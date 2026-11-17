@@ -1,0 +1,164 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/scancraft-core",
+    "crates/scancraft-driver",
+    "crates/scancraft-driver-revopoint",
+    "crates/scancraft-render",
+    "crates/scancraft-ui",
+    "crates/scancraft-slam",
+    "crates/scancraft-fusion",
+    "crates/scancraft-mesh",
+    "crates/scancraft-io",
+    "crates/scancraft-pipeline",
+    "crates/scancraft-splat",
+    "crates/scancraft-align",
+    "crates/scancraft-markers",
+    "crates/scancraft-color",
+    "crates/scancraft-laser",
+    "crates/scancraft-stereo",
+    "crates/scancraft-hybrid",
+    "apps/scancraft"
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["ScanCraft Contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Pixelplanet/scancraft"
+
+[workspace.dependencies]
+# Internal crates
+scancraft-core = { path = "crates/scancraft-core" }
+scancraft-driver = { path = "crates/scancraft-driver" }
+scancraft-driver-revopoint = { path = "crates/scancraft-driver-revopoint" }
+scancraft-render = { path = "crates/scancraft-render" }
+scancraft-ui = { path = "crates/scancraft-ui" }
+scancraft-slam = { path = "crates/scancraft-slam" }
+scancraft-fusion = { path = "crates/scancraft-fusion" }
+scancraft-mesh = { path = "crates/scancraft-mesh" }
+scancraft-io = { path = "crates/scancraft-io" }
+scancraft-pipeline = { path = "crates/scancraft-pipeline" }
+scancraft-splat = { path = "crates/scancraft-splat" }
+scancraft-align = { path = "crates/scancraft-align" }
+scancraft-markers = { path = "crates/scancraft-markers" }
+scancraft-color = { path = "crates/scancraft-color" }
+scancraft-laser = { path = "crates/scancraft-laser" }
+scancraft-stereo = { path = "crates/scancraft-stereo" }
+scancraft-hybrid = { path = "crates/scancraft-hybrid" }
+
+# Common foundational dependencies
+glam = { version = "0.29", features = ["serde"] }
+bytemuck = { version = "1.21", features = ["derive"] }
+thiserror = "2.0"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+log = "0.4"
+env_logger = "0.11"
+tokio = { version = "1.42", features = ["full"] }
+async-trait = "0.1"
+rayon = "1.10"
+futures = "0.3"
+byteorder = "1.5"
+
+# UI & Rendering
+egui = "0.36"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "accesskit", "x11", "wayland"] }
+egui-wgpu = "0.36"
+wgpu = "30"
+resvg = { version = "0.45", default-features = false }
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Gaussian splatting: Brush (Apache-2.0, https://github.com/ArthurBrussee/brush) used as a library.
+# Not published on crates.io, so pinned to a git revision. Brush tracks Burn's git `main`; the
+# exact Burn/CubeCL commits are pinned by Cargo.lock to the ones Brush's own lockfile uses at this
+# revision (see docs/architecture/splatting.md, "Bumping Brush").
+brush-train = { git = "https://github.com/ArthurBrussee/brush", rev = "1388f74c6fe0236f68ee4915564bf00e9d2e3747" }
+brush-render = { git = "https://github.com/ArthurBrussee/brush", rev = "1388f74c6fe0236f68ee4915564bf00e9d2e3747" }
+brush-dataset = { git = "https://github.com/ArthurBrussee/brush", rev = "1388f74c6fe0236f68ee4915564bf00e9d2e3747" }
+brush-serde = { git = "https://github.com/ArthurBrussee/brush", rev = "1388f74c6fe0236f68ee4915564bf00e9d2e3747" }
+brush-vfs = { git = "https://github.com/ArthurBrussee/brush", rev = "1388f74c6fe0236f68ee4915564bf00e9d2e3747" }
+burn = { git = "https://github.com/tracel-ai/burn", branch = "main", default-features = false, features = ["std"] }
+burn-wgpu = { git = "https://github.com/tracel-ai/burn", branch = "main", features = ["exclusive-memory-only"] }
+# Brush's math types use glam 0.30 (ScanCraft is on 0.29); conversions go through plain arrays.
+brush-glam = { package = "glam", version = "0.30" }
+
+# Math & Geometry
+kdtree = "0.7"
+
+[profile.dev]
+opt-level = 1
+
+# Per-frame hot paths (tracking, back-projection, QuickLZ) must keep up with the scanner even in
+# debug builds.
+[profile.dev.package.scancraft-slam]
+opt-level = 3
+[profile.dev.package.scancraft-core]
+opt-level = 3
+[profile.dev.package.scancraft-markers]
+[profile.dev.package.scancraft-hybrid]
+opt-level = 3
+[profile.dev.package.scancraft-driver-revopoint]
+opt-level = 3
+[profile.dev.package.scancraft-align]
+[profile.dev.package.scancraft-laser]
+[profile.dev.package.scancraft-stereo]
+opt-level = 3
+[profile.dev.package.kiddo]
+opt-level = 3
+# Gaussian-splat training: Burn/CubeCL record and fuse kernels on the host every step, so their
+# host code must be optimised or debug builds train several times slower (GPU-bound otherwise).
+[profile.dev.package.brush-render]
+opt-level = 3
+[profile.dev.package.brush-train]
+opt-level = 3
+[profile.dev.package.brush-loss]
+opt-level = 3
+[profile.dev.package.brush-cube]
+opt-level = 3
+[profile.dev.package.brush-sort]
+opt-level = 3
+[profile.dev.package.brush-scan]
+opt-level = 3
+[profile.dev.package.burn-tensor]
+opt-level = 3
+[profile.dev.package.burn-backend]
+opt-level = 3
+[profile.dev.package.burn-dispatch]
+opt-level = 3
+[profile.dev.package.burn-autodiff]
+opt-level = 3
+[profile.dev.package.burn-fusion]
+opt-level = 3
+[profile.dev.package.burn-ir]
+opt-level = 3
+[profile.dev.package.burn-cubecl]
+opt-level = 3
+[profile.dev.package.burn-cubecl-fusion]
+opt-level = 3
+[profile.dev.package.cubecl-core]
+opt-level = 3
+[profile.dev.package.cubecl-ir]
+opt-level = 3
+[profile.dev.package.cubecl-opt]
+opt-level = 3
+[profile.dev.package.cubecl-runtime]
+opt-level = 3
+[profile.dev.package.cubecl-server]
+opt-level = 3
+[profile.dev.package.cubecl-wgpu]
+opt-level = 3
+[profile.dev.package.cubecl-common]
+# RGB stream: JPEG decoding (1280x1024 at ~12 fps) and colour feature tracking.
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.scancraft-color]
+opt-level = 3
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

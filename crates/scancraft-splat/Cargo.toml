@@ -1,0 +1,33 @@
+[package]
+name = "scancraft-splat"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Gaussian-splat training (via Brush) from posed RGB keyframes, plus COLMAP/nerfstudio export"
+
+[dependencies]
+scancraft-core.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+image.workspace = true
+rayon.workspace = true
+kiddo = "4"
+
+brush-train.workspace = true
+brush-render.workspace = true
+brush-dataset.workspace = true
+brush-serde.workspace = true
+burn.workspace = true
+burn-wgpu.workspace = true
+brush-glam.workspace = true
+wgpu.workspace = true
+tokio = { workspace = true }
+
+[dev-dependencies]
+env_logger.workspace = true
+# Used by tests to load our COLMAP / nerfstudio exports back through Brush's own loaders.
+brush-vfs.workspace = true

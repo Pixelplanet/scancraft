@@ -1,0 +1,31 @@
+[package]
+name = "scancraft"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-driver.workspace = true
+scancraft-driver-revopoint.workspace = true
+scancraft-render.workspace = true
+scancraft-ui.workspace = true
+scancraft-slam.workspace = true
+scancraft-pipeline.workspace = true
+async-trait.workspace = true
+scancraft-fusion.workspace = true
+scancraft-mesh.workspace = true
+scancraft-io.workspace = true
+scancraft-align.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+image.workspace = true
+glam.workspace = true
+eframe.workspace = true
+egui.workspace = true
+egui-wgpu.workspace = true
+wgpu.workspace = true
+tokio.workspace = true
+log.workspace = true
+env_logger.workspace = true

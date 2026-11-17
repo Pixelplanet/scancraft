@@ -1,0 +1,34 @@
+[package]
+name = "scancraft-driver-revopoint"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-driver.workspace = true
+glam.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+byteorder = "1.5"
+quicklz = "0.3.1"
+image.workspace = true
+# Luma-only decoding of the laser modes' JPEG IR pairs (already a dependency of `image`).
+zune-jpeg = "0.5"
+zune-core = "0.5"
+futures.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+
+[dev-dependencies]
+env_logger.workspace = true
+scancraft-slam.workspace = true
+scancraft-pipeline.workspace = true
+scancraft-laser.workspace = true
+scancraft-io.workspace = true
+scancraft-stereo.workspace = true
+scancraft-hybrid.workspace = true

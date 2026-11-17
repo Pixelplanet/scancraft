@@ -1,0 +1,11 @@
+[package]
+name = "scancraft-hybrid"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-stereo.workspace = true
+rayon.workspace = true

@@ -1,0 +1,1198 @@
+//! The floating browser card (left) and the properties card (right).
+
+use eframe::egui::{self, Margin, Rect, pos2, vec2};
+use scancraft_driver::{AccuracyPreset, DeviceParam, LightSource, TurntableMode};
+use scancraft_ui::kit::{self, Button, Mark, Row, Surface};
+use scancraft_ui::Tokens;
+
+use crate::app::{Capture, ScanCraftApp, Tone};
+use crate::project::{AlignState, PassStart};
+use crate::scan_modes::{self, OptionState};
+use crate::model::{ExportFormat, Node, Quality, Stage, Tool, thousands};
+
+/// Status-dot colour of a pass's alignment.
+fn align_colour(state: AlignState, t: &Tokens) -> egui::Color32 {
+    match state {
+        AlignState::Reference => t.accent,
+        AlignState::Aligned { .. } => t.agent_ok,
+        AlignState::Unaligned => t.warning,
+        AlignState::Locating => t.agent_busy,
+    }
+}
+
+fn verdict_colour(v: scancraft_align::Verdict, t: &Tokens) -> egui::Color32 {
+    match v {
+        scancraft_align::Verdict::Good => t.agent_ok,
+        scancraft_align::Verdict::Fair => t.warning,
+        scancraft_align::Verdict::Poor => t.error,
+    }
+}
+
+/// Quality read-outs of an alignment.
+fn quality_rows(ui: &mut egui::Ui, q: &scancraft_align::Quality) {
+    let t = Tokens::get();
+    kit::row(ui, "Verdict", |ui| kit::status_line(ui, q.verdict().label(), verdict_colour(q.verdict(), &t)));
+    kit::row(ui, "Overlap", |ui| kit::value_text(ui, &format!("{:.0} % of the pass", q.overlap * 100.0), false));
+    let rms = if q.rmse_mm.is_finite() { format!("{:.2} mm", q.rmse_mm) } else { "—".to_string() };
+    kit::row(ui, "RMS error", |ui| kit::value_text(ui, &rms, false));
+    kit::row(ui, "See-through", |ui| kit::value_text(ui, &format!("{:.1} %", q.visibility_conflict * 100.0), false));
+}
+
+pub const BROWSER_WIDTH: f32 = 248.0;
+pub const PROPERTIES_WIDTH: f32 = 280.0;
+
+fn dash(v: Option<String>) -> String {
+    v.unwrap_or_else(|| "—".to_string())
+}
+
+/// The browser: session tree of scanner, passes and results (`browser::browser`).
+pub fn browser(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> Rect {
+    let t = Tokens::get();
+    let frame = kit::frame(Surface::Panel).inner_margin(kit::CARD_INSET as i8);
+    let inner_w = BROWSER_WIDTH - 2.0 * (kit::CARD_INSET + 1.0);
+    let max_h = (bounds.height() - 2.0 * (kit::CARD_INSET + 1.0)).max(60.0);
+    let resp = egui::Area::new(egui::Id::new("browser_card")).fixed_pos(bounds.min).order(egui::Order::Middle).show(ctx, |ui| {
+        frame.show(ui, |ui| {
+            ui.set_width(inner_w);
+            ui.set_max_height(max_h);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let count = format!("{} points", thousands(app.total_points()));
+            kit::browser_header(ui, "Browser", &count);
+            ui.add_space(t.space_3);
+            egui::ScrollArea::vertical().auto_shrink([false, true]).max_height(max_h - kit::HEADER_H - t.space_3).show(ui, |ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                tree(app, ui);
+            });
+        });
+    });
+    resp.response.rect
+}
+
+fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let sel = app.selection;
+    let branch = |inside: bool| if inside { Mark::Branch } else { Mark::None };
+
+    // Scanner.
+    let (device_label, device_status, device_tip) = match &app.connection {
+        Some(c) => (c.info.model.clone(), Some(t.agent_ok), format!("{} · {}", c.info.active_transport.description(), c.info.serial_number)),
+        None if app.connecting => ("Connecting…".to_string(), Some(t.agent_busy), "Connecting".to_string()),
+        None => ("No scanner".to_string(), None, "Not connected".to_string()),
+    };
+    let live = match app.capture {
+        Capture::Running => "recording",
+        Capture::Paused => "paused",
+        Capture::Starting => "starting",
+        Capture::Stopping => "stopping",
+        Capture::Idle if app.previewing => "preview",
+        Capture::Idle => "",
+    };
+    let r = kit::tree_row(
+        ui,
+        egui::Id::new("row_device"),
+        &Row {
+            depth: 0,
+            icon: "camera",
+            label: &device_label,
+            selected: sel == Some(Node::Device),
+            dim: app.connection.is_none(),
+            status: device_status,
+            count: live,
+            tip: Some(&device_tip),
+            mark: if sel == Some(Node::Device) { Mark::Here } else { Mark::None },
+            ..Default::default()
+        },
+    );
+    if r.clicked {
+        app.selection = Some(Node::Device);
+        if app.connection.is_none() {
+            app.stage = Stage::Connect;
+        }
+    }
+
+    // Scan passes.
+    let open = app.folded("passes", true);
+    let pass_count = app.passes.len().to_string();
+    let in_passes = matches!(sel, Some(Node::Pass(_) | Node::Frame(..)));
+    let r = kit::tree_row(
+        ui,
+        egui::Id::new("row_passes"),
+        &Row { depth: 0, fold: Some(open), eye: Some(app.passes.iter().any(|p| p.layer.visible)), icon: "folder", label: "Scan passes", count: &pass_count, mark: branch(in_passes), dim: app.passes.is_empty(), ..Default::default() },
+    );
+    if r.fold || r.double {
+        app.folds.insert("passes".into(), !open);
+    }
+    if r.eye {
+        let any = app.passes.iter().any(|p| p.layer.visible);
+        for p in &mut app.passes {
+            p.layer.visible = !any;
+        }
+    }
+    if open {
+        if app.passes.is_empty() {
+            empty_row(ui, "No passes yet");
+        }
+        let limits = scancraft_slam::TrackerConfig::default();
+        let can_frames = app.can_edit_frames();
+        let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
+        let mut actions: Vec<BrowserAction> = Vec::new();
+        for p in &app.passes {
+            let count = thousands(p.layer.len());
+            let recording = app.active_pass == Some(p.id) && app.capture == Capture::Running;
+            let pass_key = format!("pass:{}", p.id);
+            let pass_open = app.folded(&pass_key, true);
+            let tip = format!(
+                "{} · {}{}\n{} frames captured · {} keyframes stored",
+                p.meta.alignment.label(),
+                p.meta.scan_config.light.label(),
+                if p.meta.included { "" } else { " · left out of Merge" },
+                p.frames,
+                p.keyframes.len()
+            );
+            let frame_selected = matches!(sel, Some(Node::Frame(id, _)) if id == p.id);
+            let r = kit::tree_row(
+                ui,
+                egui::Id::new(("row_pass", p.id)),
+                &Row {
+                    depth: 1,
+                    fold: Some(pass_open),
+                    eye: Some(p.layer.visible),
+                    icon: "capture",
+                    label: &p.name,
+                    count: &count,
+                    selected: sel == Some(Node::Pass(p.id)),
+                    dim: !p.layer.visible,
+                    status: Some(if recording { t.error } else { align_colour(p.meta.alignment, &t) }),
+                    mark: if sel == Some(Node::Pass(p.id)) { Mark::Here } else { branch(frame_selected) },
+                    tip: Some(&tip),
+                },
+            );
+            if r.clicked {
+                actions.push(BrowserAction::Select(Node::Pass(p.id)));
+            }
+            if r.eye {
+                actions.push(BrowserAction::TogglePass(p.id));
+            }
+            if r.fold || r.double {
+                actions.push(BrowserAction::Fold(pass_key.clone(), !pass_open));
+            }
+            if let Some(resp) = r.response {
+                resp.context_menu(|ui| {
+                    if ui.add_enabled(can_continue, egui::Button::new("Continue pass")).on_disabled_hover_text("Connect a scanner and stop the current capture").clicked() {
+                        actions.push(BrowserAction::Continue(p.id));
+                        ui.close();
+                    }
+                    ui.separator();
+                    let align_ok = app.align_blocked(Some(p.id)).is_none() && app.align_preview.is_none();
+                    if ui.add_enabled(align_ok, egui::Button::new("Align automatically")).clicked() {
+                        actions.push(BrowserAction::AlignAuto(p.id));
+                        ui.close();
+                    }
+                    if ui.add_enabled(align_ok, egui::Button::new("Align by point pairs")).clicked() {
+                        actions.push(BrowserAction::AlignPairs(p.id));
+                        ui.close();
+                    }
+                    let can_ref = app.can_edit() && matches!(p.meta.alignment, AlignState::Aligned { .. });
+                    if ui.add_enabled(can_ref, egui::Button::new("Make reference")).on_disabled_hover_text("Only an aligned pass can define the project frame").clicked() {
+                        actions.push(BrowserAction::Reference(p.id));
+                        ui.close();
+                    }
+                    if ui.add_enabled(can_ref, egui::Button::new("Reset alignment")).clicked() {
+                        actions.push(BrowserAction::ResetAlign(p.id));
+                        ui.close();
+                    }
+                    let include = if p.meta.included { "Leave out of Merge" } else { "Include in Merge" };
+                    if ui.button(include).clicked() {
+                        actions.push(BrowserAction::Include(p.id, !p.meta.included));
+                        ui.close();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(app.can_edit() && !recording, egui::Button::new("Delete pass")).clicked() {
+                        actions.push(BrowserAction::DeletePass(p.id));
+                        ui.close();
+                    }
+                });
+            }
+            if !pass_open {
+                continue;
+            }
+            // Its stored keyframes.
+            let frames_key = format!("frames:{}", p.id);
+            let frames_open = app.folded(&frames_key, false);
+            let kept = p.kept_frames();
+            let frames_label = format!("Frames ({})", p.keyframes.len());
+            let frames_count = if kept == p.keyframes.len() { String::new() } else { format!("{kept} kept") };
+            let r = kit::tree_row(
+                ui,
+                egui::Id::new(("row_frames", p.id)),
+                &Row {
+                    depth: 2,
+                    fold: Some(frames_open),
+                    icon: "list",
+                    label: &frames_label,
+                    count: &frames_count,
+                    dim: p.keyframes.is_empty(),
+                    mark: branch(frame_selected),
+                    tip: Some("Frames the tracker stored as it moved. Select one to see where it landed; discard frames that landed wrong."),
+                    ..Default::default()
+                },
+            );
+            if r.fold || r.double || r.clicked {
+                actions.push(BrowserAction::Fold(frames_key.clone(), !frames_open));
+            }
+            if !frames_open {
+                continue;
+            }
+            if p.keyframes.is_empty() {
+                empty_row_at(ui, 3, "No keyframes stored yet");
+            }
+            for k in &p.keyframes {
+                let node = Node::Frame(p.id, k.id);
+                let quality = k.quality(limits.max_rmse_mm, limits.max_visibility_conflict);
+                let dot = if k.discarded {
+                    t.text_dim.gamma_multiply(0.5)
+                } else {
+                    match quality {
+                        Quality::Good => t.agent_ok,
+                        Quality::Fair => t.warning,
+                        Quality::Poor => t.error,
+                    }
+                };
+                let label = format!("Frame {}", k.id);
+                let count = if k.discarded { "discarded".to_string() } else { format!("+{}", thousands(k.new_points)) };
+                let tip = format!(
+                    "{} · RMS {:.2} mm · {:.0} % seen through known surface\n{} points, {} new when fused",
+                    quality.label(),
+                    k.rmse_mm,
+                    k.visibility_conflict * 100.0,
+                    thousands(k.points),
+                    thousands(k.new_points)
+                );
+                let r = kit::tree_row(
+                    ui,
+                    egui::Id::new(("row_frame", p.id, k.id)),
+                    &Row {
+                        depth: 3,
+                        icon: "point",
+                        label: &label,
+                        count: &count,
+                        selected: sel == Some(node),
+                        dim: k.discarded,
+                        status: Some(dot),
+                        mark: if sel == Some(node) { Mark::Here } else { Mark::None },
+                        tip: Some(&tip),
+                        ..Default::default()
+                    },
+                );
+                if r.clicked {
+                    actions.push(BrowserAction::Select(node));
+                }
+                if r.double && can_frames {
+                    actions.push(BrowserAction::Discard(p.id, k.id, !k.discarded));
+                }
+                if let Some(resp) = r.response {
+                    resp.context_menu(|ui| {
+                        let label = if k.discarded { "Restore frame" } else { "Discard frame" };
+                        if ui.add_enabled(can_frames, egui::Button::new(label)).on_disabled_hover_text("Pause or stop the capture first").clicked() {
+                            actions.push(BrowserAction::Discard(p.id, k.id, !k.discarded));
+                            ui.close();
+                        }
+                        if ui.add_enabled(can_frames, egui::Button::new("Discard this and all later frames")).on_disabled_hover_text("Pause or stop the capture first").clicked() {
+                            actions.push(BrowserAction::DiscardFrom(p.id, k.id));
+                            ui.close();
+                        }
+                    });
+                }
+            }
+        }
+        for action in actions {
+            match action {
+                BrowserAction::Select(node) => app.selection = Some(node),
+                BrowserAction::TogglePass(id) => {
+                    if let Some(p) = app.passes.iter_mut().find(|p| p.id == id) {
+                        p.layer.visible = !p.layer.visible;
+                    }
+                }
+                BrowserAction::Fold(key, open) => {
+                    app.folds.insert(key, open);
+                }
+                BrowserAction::Continue(id) => {
+                    app.stage = Stage::Scan;
+                    app.continue_scan(id);
+                }
+                BrowserAction::DeletePass(id) => app.delete_pass(id),
+                BrowserAction::Discard(pass, frame, discarded) => {
+                    app.selection = Some(Node::Frame(pass, frame));
+                    app.set_frame_discarded(pass, frame, discarded);
+                }
+                BrowserAction::DiscardFrom(pass, frame) => {
+                    app.selection = Some(Node::Frame(pass, frame));
+                    app.discard_frames_from(pass, frame);
+                }
+                BrowserAction::AlignAuto(id) => {
+                    app.stage = Stage::Align;
+                    app.selection = Some(Node::Pass(id));
+                    app.align_auto(id);
+                }
+                BrowserAction::AlignPairs(id) => {
+                    app.selection = Some(Node::Pass(id));
+                    app.open_tool(Tool::PointPairs(id));
+                }
+                BrowserAction::Reference(id) => app.set_reference(id),
+                BrowserAction::ResetAlign(id) => app.reset_alignment(id),
+                BrowserAction::Include(id, on) => app.set_included(id, on),
+            }
+        }
+    }
+
+    // Results.
+    let open = app.folded("results", true);
+    let in_results = matches!(sel, Some(Node::Merged | Node::Cleaned | Node::Mesh));
+    let n = app.merged.is_some() as usize + app.cleaned.is_some() as usize + app.mesh.is_some() as usize;
+    let n_label = n.to_string();
+    let r = kit::tree_row(ui, egui::Id::new("row_results"), &Row { depth: 0, fold: Some(open), icon: "folder", label: "Results", count: &n_label, mark: branch(in_results), dim: n == 0, ..Default::default() });
+    if r.fold || r.double {
+        app.folds.insert("results".into(), !open);
+    }
+    if open {
+        if n == 0 {
+            empty_row(ui, "Merge, clean or mesh to add results");
+        }
+        if let Some(m) = &app.merged {
+            let count = thousands(m.layer.len());
+            let tip = format!("{}\nFrom {}", m.summary, m.passes.iter().map(|id| format!("Pass {id}")).collect::<Vec<_>>().join(", "));
+            let r = kit::tree_row(
+                ui,
+                egui::Id::new("row_merged"),
+                &Row {
+                    depth: 1,
+                    eye: Some(m.layer.visible),
+                    icon: "combine",
+                    label: "Merged model",
+                    count: &count,
+                    selected: sel == Some(Node::Merged),
+                    dim: !m.layer.visible,
+                    mark: if sel == Some(Node::Merged) { Mark::Here } else { Mark::None },
+                    tip: Some(&tip),
+                    ..Default::default()
+                },
+            );
+            if r.clicked {
+                app.selection = Some(Node::Merged);
+            }
+            if r.eye {
+                if let Some(m) = &mut app.merged {
+                    m.layer.visible = !m.layer.visible;
+                }
+            }
+            let mut discard = false;
+            if let Some(resp) = r.response {
+                resp.context_menu(|ui| {
+                    if ui.add_enabled(app.can_edit(), egui::Button::new("Discard merged model")).clicked() {
+                        discard = true;
+                        ui.close();
+                    }
+                });
+            }
+            if discard {
+                app.discard_merged();
+            }
+        }
+        if let Some(c) = &app.cleaned {
+            let count = thousands(c.len());
+            let r = kit::tree_row(
+                ui,
+                egui::Id::new("row_cleaned"),
+                &Row {
+                    depth: 1,
+                    eye: Some(c.visible),
+                    icon: "filter",
+                    label: "Cleaned cloud",
+                    count: &count,
+                    selected: sel == Some(Node::Cleaned),
+                    dim: !c.visible,
+                    mark: if sel == Some(Node::Cleaned) { Mark::Here } else { Mark::None },
+                    ..Default::default()
+                },
+            );
+            if r.clicked {
+                app.selection = Some(Node::Cleaned);
+            }
+            if r.eye {
+                if let Some(c) = &mut app.cleaned {
+                    c.visible = !c.visible;
+                }
+            }
+        }
+        if let Some(m) = &app.mesh {
+            let count = format!("{} tris", thousands(m.analysis.triangle_count));
+            let r = kit::tree_row(
+                ui,
+                egui::Id::new("row_mesh"),
+                &Row {
+                    depth: 1,
+                    eye: Some(m.visible),
+                    icon: "mesh_body",
+                    label: "Mesh",
+                    count: &count,
+                    selected: sel == Some(Node::Mesh),
+                    dim: !m.visible,
+                    mark: if sel == Some(Node::Mesh) { Mark::Here } else { Mark::None },
+                    ..Default::default()
+                },
+            );
+            if r.clicked {
+                app.selection = Some(Node::Mesh);
+            }
+            if r.eye {
+                if let Some(m) = &mut app.mesh {
+                    m.visible = !m.visible;
+                }
+            }
+        }
+    }
+}
+
+/// What a click in the browser asked for, applied after the rows are drawn.
+enum BrowserAction {
+    Select(Node),
+    TogglePass(u32),
+    Fold(String, bool),
+    Continue(u32),
+    DeletePass(u32),
+    Discard(u32, u64, bool),
+    DiscardFrom(u32, u64),
+    AlignAuto(u32),
+    AlignPairs(u32),
+    Reference(u32),
+    ResetAlign(u32),
+    Include(u32, bool),
+}
+
+fn empty_row(ui: &mut egui::Ui, text: &str) {
+    empty_row_at(ui, 1, text);
+}
+
+/// A dim placeholder line where rows at `depth` would start.
+fn empty_row_at(ui: &mut egui::Ui, depth: usize, text: &str) {
+    let t = Tokens::get();
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), kit::TREE_ROW_HEIGHT), egui::Sense::hover());
+    let x = rect.left() + 2.0 + depth as f32 * 14.0 + 14.0 + 18.0;
+    ui.painter().text(pos2(x, rect.center().y), egui::Align2::LEFT_CENTER, text, egui::FontId::proportional(t.font_body), t.text_dim);
+}
+
+/// The properties card: the open tool's parameters, else the stage's settings, then the
+/// selection's facts.
+pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> Rect {
+    let t = Tokens::get();
+    let x = bounds.right() - PROPERTIES_WIDTH;
+    let max_h = bounds.height().max(80.0);
+    let tool = app.tool;
+    let frame = match (tool, app.selection) {
+        (None, Some(Node::Frame(pass, frame))) => Some((pass, frame)),
+        _ => None,
+    };
+    let (icon, title) = match (tool, frame) {
+        (Some(tool), _) => (tool.icon(), tool.title().to_string()),
+        (None, Some((_, id))) => ("point", format!("Frame {id}")),
+        (None, None) => match app.stage {
+            Stage::Connect => ("drive", "Scanner".to_string()),
+            Stage::Scan => ("capture", "Scan Settings".to_string()),
+            Stage::Align => ("align", "Alignment".to_string()),
+            Stage::Clean => ("filter", "Cleaning".to_string()),
+            Stage::Mesh => ("mesh_body", "Mesh".to_string()),
+            Stage::Export => ("export", "Export".to_string()),
+        },
+    };
+    let resp = egui::Area::new(egui::Id::new("properties_card")).fixed_pos(pos2(x, bounds.top())).order(egui::Order::Middle).show(ctx, |ui| {
+        kit::frame(Surface::Feature).show(ui, |ui| {
+            ui.set_width(PROPERTIES_WIDTH - 2.0);
+            ui.set_max_height(max_h);
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if kit::dialog_header(ui, icon, &title, tool.is_some() || frame.is_some()) {
+                if tool.is_some() {
+                    app.tool = None;
+                    app.picking = None;
+                } else if let Some((pass, _)) = frame {
+                    app.selection = Some(Node::Pass(pass));
+                }
+            }
+            let footer_h = if tool.is_some() { t.form_footer_height } else { 0.0 };
+            egui::ScrollArea::vertical().auto_shrink([false, true]).max_height((max_h - t.form_header_height - footer_h - 2.0).max(40.0)).show(ui, |ui| {
+                egui::Frame::NONE.inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 10 }).show(ui, |ui| {
+                    kit::scope(ui, |ui| match (tool, frame) {
+                        (Some(tool), _) => tool_body(app, ui, tool),
+                        (None, Some((pass, id))) => frame_body(app, ui, pass, id),
+                        (None, None) => stage_body(app, ui),
+                    });
+                });
+            });
+            if let Some(tool) = tool {
+                let rule = ui.cursor().top();
+                t.secondary_hline(ui.painter(), ui.max_rect().x_range(), rule, t.dialog_rule);
+                let blocked = app.tool_blocked(tool);
+                let ok = match tool {
+                    Tool::ConnectIp => "Connect",
+                    Tool::Export(_) => "Export",
+                    Tool::PointPairs(_) => "Align",
+                    Tool::SaveProject => "Save",
+                    Tool::OpenProject => "Open",
+                    _ => "OK",
+                };
+                let ok_enabled = blocked.is_none() && (tool != Tool::ConnectIp || app.ip_valid()) && (!matches!(tool, Tool::PointPairs(_)) || app.picked_pairs().len() >= 3);
+                let (cancel, accept) = egui::Frame::NONE.fill(t.dialog_footer).corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: t.radius_xl, se: t.radius_xl }).show(ui, |ui| kit::dialog_footer(ui, ok, ok_enabled, Some("Cancel"))).inner;
+                if cancel {
+                    app.tool = None;
+                    app.picking = None;
+                }
+                if accept {
+                    app.run_tool(tool);
+                }
+            }
+        });
+    });
+    resp.response.rect
+}
+
+/// A selected keyframe: how well it fitted, and discard / restore.
+fn frame_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, pass: u32, id: u64) {
+    let t = Tokens::get();
+    let Some(p) = app.passes.iter().find(|p| p.id == pass) else { return };
+    let Some(k) = p.keyframes.iter().find(|k| k.id == id).cloned() else {
+        kit::note(ui, "This frame is no longer stored.");
+        return;
+    };
+    let pass_name = p.name.clone();
+    let later = p.keyframes.iter().filter(|f| f.id > id && !f.discarded).count();
+    let limits = scancraft_slam::TrackerConfig::default();
+    let quality = k.quality(limits.max_rmse_mm, limits.max_visibility_conflict);
+    let colour = match quality {
+        Quality::Good => t.agent_ok,
+        Quality::Fair => t.warning,
+        Quality::Poor => t.error,
+    };
+    kit::row(ui, "Pass", |ui| kit::value_text(ui, &pass_name, false));
+    kit::row(ui, "State", |ui| kit::value_text(ui, if k.discarded { "Discarded" } else { "Kept" }, k.discarded));
+    kit::row(ui, "Fit", |ui| {
+        kit::status_line(ui, quality.label(), if k.discarded { t.text_dim } else { colour });
+    });
+    kit::row(ui, "RMS error", |ui| kit::value_text(ui, &format!("{:.2} mm (limit {:.1})", k.rmse_mm, limits.max_rmse_mm), false));
+    kit::row(ui, "See-through", |ui| kit::value_text(ui, &format!("{:.1} % (limit {:.0} %)", k.visibility_conflict * 100.0, limits.max_visibility_conflict * 100.0), false));
+    kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(k.points), false));
+    kit::row(ui, "New points", |ui| kit::value_text(ui, &thousands(k.new_points), false));
+    ui.add_space(t.space_6);
+    kit::note(ui, "Its points are highlighted in the view. Discard a frame that landed in the wrong place; the pass is rebuilt from the frames that are kept.");
+    ui.add_space(t.space_8);
+    let can = app.can_edit_frames();
+    let main = if k.discarded { "Restore frame" } else { "Discard frame" };
+    if kit::wide_button(ui, main, if k.discarded { Button::Primary } else { Button::Normal }, can).clicked() {
+        app.set_frame_discarded(pass, id, !k.discarded);
+    }
+    ui.add_space(t.space_4);
+    let from = if later > 0 { format!("Discard this and {later} later frame{}", if later == 1 { "" } else { "s" }) } else { "Discard this and all later frames".to_string() };
+    if kit::wide_button(ui, &from, Button::Normal, can && (!k.discarded || later > 0)).clicked() {
+        app.discard_frames_from(pass, id);
+    }
+    if !can {
+        ui.add_space(t.space_4);
+        kit::note(ui, if app.busy.is_some() { "Wait for the current operation to finish." } else { "Pause or stop the capture to change frames." });
+    }
+}
+
+fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
+    let t = Tokens::get();
+    let input = thousands(app.working_len());
+    let source = app.working_source();
+    if let Some(reason) = app.tool_blocked(tool) {
+        kit::status_line(ui, reason, t.warning);
+        ui.add_space(t.space_6);
+    }
+    let s = &mut app.settings;
+    match tool {
+        Tool::ConnectIp => {
+            kit::row(ui, "Address", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut s.ip).hint_text("192.168.1.20").desired_width(f32::INFINITY));
+            });
+            kit::note(ui, "The scanner joins the network from its own Wi-Fi settings; its address is shown by your router.");
+        }
+        Tool::RemovePlane => {
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
+            kit::slider_row(ui, "Tolerance", &mut s.plane_tolerance_mm, 0.5..=6.0, 1, "mm");
+            kit::note(ui, "Finds the largest flat surface (a turntable or table) and removes it and everything below it.");
+        }
+        Tool::Outliers => {
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
+            kit::slider_row(ui, "Neighbours", &mut s.sor_neighbors, 4..=48, 0, "");
+            kit::slider_row(ui, "Threshold", &mut s.sor_std_dev, 0.5..=3.0, 2, "σ");
+            kit::note(ui, "Removes points whose mean distance to their neighbours is far above the average.");
+        }
+        Tool::Downsample => {
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
+            kit::slider_row(ui, "Voxel size", &mut s.voxel_mm, 0.2..=5.0, 1, "mm");
+        }
+        Tool::Crop => {
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
+            kit::section_heading(ui, "Minimum");
+            for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                kit::row(ui, axis, |ui| {
+                    ui.add(egui::DragValue::new(&mut s.crop_min[i]).speed(1.0).suffix(" mm").range(-2000.0..=2000.0));
+                });
+            }
+            kit::section_heading(ui, "Maximum");
+            for (i, axis) in ["X", "Y", "Z"].iter().enumerate() {
+                kit::row(ui, axis, |ui| {
+                    ui.add(egui::DragValue::new(&mut s.crop_max[i]).speed(1.0).suffix(" mm").range(-2000.0..=2000.0));
+                });
+            }
+            kit::note(ui, "Starts at the bounds of the visible geometry. Scanner coordinates: +Y points away from the scanner, +Z up.");
+        }
+        Tool::Reconstruct => {
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
+            kit::slider_row(ui, "Cell size", &mut s.mc_cell_mm, 0.5..=5.0, 1, "mm");
+            kit::note(ui, "Smaller cells keep more detail and take longer. Clean the cloud first for a better surface.");
+        }
+        Tool::Smooth => {
+            kit::slider_row(ui, "Iterations", &mut s.smooth_iterations, 1..=10, 0, "");
+            kit::slider_row(ui, "Strength", &mut s.smooth_lambda, 0.05..=0.9, 2, "");
+        }
+        Tool::Decimate => {
+            let tris = app.mesh.as_ref().map(|m| m.analysis.triangle_count);
+            let s = &mut app.settings;
+            kit::row(ui, "Triangles", |ui| kit::value_field(ui, &dash(tris.map(thousands)), true));
+            kit::slider_row(ui, "Keep", &mut s.decimate_ratio, 0.05..=0.95, 2, "");
+            if let Some(n) = tris {
+                kit::row(ui, "Result", |ui| kit::value_field(ui, &format!("≈ {}", thousands((n as f32 * s.decimate_ratio) as usize)), true));
+            }
+        }
+        Tool::Export(_) => export_form(app, ui),
+        Tool::PointPairs(id) => pairs_form(app, ui, id),
+        Tool::SaveProject => {
+            kit::row(ui, "Folder", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.settings.project_path).desired_width(f32::INFINITY));
+            });
+            let n = app.passes.len();
+            kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
+            kit::note(ui, "Saves project.json and each pass's keyframes into the folder (created if needed). Saving again overwrites it.");
+        }
+        Tool::OpenProject => {
+            kit::row(ui, "Folder", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.settings.project_path).desired_width(f32::INFINITY));
+            });
+            let exists = scancraft_io::project::is_project(std::path::Path::new(app.settings.project_path.trim()));
+            if exists {
+                kit::note(ui, "Opening replaces what is open now (undoable).");
+            } else {
+                kit::status_line(ui, "No project.json in this folder", t.warning);
+            }
+        }
+    }
+}
+
+/// The point-pair card: the picked pairs and how to pick.
+fn pairs_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
+    let t = Tokens::get();
+    let name = app.passes.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
+    kit::row(ui, "Moving", |ui| kit::value_text(ui, &name, false));
+    kit::row(ui, "Onto", |ui| kit::value_text(ui, "Project model", false));
+    ui.add_space(t.space_4);
+    kit::note(ui, "Click a spot on the model (left), then the same spot on the pass (right). Three or more pairs, spread over the object, then Align. Picks need only be close: the surfaces are fitted afterwards.");
+    ui.add_space(t.space_6);
+    let mut remove = None;
+    if let Some(p) = &app.picking {
+        if p.pairs.is_empty() {
+            kit::note(ui, "No pairs yet.");
+        }
+        for (i, (a, b)) in p.pairs.iter().enumerate() {
+            let state = match (a, b) {
+                (Some(_), Some(_)) => "model + pass",
+                (Some(_), None) => "model · now click the pass",
+                (None, Some(_)) => "pass · now click the model",
+                (None, None) => "—",
+            };
+            ui.horizontal(|ui| {
+                kit::value_text(ui, &format!("{}  {state}", i + 1), a.is_none() || b.is_none());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("✕").on_hover_text("Remove this pair").clicked() {
+                        remove = Some(i);
+                    }
+                });
+            });
+        }
+    }
+    if let (Some(i), Some(p)) = (remove, app.picking.as_mut()) {
+        p.pairs.remove(i);
+    }
+    let complete = app.picked_pairs().len();
+    ui.add_space(t.space_4);
+    kit::row(ui, "Pairs", |ui| kit::value_text(ui, &format!("{complete} complete (3 needed)"), complete < 3));
+}
+
+fn export_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
+    let enabled: Vec<bool> = ExportFormat::ALL.iter().map(|f| app.tool_blocked(Tool::Export(*f)).is_none()).collect();
+    let mut index = ExportFormat::ALL.iter().position(|f| *f == app.settings.export_format).unwrap_or(0);
+    kit::row(ui, "Format", |ui| {
+        if kit::dropdown(ui, "export_format", &mut index, &labels, &enabled) {
+            app.set_export_format(ExportFormat::ALL[index]);
+            if app.tool.is_some_and(|t| matches!(t, Tool::Export(_))) {
+                app.tool = Some(Tool::Export(ExportFormat::ALL[index]));
+            }
+        }
+    });
+    kit::row(ui, "File", |ui| {
+        ui.add(egui::TextEdit::singleline(&mut app.settings.export_path).desired_width(f32::INFINITY));
+    });
+    let source = if app.settings.export_format.needs_mesh() {
+        app.mesh.as_ref().map(|m| format!("Mesh · {} triangles", thousands(m.analysis.triangle_count))).unwrap_or_else(|| "—".into())
+    } else {
+        format!("{} · {} points", app.working_source(), thousands(app.working_len()))
+    };
+    kit::row(ui, "Source", |ui| kit::value_field(ui, &source, true));
+    let path = std::path::Path::new(&app.settings.export_path);
+    let full = if path.is_absolute() { path.to_path_buf() } else { std::env::current_dir().map(|d| d.join(path)).unwrap_or_else(|_| path.to_path_buf()) };
+    kit::note(ui, &format!("Saves to {}", full.display()));
+}
+
+fn stage_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    match app.stage {
+        Stage::Connect => connect_body(app, ui),
+        Stage::Scan => scan_body(app, ui),
+        Stage::Align => align_body(app, ui),
+        Stage::Clean => clean_body(app, ui),
+        Stage::Mesh => mesh_body(app, ui),
+        Stage::Export => {
+            export_form(app, ui);
+            ui.add_space(Tokens::get().space_8);
+            let format = app.settings.export_format;
+            let blocked = app.tool_blocked(Tool::Export(format));
+            if kit::wide_button(ui, "Export", Button::Primary, blocked.is_none()).clicked() {
+                app.run_tool(Tool::Export(format));
+            }
+            if let Some(reason) = blocked {
+                kit::note(ui, reason);
+            }
+        }
+    }
+    selection_section(app, ui);
+}
+
+fn connect_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    if let Some(c) = &app.connection {
+        let info = c.info.clone();
+        let caps = c.capabilities.clone();
+        kit::row(ui, "Model", |ui| kit::value_text(ui, &info.model, false));
+        kit::row(ui, "Vendor", |ui| kit::value_text(ui, &info.vendor, false));
+        kit::row(ui, "Serial", |ui| kit::value_text(ui, &info.serial_number, false));
+        kit::row(ui, "Firmware", |ui| kit::value_text(ui, &info.firmware_version, false));
+        kit::row(ui, "Link", |ui| kit::value_text(ui, &info.active_transport.description(), false));
+        kit::row(ui, "Depth", |ui| kit::value_text(ui, &format!("{} × {}", info.depth_resolution.0, info.depth_resolution.1), false));
+        kit::row(ui, "Range", |ui| kit::value_text(ui, &format!("{:.0}–{:.0} mm", info.recommended_distance_range_mm.0, info.recommended_distance_range_mm.1), false));
+        kit::section(ui, "caps", "Capabilities", false, |ui| {
+            let yn = |b: bool| if b { "Yes" } else { "No" };
+            kit::row(ui, "IMU", |ui| kit::value_text(ui, yn(caps.has_imu), true));
+            kit::row(ui, "RGB camera", |ui| kit::value_text(ui, yn(caps.has_rgb_camera), true));
+            kit::row(ui, "Turntable", |ui| kit::value_text(ui, yn(caps.has_hardware_turntable_control), true));
+            kit::row(ui, "Markers", |ui| kit::value_text(ui, yn(caps.supports_marker_tracking), true));
+        });
+        ui.add_space(t.space_8);
+        if kit::wide_button(ui, "Disconnect", Button::Normal, true).clicked() {
+            app.disconnect();
+        }
+        return;
+    }
+    kit::section_heading(ui, "Found scanners");
+    ui.add_space(t.space_4);
+    if app.discovered.is_empty() {
+        let text = if app.discovering { "Searching…" } else { "None yet. Use Find Scanners, Connect by IP, or the simulated scanner." };
+        kit::note(ui, text);
+    } else {
+        let mut pick = None;
+        let mut connect = false;
+        for (i, d) in app.discovered.iter().enumerate() {
+            let label = format!("{} · {}", d.model_name, d.selected_transport.description());
+            let r = kit::tree_row(ui, egui::Id::new(("found", i)), &Row { icon: if d.driver_id == "mock" { "box" } else { "camera" }, label: &label, selected: app.selected_discovered == i, tip: Some(&d.serial_number), ..Default::default() });
+            if r.clicked {
+                pick = Some(i);
+            }
+            if r.double {
+                pick = Some(i);
+                connect = true;
+            }
+        }
+        if let Some(i) = pick {
+            app.selected_discovered = i;
+        }
+        if connect {
+            app.connect_discovered();
+        }
+    }
+    ui.add_space(t.space_8);
+    ui.horizontal(|ui| {
+        if kit::button(ui, if app.discovering { "Searching…" } else { "Find Scanners" }, Button::Normal, !app.discovering).clicked() {
+            app.discover();
+        }
+        if kit::button(ui, "Connect", Button::Primary, !app.discovered.is_empty() && !app.connecting).clicked() {
+            app.connect_discovered();
+        }
+    });
+}
+
+fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let live = app.capture != Capture::Idle;
+    let connected = app.connection.is_some();
+
+    // Scan mode, tracking and object, in Revo Scan's order, as the device offers them.
+    let choice = app.mode_choice();
+    let opts = scan_modes::options(app.modes(), choice);
+    let mut next = choice;
+    let live_reason = live.then_some("Stop the capture to change this");
+    mode_row(ui, "Scan mode", "scan_mode", &opts.lights, choice.light, live_reason, &mut next.light, scan_modes::light_help(choice.light));
+    mode_row(ui, "Tracking", "tracking_mode", &opts.tracking, choice.tracking, live_reason, &mut next.tracking, scan_modes::tracking_help(choice.tracking));
+    mode_row(ui, "Object", "object_type", &opts.objects, choice.object, live_reason, &mut next.object, scan_modes::object_help(choice.object));
+    if next != choice {
+        app.set_mode_choice(next);
+    }
+    if app.connection.is_none() {
+        kit::note(ui, "What a scanner offers shows once it is connected.");
+    } else if let Some(reason) = app.mode_blocked() {
+        kit::status_line(ui, &reason, t.warning);
+    }
+    ui.add_space(t.space_4);
+    ui.add_enabled_ui(!live, |ui| {
+        let accuracies = [AccuracyPreset::HighDetail, AccuracyPreset::Standard, AccuracyPreset::FastPreview];
+        let mut accuracy = accuracies.iter().position(|a| *a == app.scan_config.accuracy).unwrap_or(1);
+        kit::row(ui, "Point pitch", |ui| {
+            if kit::segmented(ui, &mut accuracy, &["0.3 mm", "0.5 mm", "1.0 mm"], &[], &[]) {
+                app.scan_config.accuracy = accuracies[accuracy];
+            }
+        });
+        let motions = [TurntableMode::HandheldFreeform, TurntableMode::TurntableContinuous, TurntableMode::TurntableStep];
+        let mut motion = motions.iter().position(|m| *m == app.scan_config.turntable_mode).unwrap_or(0);
+        kit::row(ui, "Motion", |ui| {
+            if kit::dropdown(ui, "motion", &mut motion, &["Handheld", "Turntable, continuous", "Turntable, step"], &[]) {
+                app.scan_config.turntable_mode = motions[motion];
+            }
+        });
+    });
+
+    // Exposure, gain and depth range live in the camera view, next to the image they change.
+    kit::section(ui, "camera_summary", "Camera", true, |ui| {
+        let exposure = match app.connection.as_ref().map(|c| c.capabilities.manual_exposure) {
+            Some(false) => "automatic".to_string(),
+            _ => format!("{:.2} ms, gain {}", app.scan_config.depth_exposure_us as f32 / 1000.0, app.scan_config.depth_gain),
+        };
+        kit::row(ui, "Exposure", |ui| kit::value_text(ui, &exposure, true));
+        kit::row(ui, "Depth", |ui| kit::value_text(ui, &format!("{:.0}–{:.0} mm", app.settings.min_mm, app.settings.max_mm), true));
+        let note = if app.connection.is_some() { "Set these in the camera view at the bottom left." } else { "Set these in the camera view once a scanner is connected." };
+        kit::note(ui, note);
+        if app.connection.is_some() && !app.show_inset && kit::wide_button(ui, "Show camera view", Button::Normal, true).clicked() {
+            app.show_inset = true;
+        }
+    });
+    kit::section(ui, "density", "Density", false, |ui| {
+        ui.add_enabled_ui(!live, |ui| {
+            let s = &mut app.settings;
+            let mut budget_m = s.point_budget as f32 / 1e6;
+            if kit::slider_row(ui, "Budget", &mut budget_m, 0.5..=10.0, 1, "M pts").changed() {
+                s.point_budget = (budget_m * 1e6) as usize;
+            }
+        });
+    });
+    ui.add_space(t.space_8);
+    // How the next pass relates to the ones before (docs/architecture/scan-sessions.md, 2.3).
+    if app.passes.iter().any(|p| p.meta.alignment.is_placed()) {
+        ui.add_enabled_ui(!live, |ui| {
+            let mut start = if app.next_start == PassStart::SamePosition { 1 } else { 0 };
+            kit::row(ui, "Next pass", |ui| {
+                if kit::segmented(ui, &mut start, &["Object moved", "Same position"], &[], &[]) {
+                    app.next_start = if start == 1 { PassStart::SamePosition } else { PassStart::Moved };
+                }
+            });
+        });
+        let help = match app.next_start {
+            PassStart::Moved => "The object was flipped or moved: the new pass is aligned afterwards on the Align tab.",
+            PassStart::SamePosition => "The object was not touched: the new pass places itself in the project as it starts (e.g. another mode for a detail).",
+        };
+        kit::note(ui, help);
+        ui.add_space(t.space_6);
+    }
+    match app.capture {
+        Capture::Idle => {
+            if kit::wide_button(ui, "Start capture", Button::Primary, connected).clicked() {
+                app.start_scan();
+            }
+            if !connected {
+                kit::note(ui, "Connect a scanner to capture.");
+            }
+        }
+        Capture::Running | Capture::Paused | Capture::Starting => {
+            if kit::wide_button(ui, "Stop capture", Button::Normal, true).clicked() {
+                app.stop_scan();
+            }
+        }
+        Capture::Stopping => {
+            kit::wide_button(ui, "Stopping…", Button::Normal, false);
+        }
+    }
+}
+
+/// One mode choice: a dropdown whose disabled options give their reason, and a line on what the
+/// chosen option does.
+#[allow(clippy::too_many_arguments)]
+fn mode_row<T: Copy + PartialEq>(ui: &mut egui::Ui, label: &str, id: &str, options: &[OptionState<T>], current: T, live: Option<&str>, out: &mut T, help: &str) {
+    let labels: Vec<&str> = options.iter().map(|o| o.label).collect();
+    let enabled: Vec<bool> = options.iter().map(|o| o.enabled() && live.is_none()).collect();
+    let reasons: Vec<Option<&str>> = options.iter().map(|o| o.disabled.as_deref().or(live)).collect();
+    let mut index = options.iter().position(|o| o.value == current).unwrap_or(0);
+    kit::row(ui, label, |ui| {
+        ui.add_enabled_ui(live.is_none(), |ui| {
+            if kit::dropdown_with_reasons(ui, id, &mut index, &labels, &enabled, &reasons) {
+                if let Some(o) = options.get(index) {
+                    *out = o.value;
+                }
+            }
+        });
+    });
+    // The description sits under the control column.
+    let t = Tokens::get();
+    let indent = t.form_label_width + t.space_8;
+    let galley = ui.painter().layout(help.to_string(), egui::FontId::proportional(t.font_small), t.text_dim, (ui.available_width() - indent).max(40.0));
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), galley.size().y), egui::Sense::hover());
+    ui.painter().galley(pos2(rect.left() + indent, rect.top()), galley, t.text_dim);
+    ui.add_space(t.space_4);
+}
+
+fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    // A proposed alignment waits for a decision.
+    if let Some(preview) = &app.align_preview {
+        let name = app.passes.iter().find(|p| p.id == preview.pass).map(|p| p.name.clone()).unwrap_or_default();
+        let q = preview.alignment.quality;
+        let method = preview.method.label();
+        kit::section_heading(ui, "Proposed alignment");
+        kit::row(ui, "Pass", |ui| kit::value_text(ui, &name, false));
+        kit::row(ui, "Method", |ui| kit::value_text(ui, method, false));
+        quality_rows(ui, &q);
+        ui.add_space(t.space_4);
+        let note = match q.verdict() {
+            scancraft_align::Verdict::Good => "The pass is shown in its colour where it would go. It fits closely and hides nothing that was measured.",
+            scancraft_align::Verdict::Fair => "Check the fit in the view before accepting: the overlap is small or the surfaces do not agree everywhere.",
+            scancraft_align::Verdict::Poor => "This looks wrong: little overlap, or it puts surface where the scanner saw through. Try point pairs instead.",
+        };
+        kit::note(ui, note);
+        ui.add_space(t.space_8);
+        ui.horizontal(|ui| {
+            if kit::button(ui, "Accept", Button::Primary, app.can_edit()).clicked() {
+                app.accept_preview();
+            }
+            if kit::button(ui, "Discard", Button::Normal, true).clicked() {
+                app.discard_preview();
+            }
+        });
+        return;
+    }
+    let placed = app.passes.iter().filter(|p| p.meta.alignment.is_placed()).count();
+    let unaligned: Vec<String> = app.passes.iter().filter(|p| p.meta.alignment == AlignState::Unaligned).map(|p| p.name.clone()).collect();
+    let reference = app.reference_pass().and_then(|id| app.passes.iter().find(|p| p.id == id)).map(|p| p.name.clone());
+    kit::row(ui, "Reference", |ui| kit::value_text(ui, &dash(reference), false));
+    kit::row(ui, "Aligned", |ui| kit::value_text(ui, &format!("{placed} of {}", app.passes.len()), false));
+    if !unaligned.is_empty() {
+        kit::row(ui, "To align", |ui| kit::value_text(ui, &unaligned.join(", "), false));
+    }
+    ui.add_space(t.space_4);
+    let hint = if app.passes.len() < 2 {
+        "Capture another pass (flip the object, or keep it in place and choose Same position) to align it here."
+    } else if !unaligned.is_empty() {
+        "Select a pass and use Align Passes, or Point Pairs if the automatic result is wrong. Each result is previewed before it is accepted."
+    } else {
+        "All passes are aligned. Refine All spreads the remaining errors; Merge fuses the included passes into one model."
+    };
+    kit::note(ui, hint);
+    kit::section(ui, "merge_settings", "Merge", true, |ui| {
+        kit::checkbox(ui, "Remove outliers", &mut app.settings.merge_outliers);
+        ui.add_enabled_ui(app.settings.merge_outliers, |ui| {
+            kit::slider_row(ui, "Threshold", &mut app.settings.merge_sigma, 1.0..=5.0, 1, "σ");
+        });
+        kit::note(ui, "Where passes overlap, the more accurate one wins (laser > Full-field HD > VCSEL); set a pass's weight below. Single observations without surface around them are dropped.");
+    });
+    if let Some(s) = app.tracking.as_ref().filter(|_| app.capture != Capture::Idle) {
+        kit::section(ui, "live_tracking", "Live tracking", false, |ui| {
+            kit::row(ui, "State", |ui| kit::value_text(ui, &format!("{:?}", s.state), false));
+            kit::row(ui, "RMS error", |ui| kit::value_text(ui, &format!("{:.2} mm", s.rmse_mm), false));
+        });
+    }
+}
+
+fn clean_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let visible_passes = app.passes.iter().filter(|p| p.layer.visible).count();
+    kit::row(ui, "Works on", |ui| kit::value_text(ui, app.working_source(), false));
+    kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(app.working_len()), false));
+    if app.cleaned.is_none() && app.merged.is_none() {
+        kit::row(ui, "Passes", |ui| kit::value_text(ui, &format!("{visible_passes} of {}", app.passes.len()), false));
+    }
+    ui.add_space(t.space_6);
+    kit::note(ui, "Pick a filter in the ribbon. Each filter replaces the cleaned cloud and can be undone.");
+}
+
+fn mesh_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let a = app.mesh.as_ref().map(|m| m.analysis.clone());
+    kit::row(ui, "Vertices", |ui| kit::value_text(ui, &dash(a.as_ref().map(|a| thousands(a.vertex_count))), a.is_none()));
+    kit::row(ui, "Triangles", |ui| kit::value_text(ui, &dash(a.as_ref().map(|a| thousands(a.triangle_count))), a.is_none()));
+    kit::row(ui, "Area", |ui| kit::value_text(ui, &dash(a.as_ref().map(|a| format!("{:.1} cm²", a.surface_area_mm2 / 100.0))), a.is_none()));
+    kit::row(ui, "Volume", |ui| kit::value_text(ui, &dash(a.as_ref().filter(|a| a.is_watertight).map(|a| format!("{:.1} cm³", a.volume_mm3 / 1000.0))), a.as_ref().is_none_or(|a| !a.is_watertight)));
+    kit::row(ui, "Watertight", |ui| kit::value_text(ui, &dash(a.as_ref().map(|a| if a.is_watertight { "Yes".into() } else { format!("No · {} open edges", thousands(a.open_edges)) })), a.is_none()));
+    ui.add_space(t.space_6);
+    if a.is_none() {
+        kit::note(ui, "Reconstruct builds a surface from the cleaned cloud, or from the visible passes.");
+    }
+}
+
+/// Facts about the browser selection, below the stage settings.
+fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let Some(node) = app.selection else { return };
+    let title = match node {
+        Node::Device | Node::Frame(..) => return,
+        Node::Pass(_) => "Selected pass",
+        Node::Merged => "Merged model",
+        Node::Cleaned => "Selected cloud",
+        Node::Mesh => return,
+    };
+    let mut delete = None;
+    let mut continue_pass = None;
+    let mut weight_change = None;
+    let mut include_change = None;
+    kit::section(ui, "selection", title, true, |ui| match node {
+        Node::Pass(id) => {
+            let Some(p) = app.passes.iter().find(|p| p.id == id) else { return };
+            kit::row(ui, "Name", |ui| kit::value_text(ui, &p.name, false));
+            kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(p.layer.len()), false));
+            kit::row(ui, "Frames", |ui| kit::value_text(ui, &thousands(p.frames as usize), false));
+            let b = p.layer.cloud.bbox;
+            let size = if b.is_empty() { "—".to_string() } else { let e = b.max - b.min; format!("{:.0} × {:.0} × {:.0} mm", e.x, e.y, e.z) };
+            kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
+            let recording = app.active_pass == Some(id);
+            let kept = p.kept_frames();
+            let stored = p.keyframes.len();
+            kit::row(ui, "Keyframes", |ui| kit::value_text(ui, &if kept == stored { thousands(stored) } else { format!("{} of {} kept", thousands(kept), thousands(stored)) }, false));
+            kit::row(ui, "Mode", |ui| kit::value_text(ui, &format!("{} · {}", p.meta.scan_config.light.label(), p.meta.scan_config.tracking.label()), false));
+            let t = Tokens::get();
+            kit::row(ui, "Alignment", |ui| kit::status_line(ui, &p.meta.alignment.label(), align_colour(p.meta.alignment, &t)));
+            if let AlignState::Aligned { quality: Some(q), .. } = p.meta.alignment {
+                quality_rows(ui, &q);
+            }
+            let (mut weight, mut included) = (p.meta.weight, p.meta.included);
+            if kit::slider_row(ui, "Merge weight", &mut weight, 0.5..=5.0, 1, "").changed() {
+                weight_change = Some((id, weight));
+            }
+            if kit::checkbox(ui, "Include in Merge", &mut included).changed() {
+                include_change = Some((id, included));
+            }
+            ui.add_space(Tokens::get().space_4);
+            let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
+            if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text("Capture more into this pass, carrying on from its last kept frame").clicked() {
+                continue_pass = Some(id);
+            }
+            ui.add_space(Tokens::get().space_4);
+            if kit::wide_button(ui, "Delete pass", Button::Normal, !recording && app.can_edit()).clicked() {
+                delete = Some(id);
+            }
+        }
+        Node::Merged => {
+            let Some(m) = &app.merged else { return };
+            kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(m.layer.len()), false));
+            let from = m.passes.iter().filter_map(|id| app.passes.iter().find(|p| p.id == *id)).map(|p| p.name.clone()).collect::<Vec<_>>().join(", ");
+            kit::row(ui, "From", |ui| kit::value_text(ui, &from, false));
+            kit::note(ui, &m.summary);
+        }
+        Node::Cleaned => {
+            let Some(c) = &app.cleaned else { return };
+            kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(c.len()), false));
+            let b = c.cloud.bbox;
+            let size = if b.is_empty() { "—".to_string() } else { let e = b.max - b.min; format!("{:.0} × {:.0} × {:.0} mm", e.x, e.y, e.z) };
+            kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
+        }
+        _ => {}
+    });
+    if let Some((id, w)) = weight_change {
+        app.set_weight(id, w);
+    }
+    if let Some((id, on)) = include_change {
+        app.set_included(id, on);
+    }
+    if let Some(id) = continue_pass {
+        app.stage = Stage::Scan;
+        app.continue_scan(id);
+    }
+    if let Some(id) = delete {
+        app.delete_pass(id);
+        if app.tone != Tone::Error {
+            app.selection = None;
+        }
+    }
+}
+
+/// Exposure, gain (laser power for the laser lines) and depth range, as the camera view shows
+/// them under the image. Scanners that expose automatically get a read-only line instead of
+/// sliders that would do nothing.
+pub fn camera_controls(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let live = app.capture != Capture::Idle;
+    let manual = app.connection.as_ref().is_none_or(|c| c.capabilities.manual_exposure);
+    kit::scope(ui, |ui| {
+        if manual {
+            let mut exposure_ms = app.scan_config.depth_exposure_us as f32 / 1000.0;
+            if kit::slider_row(ui, "Exposure", &mut exposure_ms, 0.05..=20.0, 2, "ms").changed() {
+                app.scan_config.depth_exposure_us = (exposure_ms * 1000.0).round() as u32;
+                app.camera_from_preset = false;
+                app.scan_config.camera_override = true;
+                if live {
+                    app.set_parameter(DeviceParam::DepthExposure(app.scan_config.depth_exposure_us));
+                }
+            }
+            let mut gain = app.scan_config.depth_gain.clamp(1, 10);
+            if kit::slider_row(ui, "Gain", &mut gain, 1..=10, 0, "").changed() {
+                app.scan_config.depth_gain = gain;
+                app.camera_from_preset = false;
+                app.scan_config.camera_override = true;
+                if live {
+                    app.set_parameter(DeviceParam::DepthGain(gain));
+                }
+            }
+        } else {
+            kit::row(ui, "Exposure", |ui| kit::value_field(ui, "Automatic", true))
+                .on_hover_text("This scanner sets exposure and gain itself in this mode; values sent to it have no effect.");
+            kit::note(ui, "Exposed automatically by the scanner in this mode.");
+        }
+        // Laser power applies to the blue laser lines only.
+        if matches!(app.scan_config.light, LightSource::CrossLines | LightSource::SingleLine) {
+            let mut power = app.scan_config.laser_power;
+            if kit::slider_row(ui, "Laser", &mut power, 1..=10, 0, "").changed() {
+                app.scan_config.laser_power = power;
+                if live {
+                    app.set_parameter(DeviceParam::LaserPower(power));
+                }
+            }
+        }
+        ui.add_enabled_ui(!live, |ui| {
+            let s = &mut app.settings;
+            kit::slider_row(ui, "Near", &mut s.min_mm, 50.0..=600.0, 0, "mm").on_disabled_hover_text("Set the depth range before capturing");
+            kit::slider_row(ui, "Far", &mut s.max_mm, 100.0..=1500.0, 0, "mm").on_disabled_hover_text("Set the depth range before capturing");
+            if s.max_mm < s.min_mm + 20.0 {
+                s.max_mm = s.min_mm + 20.0;
+            }
+        });
+        if manual && !app.camera_from_preset && scan_modes::preset(app.scan_config.light, app.scan_config.object).is_some() {
+            ui.horizontal(|ui| {
+                kit::note(ui, "Changed from the preset.");
+                if ui.small_button("Reset").on_hover_text("Back to the preset's exposure, gain and depth range").clicked() {
+                    app.apply_preset();
+                }
+            });
+        }
+        let _ = t;
+    });
+}

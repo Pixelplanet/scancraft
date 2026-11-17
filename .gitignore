@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+scratch/
+firmware/
+calibration/
+*.py
+!client/*.py
+!tests/*.py
+3dcamera_exports.txt
+target/
+*.pdb
+
+# Agent worktrees
+.claude/
+
+# Editor settings
+.vscode/

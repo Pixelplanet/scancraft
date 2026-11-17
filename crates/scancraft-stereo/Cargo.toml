@@ -1,0 +1,15 @@
+[package]
+name = "scancraft-stereo"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Dense stereo matching (census + semi-global matching) for rectified IR pairs"
+
+[dependencies]
+scancraft-core.workspace = true
+rayon.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true

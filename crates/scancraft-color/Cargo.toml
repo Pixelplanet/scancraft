@@ -1,0 +1,19 @@
+[package]
+name = "scancraft-color"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Colour for ScanCraft: RGB keyframes, depth-to-RGB registration, vertex colouring and RGB feature tracking"
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-slam.workspace = true
+glam.workspace = true
+serde.workspace = true
+log.workspace = true
+image.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+scancraft-driver-revopoint.workspace = true

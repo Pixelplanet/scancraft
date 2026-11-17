@@ -1,0 +1,20 @@
+[package]
+name = "scancraft-markers"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-slam.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+scancraft-driver-revopoint.workspace = true
+scancraft-driver.workspace = true
+env_logger.workspace = true
+tokio.workspace = true

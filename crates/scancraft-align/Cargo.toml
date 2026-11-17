@@ -1,0 +1,15 @@
+[package]
+name = "scancraft-align"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-slam.workspace = true
+glam.workspace = true
+rayon.workspace = true
+log.workspace = true
+thiserror.workspace = true
+kiddo = "4"
