@@ -11,9 +11,14 @@ scene; scanning with a moving scanner is only partly tested. See
 
 ## Run it
 
-**Prebuilt (Windows x64):** download the zip from the
-[Releases page](https://github.com/Pixelplanet/scancraft/releases), unpack it anywhere and start
-`scancraft.exe`. Nothing needs to be installed.
+**Prebuilt (Windows x64):** from the
+[Releases page](https://github.com/Pixelplanet/scancraft/releases), either
+
+- `ScanCraft-Setup-<version>.exe` — installs for the current user (no administrator rights) to
+  `%LOCALAPPDATA%\Programs\ScanCraft`, with Start menu entries and an uninstaller under
+  *Settings → Apps*. The program is not code-signed, so Windows may ask for confirmation
+  (*More info → Run anyway*); or
+- the portable zip — unpack it anywhere and start `scancraft.exe`.
 
 - `scancraft.exe` — start, then *Connect → Find Scanners* (the scanner must be on the same
   network as the PC).
@@ -33,7 +38,12 @@ cargo run --release -p scancraft
 ```
 
 The first build takes a while (the Gaussian-splat trainer pulls in a GPU compute stack).
-`cargo test --workspace` runs the tests; none of them needs a scanner.
+`cargo test --workspace` runs the tests; none of them needs a scanner. To build the installer and
+the portable zip yourself (Windows, uses the built-in IExpress):
+
+```
+powershell -ExecutionPolicy Bypass -File packaging\windows\build_release.ps1 -Out <folder>
+```
 
 ## What works on the POP 4 (firmware v5.3.99)
 

@@ -10,6 +10,15 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,
+automatic table removal, wall-aware quality for inside/outside scans), Refine as a preview, Merge,
+Isolate Object, Import Scan (PLY/OBJ/STL) and Add Project. Tested on three Revo Scan scans of a
+thin shell part; details, the user's decisions on AI segmentation and the backlog:
+[architecture/merge-and-ai.md](architecture/merge-and-ai.md). Windows installer:
+`packaging/windows/build_release.ps1`. Next on the laptop: test merging with passes scanned in
+ScanCraft, then the solid-model pipeline (watertight mesh, hole filling, marker removal; being
+finished in `scancraft-mesh`) and the AI segmentation work in the order of merge-and-ai.md §4.
+
 - The POP 4 driver (`crates/scancraft-driver-revopoint`) starts, streams and stops every scan
   mode the scanner has, on **firmware v5.3.99.20261010**. All light source / tracking
   combinations of the POP 4 produce geometry and track a **static** scene without losing frames.

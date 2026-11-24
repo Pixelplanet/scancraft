@@ -168,6 +168,24 @@ assistant never controls the scanner without explicit approval, and the scanner 
 | Solid model (watertight mesh, holes, markers) | in progress |
 | Colour keyframes, segmentation crate, AI pack, ORT backend, SAM 2 video loop | not started |
 
+## 8. Backlog (later)
+
+Ideas from the ScanRuler study (`docs/research/2026-11-24-scanruler.md`). ScanRuler is AGPL:
+re-implement from the ideas, never copy its code.
+
+| Item | Where | Effort |
+| --- | --- | --- |
+| Auto-orient a merged part to its own faces (area-weighted normal histogram, axis from wall normals, open rim as the base) | after merging, before meshing/export | S–M |
+| "Ambiguous" warning when a clearly different pose scores almost as well | `scancraft-align` quality | S |
+| Score poses by a capped mean over all samples; facing-aware closest-point search | refine / quality | S |
+| Manual 3-point alignment (Horn's method, collinear warning) as the fallback when Align All rejects an edge | `align_point_pairs`, app | S |
+| Datum alignment to world axes (plane / axis / origin, live preview) and primitive fits grown from a click | app | M |
+| Scale from several measured lengths (imported photogrammetry scans) | import | S |
+| Volume-error check (excess / missing material regions) | solid-model benchmark | M |
+| Review tool for an AI agent (ranked worst places on renders, trend, target) with guides served by the app | AI assistant, §6 | M |
+| STEP export of fitted primitives (analytic AP214, own writer or `truck-stepio`) | export | M |
+| Scan-to-CAD in SolidCraft: ScanCraft hands over the watertight mesh plus fitted primitives | SolidCraft | L |
+
 Known gaps: per-pass object labels and the new quality fields are not saved in the project (the
 format still has version 1); `save_ply_binary` writes no normals; `scancraft_slam::point_to_plane`
 still linearises about the frame origin (slow convergence far from it); imported passes are all

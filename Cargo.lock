@@ -6882,7 +6882,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "eframe",
@@ -6911,7 +6911,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-align"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "glam 0.29.3",
@@ -6927,7 +6927,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-color"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "image",
@@ -6941,7 +6941,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "glam 0.29.3",
@@ -6953,7 +6953,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-driver"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -6968,7 +6968,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-driver-revopoint"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "byteorder",
@@ -6997,7 +6997,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-fusion"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "kdtree",
@@ -7011,7 +7011,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-hybrid"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "rayon",
  "scancraft-core",
@@ -7020,7 +7020,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "byteorder",
  "glam 0.29.3",
@@ -7033,7 +7033,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-laser"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "log",
@@ -7044,7 +7044,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-markers"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "glam 0.29.3",
@@ -7060,7 +7060,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-mesh"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "kdtree",
@@ -7073,7 +7073,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "log",
@@ -7090,7 +7090,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-render"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
  "egui",
@@ -7104,7 +7104,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-slam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "kdtree",
@@ -7117,7 +7117,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-splat"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "brush-dataset",
  "brush-render",
@@ -7143,7 +7143,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-stereo"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "env_logger",
  "log",
@@ -7153,7 +7153,7 @@ dependencies = [
 
 [[package]]
 name = "scancraft-ui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "egui",
  "glam 0.29.3",
