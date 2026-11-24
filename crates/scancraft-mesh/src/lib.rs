@@ -1,4 +1,7 @@
 pub mod decimate;
+pub mod denoise;
+pub mod holes;
+pub mod implicit;
 pub mod marching_cubes;
 pub mod metrics;
 pub mod normals;
@@ -10,6 +13,9 @@ pub mod tables;
 mod tests;
 
 pub use decimate::MeshDecimator;
+pub use denoise::FeatureSmoother;
+pub use holes::{FillReport, HoleFiller, HoleInfo};
+pub use implicit::{SurfaceConfig, SurfaceStats};
 pub use marching_cubes::{MarchingCubes, ReconstructionStats};
 pub use metrics::{MeshAnalysis, MeshMetrics};
 pub use normals::NormalEstimator;
@@ -43,6 +49,25 @@ impl Mesher {
             let mut cloud_with_normals = cloud.clone();
             NormalEstimator::default().estimate_normals(&mut cloud_with_normals);
             mc.reconstruct(&cloud_with_normals)
+        }
+    }
+
+    /// Reconstructs a welded mesh with the robust implicit surface ([`implicit`]). Points without
+    /// normals get estimated ones first, as in [`reconstruct`](Self::reconstruct).
+    pub fn reconstruct_with(cloud: &PointCloud, config: &SurfaceConfig) -> Mesh {
+        Self::reconstruct_with_stats(cloud, config).0
+    }
+
+    pub fn reconstruct_with_stats(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, SurfaceStats) {
+        let step = (cloud.points.len() / 1000).max(1);
+        let sampled = cloud.points.iter().step_by(step).count();
+        let with_normals = cloud.points.iter().step_by(step).filter(|p| p.normal.iter().any(|c| *c != 0.0)).count();
+        if sampled > 0 && with_normals * 10 >= sampled * 9 {
+            implicit::reconstruct(cloud, config)
+        } else {
+            let mut with = cloud.clone();
+            NormalEstimator::default().estimate_normals(&mut with);
+            implicit::reconstruct(&with, config)
         }
     }
 

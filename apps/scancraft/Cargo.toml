@@ -25,6 +25,7 @@ glam.workspace = true
 eframe.workspace = true
 egui.workspace = true
 egui-wgpu.workspace = true
+rfd.workspace = true
 wgpu.workspace = true
 tokio.workspace = true
 log.workspace = true

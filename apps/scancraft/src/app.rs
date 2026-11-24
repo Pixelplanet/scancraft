@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{self, TextureHandle, TextureOptions};
-use scancraft_core::{BoundingBox, PointCloud};
+use scancraft_core::{BoundingBox, PointCloud, Transform};
 use scancraft_driver::mock::MockDriver;
 use scancraft_driver::{DeviceParam, DeviceTransport, DiscoveredDevice, DriverRegistry, ModeSupport, ScanConfig};
 use scancraft_driver_revopoint::RevopointDriver;
@@ -20,7 +20,7 @@ use tokio::sync::mpsc;
 
 use crate::isolation::{self, ObjectPicking};
 use crate::model::*;
-use crate::project::{self, AlignMethod, AlignState, PassMeta, PassStart, ProjectInfo};
+use crate::project::{self, AlignMethod, AlignState, PassMeta, PassSource, PassStart, ProjectInfo};
 use crate::scan_modes::{self, Choice};
 use crate::worker::{self, WorkerConfig};
 
@@ -94,9 +94,18 @@ pub struct Settings {
     pub voxel_mm: f32,
     pub crop_min: [f32; 3],
     pub crop_max: [f32; 3],
+    /// Reconstruct: triangle size, smoothness (support radius in point spacings) and the
+    /// feature-preserving smoothing applied right after.
     pub mc_cell_mm: f32,
+    pub mesh_smoothness: f32,
+    pub mesh_auto_smooth: usize,
+    /// Smooth: strength (normal-filtering iterations) and how much edges are kept (0–1).
     pub smooth_iterations: usize,
-    pub smooth_lambda: f32,
+    pub smooth_keep_edges: f32,
+    /// Fill Holes: largest hole filled (boundary length) and whether the largest opening (the
+    /// border of an open scan) stays open.
+    pub fill_max_mm: f32,
+    pub fill_keep_largest: bool,
     pub decimate_ratio: f32,
     pub export_path: String,
     pub export_format: ExportFormat,
@@ -109,7 +118,8 @@ pub struct Settings {
     /// Align, refine and merge whole passes, table and loose fragments included (otherwise
     /// each pass's object only).
     pub whole_scene: bool,
-    /// Scan file for Import Scan, and project folder for Add Project.
+    /// Last file chosen for Import Scan, and last folder for Add Project: where their dialogs
+    /// open next time.
     pub import_path: String,
     pub add_project_path: String,
 }
@@ -126,9 +136,13 @@ impl Default for Settings {
             voxel_mm: 0.8,
             crop_min: [-150.0, 100.0, -150.0],
             crop_max: [150.0, 450.0, 150.0],
-            mc_cell_mm: 1.0,
-            smooth_iterations: 2,
-            smooth_lambda: 0.35,
+            mc_cell_mm: 0.7,
+            mesh_smoothness: 3.0,
+            mesh_auto_smooth: 4,
+            smooth_iterations: 4,
+            smooth_keep_edges: 0.7,
+            fill_max_mm: 60.0,
+            fill_keep_largest: true,
             decimate_ratio: 0.5,
             export_path: "scan.ply".to_string(),
             export_format: ExportFormat::PlyCloud,
@@ -147,6 +161,13 @@ impl Default for Settings {
 /// path" adds quotes).
 fn trim_quotes(path: &str) -> String {
     path.trim().trim_matches('"').trim().to_string()
+}
+
+/// The feature-preserving smoother for a strength (iterations) and how much edges are kept (0 =
+/// smooth like a Laplacian, 1 = keep creases crisp).
+fn smoother(strength: usize, keep_edges: f32) -> scancraft_mesh::FeatureSmoother {
+    let keep = keep_edges.clamp(0.0, 1.0);
+    scancraft_mesh::FeatureSmoother { iterations: strength, sigma_normal: 1.2 + (0.22 - 1.2) * keep, ..Default::default() }
 }
 
 fn default_project_path() -> String {
@@ -254,8 +275,9 @@ pub struct ScanCraftApp {
     next_pass_id: u32,
     next_generation: u64,
     pub merged: Option<MergedLayer>,
-    pub cleaned: Option<CloudLayer>,
     pub mesh: Option<MeshLayer>,
+    /// Fill Holes: the current mesh's holes.
+    pub holes: Option<HolePreview>,
     pub history: History,
     pub settings: Settings,
     pub project: ProjectInfo,
@@ -275,6 +297,8 @@ pub struct ScanCraftApp {
     pub toast_action: Option<ToastAction>,
     /// Dropped scan files and project folders still to add, one job each.
     pending_imports: std::collections::VecDeque<std::path::PathBuf>,
+    /// The open file / folder dialog, if any.
+    pub picker: crate::file_picker::FilePicker,
     /// Align stage: show each pass in its own colour.
     pub colour_passes: bool,
 
@@ -372,7 +396,7 @@ impl ScanCraftApp {
             next_pass_id: 1,
             next_generation: 1,
             merged: None,
-            cleaned: None,
+            holes: None,
             mesh: None,
             history: History::default(),
             settings: Settings::default(),
@@ -386,6 +410,7 @@ impl ScanCraftApp {
             toast: None,
             toast_action: None,
             pending_imports: Default::default(),
+            picker: Default::default(),
             colour_passes: true,
             stage: Stage::Connect,
             tool: None,
@@ -467,19 +492,18 @@ impl ScanCraftApp {
         }
     }
 
-    /// Drops the cleaned cloud and the mesh: they were made from passes that have since moved
-    /// (or from an older merge), and cleaning or meshing must not start from them. The caller has
-    /// pushed an undo snapshot that still holds them. Returns whether anything was dropped.
+    /// Drops the mesh: it was made from passes that have since moved (or from an older merge),
+    /// and meshing must not start from it. The caller has pushed an undo snapshot that still
+    /// holds it. Returns whether anything was dropped. (Each pass's cleaning is in its own frame
+    /// and moves with it.)
     pub fn invalidate_derived(&mut self, reason: &str) -> bool {
-        let dropped: Vec<&str> = [self.cleaned.is_some().then_some("cleaned cloud"), self.mesh.is_some().then_some("mesh")].into_iter().flatten().collect();
-        self.cleaned = None;
+        let dropped: Vec<&str> = [self.mesh.is_some().then_some("mesh")].into_iter().flatten().collect();
         self.mesh = None;
-        // An open Isolate Object tool works on a copy of the old cloud: its object must not
-        // come back as the cleaned cloud.
+        // An open Isolate Object tool works on a copy of the old points, placed as they were.
         if self.object_picking.take().is_some() && self.tool == Some(Tool::IsolateObject) {
             self.tool = None;
         }
-        if matches!(self.selection, Some(Node::Cleaned | Node::Mesh)) {
+        if matches!(self.selection, Some(Node::Mesh)) {
             self.selection = None;
         }
         if dropped.is_empty() {
@@ -702,7 +726,7 @@ impl ScanCraftApp {
     /// Start capturing into an existing pass, with its tracker: the scan carries on from that
     /// pass's last kept frame.
     pub fn continue_scan(&mut self, pass: u32) {
-        if !self.passes.iter().any(|p| p.id == pass && !p.is_fixed()) {
+        if !self.passes.iter().any(|p| p.id == pass && !p.is_fixed() && !p.is_cleaned()) {
             return;
         }
         self.continue_pass = Some(pass);
@@ -902,6 +926,7 @@ impl ScanCraftApp {
                                 tinted: None,
                                 mask: isolation::new_cache(),
                                 surface: None,
+                                edit: None,
                             });
                             (id, tracker, "Capturing")
                         }
@@ -1053,15 +1078,15 @@ impl ScanCraftApp {
         self.passes.iter().map(|p| p.layer.len()).sum()
     }
 
-    /// The passes cleaning and meshing work on: the visible ones, or all when none is visible
-    /// (a result hides the passes it was made from).
+    /// The passes meshing and export work on: the visible ones, or all when none is visible
+    /// (a result hides the passes it was made from). Cleaning uses `clean_targets` instead.
     pub fn input_passes(&self) -> impl Iterator<Item = &ScanPass> {
         let any_visible = self.passes.iter().any(|p| p.layer.visible);
         self.passes.iter().filter(move |p| p.layer.visible || !any_visible)
     }
 
-    /// The visible passes put together: the input to cleaning when there is neither a merged
-    /// model nor a cleaned cloud.
+    /// The visible passes (all when none is visible) put together: what meshing and point export
+    /// take when the merged model is not shown.
     pub fn merged_passes(&self) -> PointCloud {
         let mut points = Vec::with_capacity(self.input_passes().map(|p| p.layer.len()).sum());
         for p in self.input_passes() {
@@ -1070,30 +1095,70 @@ impl ScanCraftApp {
         PointCloud::from_points(points)
     }
 
-    /// The cloud the next clean or mesh operation works on: the cleaned cloud, else the merged
-    /// model, else the visible passes.
+    /// Whether meshing and export take the merged model: it is shown, or nothing is shown and
+    /// it exists.
+    fn working_is_merged(&self) -> bool {
+        self.merged.as_ref().is_some_and(|m| m.layer.visible || !self.passes.iter().any(|p| p.layer.visible))
+    }
+
+    /// The cloud meshing and point export work on: the merged model when it is shown, else the
+    /// visible passes (each as cleaned).
     pub fn working_cloud(&self) -> PointCloud {
-        match (&self.cleaned, &self.merged) {
-            (Some(c), _) => c.cloud.clone(),
-            (None, Some(m)) => m.layer.cloud.clone(),
-            (None, None) => self.merged_passes(),
+        match &self.merged {
+            Some(m) if self.working_is_merged() => m.layer.cloud.clone(),
+            _ => self.merged_passes(),
         }
     }
 
     pub fn working_len(&self) -> usize {
-        match (&self.cleaned, &self.merged) {
-            (Some(c), _) => c.len(),
-            (None, Some(m)) => m.layer.len(),
-            (None, None) => self.input_passes().map(|p| p.layer.len()).sum(),
+        match &self.merged {
+            Some(m) if self.working_is_merged() => m.layer.len(),
+            _ => self.input_passes().map(|p| p.layer.len()).sum(),
         }
     }
 
     /// What [`working_cloud`](Self::working_cloud) is, for labels.
     pub fn working_source(&self) -> &'static str {
-        match (&self.cleaned, &self.merged) {
-            (Some(_), _) => "Cleaned cloud",
-            (None, Some(_)) => "Merged model",
-            (None, None) => "Scan passes",
+        if self.working_is_merged() { "Merged model" } else { "Scan passes" }
+    }
+
+    /// What the Clean tools work on, each on its own: every shown pass, and the merged model
+    /// when it is shown. Hidden ones are left alone.
+    pub fn clean_targets(&self) -> Vec<CleanTarget> {
+        let mut targets: Vec<CleanTarget> = self.passes.iter().filter(|p| p.layer.visible && p.layer.len() > 0).map(|p| CleanTarget::Pass(p.id)).collect();
+        if self.merged.as_ref().is_some_and(|m| m.layer.visible && m.layer.len() > 0) {
+            targets.push(CleanTarget::Merged);
+        }
+        targets
+    }
+
+    /// Points the Clean tools would work on.
+    pub fn clean_len(&self) -> usize {
+        self.clean_targets().iter().map(|t| self.target_cloud(*t).map_or(0, |c| c.len())).sum()
+    }
+
+    /// A clean target's points as shown (project frame).
+    pub fn target_cloud(&self, target: CleanTarget) -> Option<&PointCloud> {
+        match target {
+            CleanTarget::Pass(id) => self.passes.iter().find(|p| p.id == id).map(|p| &p.layer.cloud),
+            CleanTarget::Merged => self.merged.as_ref().map(|m| &m.layer.cloud),
+        }
+    }
+
+    pub fn target_name(&self, target: CleanTarget) -> String {
+        match target {
+            CleanTarget::Pass(id) => self.pass_name(id),
+            CleanTarget::Merged => "Merged model".to_string(),
+        }
+    }
+
+    /// The Clean tools' targets for labels: "Pass 1, Pass 2", or how many.
+    pub fn clean_targets_label(&self) -> String {
+        let targets = self.clean_targets();
+        match targets.len() {
+            0 => "Nothing shown".to_string(),
+            1..=3 => targets.iter().map(|t| self.target_name(*t)).collect::<Vec<_>>().join(", "),
+            n => format!("{n} scans"),
         }
     }
 
@@ -1102,9 +1167,6 @@ impl ScanCraftApp {
         if let Some(m) = self.merged.as_ref().filter(|m| m.layer.visible && m.layer.len() > 0) {
             boxes.push(m.layer.cloud.bbox);
         }
-        if let Some(c) = self.cleaned.as_ref().filter(|c| c.visible && c.len() > 0) {
-            boxes.push(c.cloud.bbox);
-        }
         if let Some(m) = self.mesh.as_ref().filter(|m| m.visible) {
             boxes.push(m.mesh.bbox);
         }
@@ -1112,13 +1174,12 @@ impl ScanCraftApp {
     }
 
     pub fn has_geometry(&self) -> bool {
-        self.total_points() > 0 || self.merged.is_some() || self.cleaned.is_some() || self.mesh.is_some()
+        self.total_points() > 0 || self.merged.is_some() || self.mesh.is_some()
     }
 
     fn snapshot(&self, label: &str) -> Snapshot {
         Snapshot {
             merged: self.merged.as_ref().map(|m| (m.layer.cloud.clone(), m.passes.clone(), m.summary.clone())),
-            cleaned: self.cleaned.as_ref().map(|c| c.cloud.clone()),
             mesh: self.mesh.as_ref().map(|m| (m.mesh.clone(), m.analysis.clone())),
             passes: self
                 .passes
@@ -1133,6 +1194,7 @@ impl ScanCraftApp {
                     meta: p.meta.clone(),
                     mask: p.mask.clone(),
                     surface: p.surface.clone(),
+                    edit: p.edit.clone(),
                 })
                 .collect(),
             label: label.to_string(),
@@ -1153,14 +1215,7 @@ impl ScanCraftApp {
             m.layer.visible = merged_visible;
             m
         });
-        let cleaned_visible = self.cleaned.as_ref().is_none_or(|c| c.visible);
         let mesh_visible = self.mesh.as_ref().is_none_or(|m| m.visible);
-        self.cleaned = s.cleaned.map(|c| {
-            let g = self.generation();
-            let mut layer = CloudLayer::new(c, g);
-            layer.visible = cleaned_visible;
-            layer
-        });
         self.mesh = s.mesh.map(|(m, a)| {
             let g = self.generation();
             let mut layer = MeshLayer::new(m, a, g);
@@ -1187,7 +1242,7 @@ impl ScanCraftApp {
                 if differs {
                     resync.push((p.id, p.tracker.clone(), flags));
                 }
-                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface }
+                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit }
             })
             .collect();
         match self.selection {
@@ -1238,6 +1293,10 @@ impl ScanCraftApp {
         if !self.can_edit_frames() {
             return;
         }
+        if self.passes.iter().any(|p| p.id == pass && p.is_cleaned()) {
+            self.say(Tone::Warning, "This pass is cleaned: reset its cleaning before discarding or restoring frames");
+            return;
+        }
         let Some(tracker) = self.passes.iter().find(|p| p.id == pass).map(|p| p.tracker.clone()) else { return };
         let verb = if discarded { "Discarded" } else { "Restored" };
         self.history.push(self.snapshot(&format!("{} frame {frame}", if discarded { "discard" } else { "restore" })));
@@ -1256,6 +1315,10 @@ impl ScanCraftApp {
             return;
         }
         let Some(p) = self.passes.iter().find(|p| p.id == pass) else { return };
+        if p.is_cleaned() {
+            self.say(Tone::Warning, "This pass is cleaned: reset its cleaning before discarding frames");
+            return;
+        }
         let tracker = p.tracker.clone();
         let n = p.keyframes.iter().filter(|k| k.id >= frame && !k.discarded).count();
         self.history.push(self.snapshot(&format!("discard frames from {frame}")));
@@ -1346,18 +1409,6 @@ impl ScanCraftApp {
         self.say(Tone::Normal, format!("Deleted {name}"));
     }
 
-    pub fn discard_cleaned(&mut self) {
-        if !self.can_edit() || self.cleaned.is_none() {
-            return;
-        }
-        self.history.push(self.snapshot("Discard cleaned cloud"));
-        self.cleaned = None;
-        if self.selection == Some(Node::Cleaned) {
-            self.selection = None;
-        }
-        self.say(Tone::Normal, "Discarded the cleaned cloud; cleaning starts again from the scan passes");
-    }
-
     pub fn discard_mesh(&mut self) {
         if !self.can_edit() || self.mesh.is_none() {
             return;
@@ -1380,7 +1431,6 @@ impl ScanCraftApp {
         self.picking = None;
         self.object_picking = None;
         self.merged = None;
-        self.cleaned = None;
         self.mesh = None;
         self.selection = None;
         self.framed_radius = 0.0;
@@ -1403,12 +1453,19 @@ impl ScanCraftApp {
                 }
             }
             _ if self.capture != Capture::Idle => Some("Stop the capture first"),
-            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::Reconstruct => {
-                (self.working_len() == 0).then_some("No points to work on: scan first")
+            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop => {
+                if !self.has_geometry() {
+                    Some("No points to work on: scan or import first")
+                } else if self.clean_len() == 0 {
+                    Some("Nothing shown: show the scans to clean")
+                } else {
+                    None
+                }
             }
+            Tool::Reconstruct => (self.working_len() == 0).then_some("No points to work on: scan first"),
             Tool::IsolateObject => {
-                if self.object_picking.is_none() && self.working_len() == 0 {
-                    Some("No points to work on: scan first")
+                if let Some(why) = self.isolate_blocked() {
+                    Some(why)
                 } else if self.object_picking.as_ref().is_some_and(|o| !o.current()) {
                     Some("Finding the object…")
                 } else {
@@ -1416,9 +1473,13 @@ impl ScanCraftApp {
                 }
             }
             Tool::Smooth | Tool::Decimate => self.mesh.is_none().then_some("Reconstruct a surface first"),
+            Tool::FillHoles => match &self.mesh {
+                None => Some("Reconstruct a surface first"),
+                Some(m) if m.analysis.open_edges == 0 => Some("The mesh has no holes"),
+                Some(_) => None,
+            },
             Tool::PointPairs(id) => self.pairs_blocked(id),
             Tool::SaveProject => (!self.has_geometry()).then_some("Nothing to save yet"),
-            Tool::OpenProject | Tool::ImportScan | Tool::AddProject => None,
             Tool::Export(f) => {
                 if f.needs_mesh() {
                     self.mesh.is_none().then_some("Reconstruct a surface first")
@@ -1499,22 +1560,190 @@ impl ScanCraftApp {
 
     /// Whether a job result changed geometry (its undo snapshot is kept).
     fn changes_geometry(result: &JobResult) -> bool {
-        matches!(result, JobResult::Cloud { .. } | JobResult::Mesh { .. } | JobResult::Merged { .. } | JobResult::Imported(_) | JobResult::AddedProject { .. })
+        matches!(result, JobResult::Cleaned { .. } | JobResult::Mesh { .. } | JobResult::Merged { .. } | JobResult::Imported(_) | JobResult::AddedProject { .. })
     }
 
-    /// The cleaned cloud is replaced (a filter's result, or the isolated object).
-    fn set_cleaned(&mut self, cloud: PointCloud, message: String) {
+    /// Runs a Clean filter on each shown pass and on the shown merged model, each on its own
+    /// (undoable). `filter` gets the points in the project frame (so a crop box means the same for
+    /// every pass) and returns `None` when it finds nothing to do. `noun` names what is removed in
+    /// the message ("plane points removed").
+    fn spawn_clean(&mut self, label: &str, undo_label: &str, noun: &'static str, filter: impl Fn(&PointCloud) -> Option<PointCloud> + Send + Sync + 'static) {
+        let targets = self.clean_targets();
+        if targets.is_empty() {
+            self.say(Tone::Warning, "Nothing shown to clean: show the scans to work on");
+            return;
+        }
+        // (target, name, surface to clean in its own frame, project <- own frame)
+        enum Input {
+            Pass(u32, String, PassSource, Transform),
+            Merged(PointCloud),
+        }
+        let inputs: Vec<Input> = targets
+            .iter()
+            .filter_map(|t| match *t {
+                CleanTarget::Pass(id) => self.passes.iter().find(|p| p.id == id).map(|p| Input::Pass(id, p.name.clone(), p.source(), p.meta.transform)),
+                CleanTarget::Merged => self.merged.as_ref().map(|m| Input::Merged(m.layer.cloud.clone())),
+            })
+            .collect();
+        self.spawn_undoable(label, undo_label, move || {
+            use rayon::prelude::*;
+            // (name, before, after or None when unchanged, result in the target's own frame)
+            let results: Vec<Result<(CleanTarget, String, usize, Option<PointCloud>), String>> = inputs
+                .into_par_iter()
+                .map(|input| match input {
+                    Input::Pass(id, name, source, t) => {
+                        let own = source.editable()?;
+                        let placed = PointCloud::from_points(project::place(own.points, &t));
+                        let before = placed.len();
+                        let out = filter(&placed).filter(|c| c.len() != before).map(|c| PointCloud::from_points(project::place(c.points, &t.inverse())));
+                        Ok((CleanTarget::Pass(id), name, before, out))
+                    }
+                    Input::Merged(cloud) => {
+                        let before = cloud.len();
+                        Ok((CleanTarget::Merged, "Merged model".to_string(), before, filter(&cloud).filter(|c| c.len() != before)))
+                    }
+                })
+                .collect();
+            let mut passes = Vec::new();
+            let mut merged = None;
+            let (mut changed, mut unchanged) = (Vec::new(), Vec::new());
+            let (mut before_total, mut after_total) = (0usize, 0usize);
+            for r in results {
+                let (target, name, before, out) = match r {
+                    Ok(r) => r,
+                    Err(e) => return JobResult::Failed(e),
+                };
+                match out {
+                    Some(cloud) => {
+                        before_total += before;
+                        after_total += cloud.len();
+                        changed.push(name);
+                        match target {
+                            CleanTarget::Pass(id) => passes.push((id, cloud)),
+                            CleanTarget::Merged => merged = Some(cloud),
+                        }
+                    }
+                    None => unchanged.push(name),
+                }
+            }
+            if changed.is_empty() {
+                return JobResult::NoChange(format!("Nothing {noun} in {}", unchanged.join(", ")));
+            }
+            let mut message = if after_total <= before_total {
+                format!("{}: {} {noun} points removed ({} → {})", changed.join(", "), thousands(before_total - after_total), thousands(before_total), thousands(after_total))
+            } else {
+                format!("{}: {} → {} points", changed.join(", "), thousands(before_total), thousands(after_total))
+            };
+            if !unchanged.is_empty() {
+                message.push_str(&format!(" · nothing {noun} in {}", unchanged.join(", ")));
+            }
+            JobResult::Cleaned { passes, merged, message }
+        });
+    }
+
+    /// Puts Clean results in place: each pass gets its cleaned surface, the merged model its new
+    /// cloud. Shown and hidden stay as they were.
+    fn apply_cleaned(&mut self, passes: Vec<(u32, PointCloud)>, merged: Option<PointCloud>) {
+        for (id, own) in passes {
+            let g = self.generation();
+            let Some(p) = self.passes.iter_mut().find(|p| p.id == id) else { continue };
+            let visible = p.layer.visible;
+            p.layer = CloudLayer::new(PointCloud::from_points(project::place(own.points.clone(), &p.meta.transform)), g);
+            p.layer.visible = visible;
+            p.edit = Some(Arc::new(own));
+            // Object isolation and the tinted copy were made from the old surface.
+            p.mask = isolation::new_cache();
+            p.tinted = None;
+        }
+        if let Some(cloud) = merged {
+            let g = self.generation();
+            if let Some(m) = self.merged.take() {
+                let visible = m.layer.visible;
+                let mut layer = MergedLayer::new(cloud, g, m.passes, m.summary);
+                layer.layer.visible = visible;
+                self.merged = Some(layer);
+            }
+        }
+    }
+
+    /// Finds the mesh's holes if the mesh changed, and colours their outlines for the current
+    /// Fill Holes settings (accent: filled, grey: left open).
+    pub fn refresh_holes(&mut self) {
+        let Some(mesh) = &self.mesh else {
+            self.holes = None;
+            return;
+        };
+        if self.holes.as_ref().is_none_or(|h| h.mesh_generation != mesh.generation) {
+            self.holes = Some(HolePreview { mesh_generation: mesh.generation, holes: scancraft_mesh::HoleFiller::find_holes(&mesh.mesh), outline: None });
+        }
+        let key = (self.settings.fill_max_mm, self.settings.fill_keep_largest);
+        let stale = self.holes.as_ref().is_some_and(|h| h.outline.as_ref().is_none_or(|(k, _)| *k != key));
+        if !stale {
+            return;
+        }
+        let Some(h) = self.holes.as_ref() else { return };
+        let fill = scancraft_core::ColorRgba::new(255, 140, 40, 255);
+        let open = scancraft_core::ColorRgba::new(140, 145, 155, 255);
+        let mut points = Vec::new();
+        for (i, hole) in h.holes.iter().enumerate() {
+            let colour = if h.fills(i, key.0, key.1) { fill } else { open };
+            let n = hole.vertices.len();
+            for k in 0..n {
+                let a = glam::Vec3::from(mesh.mesh.vertices[hole.vertices[k] as usize].position);
+                let b = glam::Vec3::from(mesh.mesh.vertices[hole.vertices[(k + 1) % n] as usize].position);
+                // Dense enough along each edge to read as a line.
+                let steps = ((a.distance(b) / 0.15).ceil() as usize).clamp(1, 64);
+                for s in 0..steps {
+                    let p = a.lerp(b, s as f32 / steps as f32);
+                    points.push(scancraft_core::Point3D::new(p.to_array()).with_color(colour));
+                }
+            }
+        }
         let g = self.generation();
-        self.cleaned = Some(CloudLayer::new(cloud, g));
-        // The cleaned cloud replaces the passes and the merged model on screen.
-        for p in &mut self.passes {
-            p.layer.visible = false;
+        if let Some(h) = self.holes.as_mut() {
+            h.outline = Some((key, CloudLayer::new(PointCloud::from_points(points), g)));
         }
-        if let Some(m) = &mut self.merged {
-            m.layer.visible = false;
+    }
+
+    /// Whether any shown pass has been cleaned (Reset Cleaning has something to do).
+    pub fn can_reset_cleaning(&self) -> bool {
+        self.passes.iter().any(|p| p.layer.visible && p.is_cleaned())
+    }
+
+    /// Takes the shown passes back to their surfaces as scanned or imported (undoable).
+    pub fn reset_cleaning(&mut self) {
+        let ids: Vec<u32> = self.passes.iter().filter(|p| p.layer.visible && p.is_cleaned()).map(|p| p.id).collect();
+        self.reset_cleaning_of(&ids);
+    }
+
+    /// Takes the given passes back to their surfaces as scanned or imported (undoable).
+    pub fn reset_cleaning_of(&mut self, ids: &[u32]) {
+        if !self.can_edit() || !self.passes.iter().any(|p| ids.contains(&p.id) && p.is_cleaned()) {
+            return;
         }
-        self.selection = Some(Node::Cleaned);
-        self.say(Tone::Success, message);
+        self.history.push(self.snapshot("Reset cleaning"));
+        let mut names = Vec::new();
+        for i in 0..self.passes.len() {
+            if !(ids.contains(&self.passes[i].id) && self.passes[i].is_cleaned()) {
+                continue;
+            }
+            self.passes[i].edit = None;
+            let own = match self.passes[i].source() {
+                PassSource::Fixed(s) => s.points.clone(),
+                PassSource::Tracked(t) => match t.lock() {
+                    Ok(t) => t.fused_points(),
+                    Err(_) => continue,
+                },
+                PassSource::Edited { .. } => continue,
+            };
+            let g = self.generation();
+            let p = &mut self.passes[i];
+            p.layer = CloudLayer::new(PointCloud::from_points(project::place(own, &p.meta.transform)), g);
+            p.mask = isolation::new_cache();
+            p.tinted = None;
+            names.push(p.name.clone());
+        }
+        self.say(Tone::Normal, format!("Reset the cleaning of {}", names.join(", ")));
     }
 
     // ------------------------------------------------------------------ isolate object
@@ -1524,14 +1753,46 @@ impl ScanCraftApp {
         if self.object_picking.is_some() {
             return true;
         }
-        let input = self.working_cloud();
-        if input.is_empty() || self.busy.is_some() {
+        if self.busy.is_some() || self.isolate_blocked().is_some() {
+            return false;
+        }
+        let Some(&target) = self.clean_targets().first() else { return false };
+        // A pass is isolated from its own surface (with observation counts), placed.
+        let input = match target {
+            CleanTarget::Pass(id) => {
+                let Some(p) = self.passes.iter().find(|p| p.id == id) else { return false };
+                match p.source().editable() {
+                    Ok(own) => PointCloud::from_points(project::place(own.points, &p.meta.transform)),
+                    Err(e) => {
+                        self.say(Tone::Error, e);
+                        return false;
+                    }
+                }
+            }
+            CleanTarget::Merged => match &self.merged {
+                Some(m) => m.layer.cloud.clone(),
+                None => return false,
+            },
+        };
+        if input.is_empty() {
             return false;
         }
         let g = self.generation();
-        self.object_picking = Some(ObjectPicking::new(input, g));
+        self.object_picking = Some(ObjectPicking::new(input, g, target));
         self.segment_picks();
         true
+    }
+
+    /// Why Isolate Object cannot start: it works on one scan (or the merged model) at a time.
+    pub fn isolate_blocked(&self) -> Option<&'static str> {
+        if self.object_picking.is_some() {
+            return None;
+        }
+        match self.clean_targets().len() {
+            0 => Some("Nothing shown: show the scan to isolate"),
+            1 => None,
+            _ => Some("Show only the scan to isolate (hide the others)"),
+        }
     }
 
     /// Adds a pick (keep or exclude) at `point` and segments again.
@@ -1571,16 +1832,25 @@ impl ScanCraftApp {
         });
     }
 
-    /// The Isolate Object tool's OK: its object becomes the cleaned cloud (undoable).
+    /// The Isolate Object tool's OK: its object replaces the pass's (or merged model's) points
+    /// (undoable).
     fn commit_object(&mut self) {
         let Some(object) = self.object_picking.as_ref().filter(|o| o.current()).and_then(|o| o.object()) else {
             self.say(Tone::Warning, "No object found: click a cluster of points to keep");
             return;
         };
-        let before = self.object_picking.as_ref().map_or(0, |o| o.input.len());
+        let Some((before, target)) = self.object_picking.as_ref().map(|o| (o.input.len(), o.target)) else { return };
         self.history.push(self.snapshot("Isolate object"));
-        let message = format!("Kept the object: {} of {} points", thousands(object.len()), thousands(before));
-        self.set_cleaned(object, message);
+        let message = format!("{}: kept the object, {} of {} points", self.target_name(target), thousands(object.len()), thousands(before));
+        match target {
+            CleanTarget::Pass(id) => {
+                let Some(t) = self.passes.iter().find(|p| p.id == id).map(|p| p.meta.transform) else { return };
+                let own = PointCloud::from_points(project::place(object.points, &t.inverse()));
+                self.apply_cleaned(vec![(id, own)], None);
+            }
+            CleanTarget::Merged => self.apply_cleaned(Vec::new(), Some(object)),
+        }
+        self.say(Tone::Success, message);
         self.object_picking = None;
         self.tool = None;
     }
@@ -1601,23 +1871,8 @@ impl ScanCraftApp {
                 return;
             }
             Tool::SaveProject => {
-                let path = self.settings.project_path.trim().to_string();
+                let path = trim_quotes(&self.settings.project_path);
                 self.save_project(std::path::PathBuf::from(path));
-                return;
-            }
-            Tool::OpenProject => {
-                let path = self.settings.project_path.trim().to_string();
-                self.open_project(std::path::PathBuf::from(path));
-                return;
-            }
-            Tool::ImportScan => {
-                let path = trim_quotes(&self.settings.import_path);
-                self.import_scan(std::path::PathBuf::from(path));
-                return;
-            }
-            Tool::AddProject => {
-                let path = trim_quotes(&self.settings.add_project_path);
-                self.add_project(std::path::PathBuf::from(path));
                 return;
             }
             Tool::IsolateObject => {
@@ -1625,63 +1880,81 @@ impl ScanCraftApp {
                 return;
             }
             Tool::RemovePlane => {
-                let input = self.working_cloud();
                 let tolerance = s.plane_tolerance_mm;
-                self.spawn_undoable("Removing the dominant plane", "Remove plane", move || {
-                    let before = input.len();
-                    let (cleaned, plane) = RansacPlaneFilter::new(tolerance, 150, PlaneFilterMode::ClipBelow).filter(&input);
-                    match plane {
-                        Some(_) => JobResult::Cloud { message: format!("Removed {} plane points", thousands(before - cleaned.len())), cloud: cleaned },
-                        None => JobResult::NoChange("No dominant plane found".into()),
-                    }
+                self.spawn_clean("Removing the dominant plane", "Remove plane", "plane", move |c| {
+                    let (cleaned, plane) = RansacPlaneFilter::new(tolerance, 150, PlaneFilterMode::ClipBelow).filter(c);
+                    plane.map(|_| cleaned)
                 });
             }
             Tool::Outliers => {
-                let input = self.working_cloud();
                 let (k, sd) = (s.sor_neighbors, s.sor_std_dev);
-                self.spawn_undoable("Removing outliers", "Remove outliers", move || {
-                    let before = input.len();
-                    let cleaned = StatisticalOutlierFilter::new(k, sd).filter(&input);
-                    JobResult::Cloud { message: format!("Removed {} outliers", thousands(before - cleaned.len())), cloud: cleaned }
-                });
+                self.spawn_clean("Removing outliers", "Remove outliers", "outlier", move |c| Some(StatisticalOutlierFilter::new(k, sd).filter(c)));
             }
             Tool::Downsample => {
-                let input = self.working_cloud();
                 let voxel = s.voxel_mm;
-                self.spawn_undoable("Downsampling", "Downsample", move || {
-                    let before = input.len();
-                    let fused = VoxelFilter::new(voxel).filter(&input);
-                    JobResult::Cloud { message: format!("Downsampled {} → {} points", thousands(before), thousands(fused.len())), cloud: fused }
-                });
+                self.spawn_clean("Downsampling", "Downsample", "merged", move |c| Some(VoxelFilter::new(voxel).filter(c)));
             }
             Tool::Crop => {
-                let input = self.working_cloud();
                 let bbox = BoundingBox::from_arrays(s.crop_min, s.crop_max);
-                self.spawn_undoable("Cropping", "Crop", move || {
-                    let before = input.len();
-                    let cropped = RoiCropFilter::new(bbox).filter(&input);
-                    JobResult::Cloud { message: format!("Cropped away {} points", thousands(before - cropped.len())), cloud: cropped }
-                });
+                self.spawn_clean("Cropping", "Crop", "cropped", move |c| Some(RoiCropFilter::new(bbox).filter(c)));
             }
             Tool::Reconstruct => {
                 let input = self.working_cloud();
-                let cell = s.mc_cell_mm;
+                let config = scancraft_mesh::SurfaceConfig { cell_mm: s.mc_cell_mm, detail: s.mesh_smoothness, ..Default::default() };
+                let smoother = (s.mesh_auto_smooth > 0).then(|| smoother(s.mesh_auto_smooth, s.smooth_keep_edges));
                 self.spawn_undoable("Reconstructing the surface", "Reconstruct surface", move || {
-                    let mesh = Mesher::reconstruct(&input, cell);
+                    let (mut mesh, stats) = Mesher::reconstruct_with_stats(&input, &config);
                     if mesh.triangles.is_empty() {
-                        return JobResult::Failed("Reconstruction produced no surface; try a larger cell size".into());
+                        return JobResult::Failed("Reconstruction produced no surface; try a larger cell size or more smoothness".into());
+                    }
+                    if let Some(sm) = smoother {
+                        sm.smooth(&mut mesh);
                     }
                     let analysis = Mesher::analyze(&mesh);
-                    JobResult::Mesh { message: format!("Reconstructed {} triangles", thousands(analysis.triangle_count)), mesh, analysis }
+                    let holes = scancraft_mesh::HoleFiller::find_holes(&mesh).len();
+                    let message = format!(
+                        "Reconstructed {} triangles (point spacing {:.2} mm, smoothing radius {:.1} mm){}",
+                        thousands(analysis.triangle_count),
+                        stats.point_spacing_mm,
+                        stats.support_radius_mm,
+                        if holes > 0 { format!(" · {holes} openings: Fill Holes closes them") } else { String::new() }
+                    );
+                    JobResult::Mesh { message, mesh, analysis }
                 });
             }
             Tool::Smooth => {
                 let Some(mut mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
-                let (it, lambda) = (s.smooth_iterations, s.smooth_lambda);
+                let sm = smoother(s.smooth_iterations, s.smooth_keep_edges);
+                let it = s.smooth_iterations;
                 self.spawn_undoable("Smoothing", "Smooth", move || {
-                    Mesher::smooth(&mut mesh, it, lambda);
+                    sm.smooth(&mut mesh);
                     let analysis = Mesher::analyze(&mesh);
-                    JobResult::Mesh { mesh, analysis, message: format!("Smoothed ({it} iterations)") }
+                    JobResult::Mesh { mesh, analysis, message: format!("Smoothed (strength {it})") }
+                });
+            }
+            Tool::FillHoles => {
+                let Some(mut mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
+                let filler = scancraft_mesh::HoleFiller { max_perimeter_mm: s.fill_max_mm, keep_largest: s.fill_keep_largest };
+                self.spawn_undoable("Filling holes", "Fill holes", move || {
+                    let report = filler.fill(&mut mesh);
+                    if report.filled == 0 {
+                        return JobResult::NoChange("No hole small enough to fill: raise the maximum size".into());
+                    }
+                    mesh.recompute_normals();
+                    let analysis = Mesher::analyze(&mesh);
+                    let left = scancraft_mesh::HoleFiller::find_holes(&mesh).len();
+                    let message = format!(
+                        "Filled {} hole{} (+{} triangles){}",
+                        report.filled,
+                        if report.filled == 1 { "" } else { "s" },
+                        thousands(report.added_triangles),
+                        match (left, analysis.is_watertight) {
+                            (_, true) => " · the mesh is watertight".to_string(),
+                            (0, false) => String::new(),
+                            (n, false) => format!(" · {n} opening{} left", if n == 1 { "" } else { "s" }),
+                        }
+                    );
+                    JobResult::Mesh { mesh, analysis, message }
                 });
             }
             Tool::Decimate => {
@@ -1728,6 +2001,69 @@ impl ScanCraftApp {
         self.next_import();
     }
 
+    /// Opens a native file / folder dialog; its answer is handled by `poll_picker`.
+    pub fn pick(&mut self, ctx: &egui::Context, purpose: crate::file_picker::PickPurpose) {
+        use crate::file_picker::PickPurpose as P;
+        let hint = match purpose {
+            P::ImportScans => self.settings.import_path.clone(),
+            P::AddProjects => self.settings.add_project_path.clone(),
+            P::OpenProject | P::SaveFolder => self.settings.project_path.clone(),
+            P::ExportFile => {
+                let path = std::path::Path::new(self.settings.export_path.trim());
+                if path.is_absolute() {
+                    path.display().to_string()
+                } else {
+                    std::env::current_dir().map(|d| d.join(path).display().to_string()).unwrap_or_default()
+                }
+            }
+        };
+        self.picker.open(ctx, purpose, &hint);
+    }
+
+    /// Acts on a dialog that has just closed: imports, opens, or fills in the chosen path.
+    pub fn poll_picker(&mut self) {
+        use crate::file_picker::PickPurpose as P;
+        let Some(picked) = self.picker.poll() else { return };
+        let Some(first) = picked.paths.first().cloned() else { return };
+        match picked.purpose {
+            P::ImportScans => {
+                self.settings.import_path = first.display().to_string();
+                self.queue_imports(picked.paths);
+            }
+            P::AddProjects => {
+                self.settings.add_project_path = first.display().to_string();
+                let (projects, others): (Vec<_>, Vec<_>) = picked.paths.into_iter().partition(|p| scancraft_io::project::is_project(p));
+                if let Some(p) = others.first() {
+                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no project.json)", p.display()));
+                }
+                self.queue_imports(projects);
+            }
+            P::OpenProject => {
+                if scancraft_io::project::is_project(&first) {
+                    self.settings.project_path = first.display().to_string();
+                    self.open_project(first);
+                } else {
+                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no project.json)", first.display()));
+                }
+            }
+            P::SaveFolder => self.settings.project_path = first.display().to_string(),
+            P::ExportFile => {
+                // The format follows the chosen extension when it names one we write.
+                let ext = first.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
+                let current = self.settings.export_format;
+                if ext.as_deref() != Some(current.extension()) {
+                    if let Some(f) = ExportFormat::ALL.iter().find(|f| Some(f.extension()) == ext.as_deref() && f.needs_mesh() == current.needs_mesh()).or_else(|| ExportFormat::ALL.iter().find(|f| Some(f.extension()) == ext.as_deref())) {
+                        self.set_export_format(*f);
+                        if self.tool.is_some_and(|t| matches!(t, Tool::Export(_))) {
+                            self.tool = Some(Tool::Export(*f));
+                        }
+                    }
+                }
+                self.settings.export_path = first.display().to_string();
+            }
+        }
+    }
+
     /// Starts the next queued import once nothing else runs.
     fn next_import(&mut self) {
         if self.import_blocked().is_some() {
@@ -1751,13 +2087,16 @@ impl ScanCraftApp {
                 self.history.push(snapshot);
             }
             match result {
-                JobResult::Cloud { cloud, message } => self.set_cleaned(cloud, message),
+                JobResult::Cleaned { passes, merged, message } => {
+                    self.apply_cleaned(passes, merged);
+                    self.say(Tone::Success, message);
+                }
                 JobResult::NoChange(message) => self.say(Tone::Warning, message),
                 JobResult::Mesh { mesh, analysis, message } => {
                     let g = self.generation();
                     self.mesh = Some(MeshLayer::new(mesh, analysis, g));
-                    if let Some(c) = &mut self.cleaned {
-                        c.visible = false;
+                    if let Some(m) = &mut self.merged {
+                        m.layer.visible = false;
                     }
                     for p in &mut self.passes {
                         p.layer.visible = false;
@@ -1768,9 +2107,12 @@ impl ScanCraftApp {
                 JobResult::Rebuilt { pass, points, keyframes, message } => {
                     let g = self.generation();
                     if let Some(p) = self.passes.iter_mut().find(|p| p.id == pass) {
-                        let visible = p.layer.visible;
-                        p.layer = CloudLayer::new(PointCloud::from_points(project::place(points, &p.meta.transform)), g);
-                        p.layer.visible = visible;
+                        // A cleaned pass keeps showing its cleaned surface.
+                        if p.edit.is_none() {
+                            let visible = p.layer.visible;
+                            p.layer = CloudLayer::new(PointCloud::from_points(project::place(points, &p.meta.transform)), g);
+                            p.layer.visible = visible;
+                        }
                         p.keyframes = keyframes;
                     }
                     self.say(Tone::Success, message);
@@ -1793,15 +2135,12 @@ impl ScanCraftApp {
                     self.segment_picks();
                 }
                 JobResult::Merged { cloud, passes, message } => {
-                    // Cleaning and meshing start again from the new model.
+                    // Meshing starts again from the new model.
                     self.invalidate_derived("New merged model");
                     let g = self.generation();
                     self.merged = Some(MergedLayer::new(cloud, g, passes, message.clone()));
                     for p in &mut self.passes {
                         p.layer.visible = false;
-                    }
-                    if let Some(c) = &mut self.cleaned {
-                        c.visible = false;
                     }
                     self.selection = Some(Node::Merged);
                     self.say(Tone::Success, message);
@@ -1867,7 +2206,7 @@ mod tests {
     use super::*;
     use crate::alignment::{EdgeChange, RefineOutcome};
     use scancraft_align::{Alignment, Quality};
-    use scancraft_core::{Mesh, Point3D, Transform};
+    use scancraft_core::{Mesh, Point3D};
 
     fn app() -> ScanCraftApp {
         let rt = Arc::new(Runtime::new().unwrap());
@@ -1891,16 +2230,16 @@ mod tests {
             tinted: None,
             mask: isolation::new_cache(),
             surface: None,
+            edit: None,
         });
     }
 
-    /// The app with two passes, a cleaned cloud and a mesh.
+    /// The app with two passes and a mesh.
     fn with_results() -> ScanCraftApp {
         let mut app = app();
         add_pass(&mut app, 1, AlignState::Reference);
         add_pass(&mut app, 2, AlignState::Unaligned);
         let g = app.generation();
-        app.cleaned = Some(CloudLayer::new(PointCloud::from_points(vec![Point3D::new([1.0, 2.0, 3.0])]), g));
         let mesh = Mesh::default();
         let analysis = Mesher::analyze(&mesh);
         app.mesh = Some(MeshLayer::new(mesh, analysis, g + 1));
@@ -1925,11 +2264,11 @@ mod tests {
         let transform = scancraft_align::rigid(glam::Quat::from_rotation_z(0.3), glam::Vec3::new(5.0, 0.0, 0.0));
         app.align_preview = Some(AlignPreview { pass: 2, method: AlignMethod::Auto, alignment: Alignment { transform, quality }, check: None, layer: CloudLayer::new(PointCloud::new(), g) });
         app.accept_preview();
-        assert!(app.cleaned.is_none() && app.mesh.is_none(), "the cleaned cloud and mesh were made before the pass moved");
+        assert!(app.mesh.is_none(), "the mesh was made before the pass moved");
         assert!(app.working_source() == "Scan passes");
         assert!(app.current_toast().is_some_and(|t| t.contains("Undo restores them")));
         app.undo();
-        assert!(app.cleaned.is_some() && app.mesh.is_some());
+        assert!(app.mesh.is_some());
         assert_eq!(app.passes[1].meta.alignment, AlignState::Unaligned);
     }
 
@@ -1938,7 +2277,7 @@ mod tests {
         let mut app = with_results();
         let input = app.working_cloud();
         let g = app.generation();
-        app.object_picking = Some(ObjectPicking::new(input, g));
+        app.object_picking = Some(ObjectPicking::new(input, g, CleanTarget::Merged));
         app.tool = Some(Tool::IsolateObject);
         app.invalidate_derived("Pass 2 was aligned");
         assert!(app.object_picking.is_none() && app.tool.is_none(), "the tool worked on the old cloud");
@@ -1957,7 +2296,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_merge_replaces_the_cleaned_cloud_and_mesh() {
+    fn a_new_merge_replaces_the_mesh() {
         let mut app = with_results();
         app.passes[1].meta.alignment = AlignState::Aligned { method: AlignMethod::Auto, quality: None };
         app.spawn_undoable("Merging passes", "merge", || JobResult::Merged {
@@ -1967,12 +2306,12 @@ mod tests {
         });
         finish_job(&mut app);
         assert!(app.merged.is_some());
-        assert!(app.cleaned.is_none() && app.mesh.is_none());
+        assert!(app.mesh.is_none());
         assert_eq!(app.working_source(), "Merged model");
         // One undo step brings back the state before the merge.
         assert_eq!(app.history.undo_label(), Some("merge"));
         app.undo();
-        assert!(app.merged.is_none() && app.cleaned.is_some() && app.mesh.is_some());
+        assert!(app.merged.is_none() && app.mesh.is_some());
     }
 
     #[test]
@@ -1981,7 +2320,7 @@ mod tests {
         app.spawn_undoable("Merging passes", "merge", || JobResult::Failed("tracker unavailable".into()));
         finish_job(&mut app);
         assert!(!app.history.can_undo(), "the failed merge left an undo step");
-        assert!(app.cleaned.is_some(), "a failed job must not touch the results");
+        assert!(app.mesh.is_some(), "a failed job must not touch the results");
         app.spawn_undoable("Removing outliers", "Remove outliers", || JobResult::NoChange("nothing".into()));
         finish_job(&mut app);
         assert!(!app.history.can_undo());
@@ -2013,7 +2352,7 @@ mod tests {
         assert!(app.poses_preview.is_none());
         assert_eq!(app.passes[1].meta.transform, moved);
         assert!(matches!(app.passes[1].meta.alignment, AlignState::Aligned { method: AlignMethod::Refined, quality: Some(r) } if r.rmse_mm == 0.3));
-        assert!(app.cleaned.is_none() && app.mesh.is_none());
+        assert!(app.mesh.is_none());
         app.undo();
         assert_eq!(app.passes[1].meta.transform, Transform::default());
     }
@@ -2114,10 +2453,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
-    #[test]
-    fn isolate_object_keeps_the_object_as_the_cleaned_cloud() {
-        let mut app = app();
-        // A table with a block on it, as one cleaned cloud.
+    /// An imported pass with a fixed surface, placed by `transform`.
+    fn add_fixed_pass(app: &mut ScanCraftApp, id: u32, points: Vec<Point3D>, transform: Transform) {
+        let g = app.generation();
+        let surface = Arc::new(PointCloud::from_points(points));
+        let mut meta = PassMeta::imported(format!("scan{id}.ply"));
+        meta.transform = transform;
+        meta.alignment = if id == 1 { AlignState::Reference } else { AlignState::Aligned { method: AlignMethod::Auto, quality: None } };
+        app.passes.push(ScanPass {
+            id,
+            name: format!("Scan {id}"),
+            layer: CloudLayer::new(PointCloud::from_points(project::place(surface.points.clone(), &transform)), g),
+            frames: 0,
+            tracker: Arc::new(std::sync::Mutex::new(scancraft_slam::Tracker::new())),
+            keyframes: Vec::new(),
+            meta,
+            tinted: None,
+            mask: isolation::new_cache(),
+            surface: Some(surface),
+            edit: None,
+        });
+    }
+
+    /// A table with a block on it (block: |x|, |y| <= 20, 0 <= z <= 40).
+    fn table_and_block() -> Vec<Point3D> {
         let mut points = Vec::new();
         for i in 0..100 {
             for j in 0..100 {
@@ -2137,22 +2496,87 @@ mod tests {
                 points.push(Point3D::new([u, -20.0 + b as f32, 40.0]).with_normal([0.0, 0.0, 1.0]));
             }
         }
-        let total = points.len();
-        let g = app.generation();
-        app.cleaned = Some(CloudLayer::new(PointCloud::from_points(points), g));
+        points
+    }
+
+    #[test]
+    fn clean_tools_work_on_each_shown_pass_and_leave_hidden_ones_alone() {
+        let mut app = app();
+        let total = table_and_block().len();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        // The second pass stands elsewhere and tilted in the project frame.
+        let moved = scancraft_align::rigid(glam::Quat::from_rotation_x(0.4), glam::Vec3::new(300.0, 0.0, 50.0));
+        add_fixed_pass(&mut app, 2, table_and_block(), moved);
+        app.stage = Stage::Clean;
+        // Work on scan 1 only.
+        app.passes[1].layer.visible = false;
+        assert_eq!(app.clean_targets(), vec![CleanTarget::Pass(1)]);
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        let first = app.passes[0].layer.len();
+        assert!(app.passes[0].is_cleaned() && first < total, "the table of scan 1 was removed ({first} of {total})");
+        assert!(!app.passes[1].is_cleaned() && app.passes[1].layer.len() == total, "the hidden scan was touched");
+        assert!(!app.passes[1].layer.visible && app.passes[0].layer.visible, "cleaning changed what is shown");
+        // Now scan 2 only: scan 1 keeps its cleaning, scan 2 loses its own (tilted) table.
+        app.passes[0].layer.visible = false;
+        app.passes[1].layer.visible = true;
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        assert_eq!(app.passes[0].layer.len(), first, "scan 1 was cleaned again while hidden");
+        let second = app.passes[1].layer.len();
+        assert!(app.passes[1].is_cleaned() && second < total && second > 5000, "scan 2 kept {second} of {total}");
+        // The cleaned surface is stored in the pass's own frame and is what merging reads.
+        let own = app.passes[1].edit.as_ref().unwrap();
+        assert!(own.points.iter().all(|p| p.position[2] > 0.5), "scan 2's table is gone in its own frame");
+        assert_eq!(app.passes[1].source().surfels().unwrap().len(), second);
+        assert!(own.points.iter().all(|p| p.confidence as u32 == crate::project::FIXED_OBSERVATIONS));
+        // Undo brings scan 2 back as imported, scan 1 stays cleaned.
+        app.undo();
+        assert!(!app.passes[1].is_cleaned() && app.passes[1].layer.len() == total);
+        assert!(app.passes[0].is_cleaned());
+        // Reset Cleaning on the shown scans only.
+        app.passes[0].layer.visible = true;
+        app.passes[1].layer.visible = false;
+        app.reset_cleaning();
+        assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
+    }
+
+    #[test]
+    fn nothing_shown_means_nothing_to_clean() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.passes[0].layer.visible = false;
+        assert!(app.tool_blocked(Tool::RemovePlane).is_some_and(|why| why.contains("show")));
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        assert!(app.tool_blocked(Tool::RemovePlane).is_none());
+        app.passes[0].layer.visible = true;
+        assert!(app.isolate_blocked().is_some_and(|why| why.contains("only")), "isolate works on one scan at a time");
+    }
+
+    #[test]
+    fn isolate_object_keeps_the_object_of_the_shown_pass() {
+        let mut app = app();
+        let total = table_and_block().len();
+        let moved = scancraft_align::rigid(glam::Quat::from_rotation_z(0.3), glam::Vec3::new(10.0, -5.0, 0.0));
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        add_fixed_pass(&mut app, 2, table_and_block(), moved);
+        app.passes[0].layer.visible = false;
         app.open_tool(Tool::IsolateObject);
         assert_eq!(app.tool, Some(Tool::IsolateObject));
         finish_job(&mut app);
-        assert!(app.object_picking.as_ref().is_some_and(|o| o.current()));
-        // A pick on the block keeps it.
-        app.add_object_pick(glam::Vec3::new(0.0, 0.0, 40.0), true);
+        assert!(app.object_picking.as_ref().is_some_and(|o| o.current() && o.target == CleanTarget::Pass(2)));
+        // A pick on the block (where it stands in the project frame) keeps it.
+        let pick = moved.to_mat4().transform_point3(glam::Vec3::new(0.0, 0.0, 40.0));
+        app.add_object_pick(pick, true);
         finish_job(&mut app);
         app.run_tool(Tool::IsolateObject);
-        let kept = app.cleaned.as_ref().map(|c| c.len()).unwrap_or(0);
-        assert!(kept > 5000 && kept < total, "kept {kept} of {total}");
-        assert!(app.cleaned.as_ref().unwrap().cloud.points.iter().all(|p| p.position[0].abs() < 25.0 && p.position[1].abs() < 25.0));
+        let kept = app.passes[1].layer.len();
+        assert!(app.passes[1].is_cleaned() && kept > 5000 && kept < total, "kept {kept} of {total}");
+        let own = app.passes[1].edit.as_ref().unwrap();
+        assert!(own.points.iter().all(|p| p.position[0].abs() < 25.0 && p.position[1].abs() < 25.0), "the object, in the pass's own frame");
+        assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
         assert!(app.tool.is_none() && app.object_picking.is_none());
         app.undo();
-        assert_eq!(app.cleaned.as_ref().map(|c| c.len()), Some(total));
+        assert!(!app.passes[1].is_cleaned() && app.passes[1].layer.len() == total);
     }
 }

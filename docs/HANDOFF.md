@@ -10,6 +10,28 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-24 evening (branch `feature/clean-per-pass-meshing`, second PC).** On top of the
+solid-model commit:
+- **File dialogs:** Import Scan, Add Project and Open Project open native Windows dialogs
+  (`apps/scancraft/src/file_picker.rs`, `rfd`); Save Project and Export have a Browse button.
+- **Workflow order is now Connect → Scan → Clean → Align → Mesh → Export** (user decision).
+  Clean works per pass: every tool runs on each *shown* pass separately (and on the merged model
+  when shown); hidden passes are untouched. A pass's cleaned surface is `ScanPass::edit` (own
+  frame, observation counts in `confidence`) and replaces the tracked / imported surface for
+  alignment, merge and saving (`pass-<id>/cleaned.ply` + `cleaned_observations.bin`). The old
+  project-wide "cleaned cloud" is gone (old projects open it as the merged model). Isolate Object
+  needs exactly one shown pass. A cleaned captured pass cannot be continued or have frames
+  discarded until Reset Cleaning.
+- **Meshing rework** (`scancraft-mesh`): Reconstruct = `implicit.rs` (normals re-fitted from
+  positions, robust implicit MLS, thin-wall side test, vertex projection) + `denoise.rs`
+  (fold repair, bilateral normal filtering); Smooth = the edge-preserving smoother; new Fill Holes
+  tool (`holes.rs`, Liepa: minimum-weight triangulation, refinement, fairing by sparse Cholesky).
+  Measured on the user's two-pass shell scan with `examples/mesh_project.rs` (rebuilds a saved
+  project's merge, meshes, prints roughness / holes, renders PNGs); numbers in merge-and-ai.md §7.
+- **Next:** wire `scancraft-mesh::solid` (`build_solid`) into the Mesh stage as a separate
+  "Make Solid" step for watertight parts, next to Reconstruct / Smooth / Fill Holes; test the new
+  Mesh tools by hand in the app (they were checked on renders and tests, not clicked through).
+
 **Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,
 automatic table removal, wall-aware quality for inside/outside scans), Refine as a preview, Merge,
 Isolate Object, Import Scan (PLY/OBJ/STL) and Add Project. Tested on three Revo Scan scans of a

@@ -75,6 +75,7 @@ fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
         tinted: None,
         mask: isolation::new_cache(),
         surface: lp.stored.surface,
+        edit: lp.stored.edit,
     }
 }
 
@@ -273,7 +274,7 @@ impl ScanCraftApp {
         }
     }
 
-    fn pass_name(&self, id: u32) -> String {
+    pub(crate) fn pass_name(&self, id: u32) -> String {
         self.passes.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| format!("Pass {id}"))
     }
 
@@ -717,7 +718,6 @@ impl ScanCraftApp {
         }
         self.passes.clear();
         self.merged = None;
-        self.cleaned = None;
         self.mesh = None;
         self.clear_previews();
         self.picking = None;
@@ -738,11 +738,10 @@ impl ScanCraftApp {
         }
         let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
         let passes: Vec<_> =
-            self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone())).collect();
+            self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone())).collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
         let merged = self.merged.as_ref().map(|m| (m.layer.cloud.clone(), m.passes.clone()));
-        let cleaned = self.cleaned.as_ref().map(|c| c.cloud.clone());
         let mesh = self.mesh.as_ref().map(|m| m.mesh.clone());
         let settings = serde_json::json!({
             "min_mm": self.settings.min_mm,
@@ -753,12 +752,12 @@ impl ScanCraftApp {
         });
         self.spawn_job("Saving the project", move || {
             let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface) in passes {
+            for (id, name, frames, visible, meta, tracker, surface, edit) in passes {
                 let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface });
+                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit });
             }
             let n = stored.len();
-            let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned, mesh, settings };
+            let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
             match project::save(&dir, &project) {
                 Ok(()) => JobResult::Saved { message: format!("Saved {n} pass{} to {}", if n == 1 { "" } else { "es" }, dir.display()), path: dir, name },
                 Err(e) => JobResult::Failed(format!("Could not save the project: {e}")),
@@ -807,7 +806,6 @@ impl ScanCraftApp {
         self.passes.clear();
         // The open project's results are replaced, not invalidated, by the opened ones.
         self.merged = None;
-        self.cleaned = None;
         self.mesh = None;
         let n = opened.passes.len();
         for mut lp in opened.passes {
@@ -828,13 +826,18 @@ impl ScanCraftApp {
             }
         }
         self.next_pass_id = opened.next_pass_id.max(self.passes.iter().map(|p| p.id + 1).max().unwrap_or(1));
-        self.merged = opened.merged.map(|(cloud, passes)| {
+        // A project saved before cleaning became per pass has one cleaned cloud of everything:
+        // it was made from the merged model (or from all passes), so it becomes the merged model.
+        let all: Vec<u32> = self.passes.iter().map(|p| p.id).collect();
+        let merged = match (opened.merged, opened.cleaned) {
+            (Some((_, passes)), Some(cleaned)) => Some((cleaned, passes, "Cleaned merged model, opened with the project".to_string())),
+            (None, Some(cleaned)) => Some((cleaned, all, "Cleaned cloud from an older project, opened as the merged model".to_string())),
+            (Some((cloud, passes)), None) => Some((cloud, passes, "Opened with the project".to_string())),
+            (None, None) => None,
+        };
+        self.merged = merged.map(|(cloud, passes, summary)| {
             let g = self.generation();
-            MergedLayer::new(cloud, g, passes, "Opened with the project".into())
-        });
-        self.cleaned = opened.cleaned.map(|c| {
-            let g = self.generation();
-            CloudLayer::new(c, g)
+            MergedLayer::new(cloud, g, passes, summary)
         });
         self.mesh = opened.mesh.map(|(m, a)| {
             let g = self.generation();
@@ -842,14 +845,11 @@ impl ScanCraftApp {
         });
         // The newest result is shown; the inputs stay in the browser.
         if self.mesh.is_some() {
-            if let Some(c) = &mut self.cleaned {
-                c.visible = false;
-            }
             if let Some(m) = &mut self.merged {
                 m.layer.visible = false;
             }
         }
-        if self.merged.is_some() || self.cleaned.is_some() || self.mesh.is_some() {
+        if self.merged.is_some() || self.mesh.is_some() {
             for p in &mut self.passes {
                 p.layer.visible = false;
             }
@@ -934,13 +934,11 @@ impl ScanCraftApp {
         if let Some(m) = &mut self.merged {
             m.layer.visible = false;
         }
-        if let Some(c) = &mut self.cleaned {
-            c.visible = false;
-        }
         if let Some(m) = &mut self.mesh {
             m.visible = false;
         }
-        self.stage = Stage::Align;
+        // New passes are usually cleaned first (table, fragments), then aligned.
+        self.stage = Stage::Clean;
         self.framed_radius = 0.0;
         self.fit_view();
         n
@@ -963,6 +961,7 @@ impl ScanCraftApp {
             tinted: None,
             mask: scan.mask,
             surface: Some(scan.surface),
+            edit: None,
         };
         let name = pass.name.clone();
         self.append_passes(vec![pass]);
@@ -973,7 +972,7 @@ impl ScanCraftApp {
             scancraft_io::NormalSource::Estimated => "normals estimated",
             scancraft_io::NormalSource::None => "no normals",
         };
-        self.say(Tone::Success, format!("Imported {name} · {} points, {normals}. Next: Align All", thousands(points)));
+        self.say(Tone::Success, format!("Imported {name} · {} points, {normals}. Next: clean it, then Align All", thousands(points)));
         if scan.likely_metres {
             self.show_choice_toast(format!("{name} is under {} units across, so probably in metres.", crate::imports::METRES_MAX_EXTENT), ToastAction::MetresToMm(id));
         }
@@ -991,7 +990,7 @@ impl ScanCraftApp {
             })
             .collect();
         let n = self.append_passes(added);
-        self.say(Tone::Success, format!("Added {n} pass{} from {project}, unaligned. Next: Align All", if n == 1 { "" } else { "es" }));
+        self.say(Tone::Success, format!("Added {n} pass{} from {project}, unaligned. Next: clean them, then Align All", if n == 1 { "" } else { "es" }));
     }
 
     /// Multiplies an imported pass's coordinates by `factor` (e.g. metres to mm; undoable). An
@@ -1011,8 +1010,11 @@ impl ScanCraftApp {
             p.meta.alignment = AlignState::Unaligned;
             p.meta.transform = Transform::default();
         }
+        // Its cleaning is scaled with it.
+        p.edit = p.edit.as_ref().map(|e| Arc::new(crate::imports::scaled(e, factor)));
+        let shown = p.edit.as_ref().unwrap_or(&surface).points.clone();
         let visible = p.layer.visible;
-        p.layer = CloudLayer::new(PointCloud::from_points(project::place(surface.points.clone(), &p.meta.transform)), g);
+        p.layer = CloudLayer::new(PointCloud::from_points(project::place(shown, &p.meta.transform)), g);
         p.layer.visible = visible;
         p.surface = Some(surface);
         p.mask = isolation::new_cache();

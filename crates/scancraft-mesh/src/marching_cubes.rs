@@ -28,7 +28,7 @@ const COORD_LIMIT: i32 = 1 << COORD_BITS;
 const BLOCK_BITS: u32 = COORD_BITS - 3;
 
 /// Corner offsets of a cube (Bourke ordering).
-const CORNERS: [[i32; 3]; 8] = [
+pub(crate) const CORNERS: [[i32; 3]; 8] = [
     [0, 0, 0],
     [1, 0, 0],
     [1, 1, 0],
@@ -41,7 +41,7 @@ const CORNERS: [[i32; 3]; 8] = [
 
 /// For every cube edge: (lower corner, upper corner, axis). "Lower" has the smaller coordinate
 /// along the axis, so a grid edge is identified by its lower corner + axis regardless of cell.
-const EDGES: [(usize, usize, u64); 12] = [
+pub(crate) const EDGES: [(usize, usize, u64); 12] = [
     (0, 1, 0),
     (1, 2, 1),
     (3, 2, 0),

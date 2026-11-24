@@ -232,3 +232,13 @@ laser model are not built.
   0.2–0.27° / ≤0.6 mm. Real-data test: `crates/scancraft-align/tests/real_data.rs`
   (`SCANCRAFT_ALIGN_DATA`). Solid-model meshing (watertight wall, holes, marker removal) in progress
   in `scancraft-mesh`.
+- 2026-11-24 (evening, second PC) — Branch `feature/clean-per-pass-meshing` on top of the
+  solid-model commit. Native file dialogs (`file_picker.rs`). Stage order Connect → Scan → Clean →
+  Align → Mesh → Export; Clean per shown pass (`ScanPass::edit`, saved as `pass-<id>/cleaned.ply`
+  + observation counts), the single "cleaned cloud" removed. Meshing: the user's scan was rough
+  because merged normals were 10–13° off the surface (points fine: ±0.04 mm between passes);
+  new `implicit.rs` (normal refit, RIMLS, projection), `denoise.rs` (bilateral normal filtering),
+  `holes.rs` (Liepa fill, written by a subagent), Fill Holes tool. Measuring tool
+  `crates/scancraft-mesh/examples/mesh_project.rs`. Not wired yet: `solid::build_solid` in the
+  app. See `docs/HANDOFF.md` §1 (top update). Test data stays in an untracked `Scans/` folder
+  (excluded locally via `.git/info/exclude`).

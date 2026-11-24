@@ -13,3 +13,10 @@ serde.workspace = true
 thiserror.workspace = true
 log.workspace = true
 rayon.workspace = true
+
+[dev-dependencies]
+# examples/mesh_project.rs: rebuilds a saved project's merged model, meshes it, renders views.
+scancraft-io.workspace = true
+scancraft-align.workspace = true
+serde_json.workspace = true
+image.workspace = true

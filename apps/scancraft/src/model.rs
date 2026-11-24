@@ -22,14 +22,14 @@ pub type SharedDevice = Arc<tokio::sync::Mutex<Box<dyn ScannerDevice>>>;
 pub enum Stage {
     Connect,
     Scan,
-    Align,
     Clean,
+    Align,
     Mesh,
     Export,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 6] = [Stage::Connect, Stage::Scan, Stage::Align, Stage::Clean, Stage::Mesh, Stage::Export];
+    pub const ALL: [Stage; 6] = [Stage::Connect, Stage::Scan, Stage::Clean, Stage::Align, Stage::Mesh, Stage::Export];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -60,30 +60,24 @@ pub enum Tool {
     Reconstruct,
     Smooth,
     Decimate,
+    /// Close holes in the mesh up to a size.
+    FillHoles,
     Export(ExportFormat),
     /// Split view for picking corresponding points on a pass and the project model.
     PointPairs(u32),
     SaveProject,
-    OpenProject,
-    /// Read a scan file (PLY, OBJ, STL) as a new pass.
-    ImportScan,
-    /// Append the passes of another project.
-    AddProject,
 }
 
 impl Tool {
     /// Project-file commands: open from the app bar on any stage.
     pub fn is_file(self) -> bool {
-        matches!(self, Tool::SaveProject | Tool::OpenProject | Tool::ImportScan | Tool::AddProject)
+        matches!(self, Tool::SaveProject)
     }
 
     pub fn title(self) -> &'static str {
         match self {
             Tool::PointPairs(_) => "Point Pairs",
             Tool::SaveProject => "Save Project",
-            Tool::OpenProject => "Open Project",
-            Tool::ImportScan => "Import Scan",
-            Tool::AddProject => "Add Project",
             Tool::ConnectIp => "Connect by IP",
             Tool::RemovePlane => "Remove Plane",
             Tool::Outliers => "Remove Outliers",
@@ -93,6 +87,7 @@ impl Tool {
             Tool::Reconstruct => "Reconstruct Surface",
             Tool::Smooth => "Smooth",
             Tool::Decimate => "Decimate",
+            Tool::FillHoles => "Fill Holes",
             Tool::Export(_) => "Export",
         }
     }
@@ -108,22 +103,19 @@ impl Tool {
             Tool::Reconstruct => "mesh_body",
             Tool::Smooth => "surface",
             Tool::Decimate => "reach",
+            Tool::FillHoles => "patch",
             Tool::Export(_) => "export",
             Tool::PointPairs(_) => "point",
             Tool::SaveProject => "save",
-            Tool::OpenProject => "open",
-            Tool::ImportScan => "import",
-            Tool::AddProject => "folder",
         }
     }
 
     pub fn stage(self) -> Stage {
         match self {
-            Tool::ConnectIp | Tool::SaveProject | Tool::OpenProject => Stage::Connect,
-            Tool::ImportScan | Tool::AddProject => Stage::Scan,
+            Tool::ConnectIp | Tool::SaveProject => Stage::Connect,
             Tool::PointPairs(_) => Stage::Align,
             Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject => Stage::Clean,
-            Tool::Reconstruct | Tool::Smooth | Tool::Decimate => Stage::Mesh,
+            Tool::Reconstruct | Tool::Smooth | Tool::Decimate | Tool::FillHoles => Stage::Mesh,
             Tool::Export(_) => Stage::Export,
         }
     }
@@ -170,8 +162,14 @@ pub enum Node {
     /// A stored keyframe of a pass: (pass id, keyframe id).
     Frame(u32, u64),
     Merged,
-    Cleaned,
     Mesh,
+}
+
+/// Something the Clean tools work on: a pass, or the merged model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CleanTarget {
+    Pass(u32),
+    Merged,
 }
 
 /// Point geometry and its GPU copy. `generation` changes whenever the points are replaced (not
@@ -273,9 +271,18 @@ pub struct ScanPass {
     /// An imported scan's fixed surface (pass frame). Such a pass has an empty tracker, no
     /// keyframes and cannot be continued.
     pub surface: Option<Arc<PointCloud>>,
+    /// The pass after cleaning (pass frame; `confidence` holds each point's observation count).
+    /// When set it replaces the tracked or imported surface everywhere: display, alignment,
+    /// merge and saving. A cleaned captured pass cannot be continued or have frames discarded
+    /// until its cleaning is reset.
+    pub edit: Option<Arc<PointCloud>>,
 }
 
 impl ScanPass {
+    pub fn is_cleaned(&self) -> bool {
+        self.edit.is_some()
+    }
+
     pub fn kept_frames(&self) -> usize {
         self.keyframes.iter().filter(|k| !k.discarded).count()
     }
@@ -287,9 +294,10 @@ impl ScanPass {
 
     /// Where background jobs read its surface from.
     pub fn source(&self) -> PassSource {
-        match &self.surface {
-            Some(s) => PassSource::Fixed(Arc::clone(s)),
-            None => PassSource::Tracked(self.tracker.clone()),
+        match (&self.edit, &self.surface) {
+            (Some(e), _) => PassSource::Edited { surface: Arc::clone(e), tracker: (!self.is_fixed()).then(|| self.tracker.clone()) },
+            (None, Some(s)) => PassSource::Fixed(Arc::clone(s)),
+            (None, None) => PassSource::Tracked(self.tracker.clone()),
         }
     }
 }
@@ -332,6 +340,29 @@ impl MergedLayer {
 }
 
 /// A reconstructed surface.
+/// The mesh's holes while Fill Holes is open: found once per mesh, outlined in the view.
+pub struct HolePreview {
+    /// Generation of the mesh they were found in.
+    pub mesh_generation: u64,
+    /// Largest first.
+    pub holes: Vec<scancraft_mesh::HoleInfo>,
+    /// The outline points for the settings they were coloured for: (max size, keep largest).
+    pub outline: Option<((f32, bool), CloudLayer)>,
+}
+
+impl HolePreview {
+    /// Whether hole `i` (in `holes` order) would be filled.
+    pub fn fills(&self, i: usize, max_mm: f32, keep_largest: bool) -> bool {
+        !(keep_largest && i == 0) && self.holes[i].perimeter_mm <= max_mm
+    }
+
+    /// (to fill, left open).
+    pub fn split(&self, max_mm: f32, keep_largest: bool) -> (usize, usize) {
+        let fill = (0..self.holes.len()).filter(|&i| self.fills(i, max_mm, keep_largest)).count();
+        (fill, self.holes.len() - fill)
+    }
+}
+
 pub struct MeshLayer {
     pub mesh: Mesh,
     pub analysis: MeshAnalysis,
@@ -437,7 +468,9 @@ pub struct AlignCheck {
 
 /// Results of background geometry jobs.
 pub enum JobResult {
-    Cloud { cloud: PointCloud, message: String },
+    /// Clean results: each cleaned pass's new surface (pass frame) and the merged model's new
+    /// cloud, for whichever was cleaned.
+    Cleaned { passes: Vec<(u32, PointCloud)>, merged: Option<PointCloud>, message: String },
     NoChange(String),
     Mesh { mesh: Mesh, analysis: MeshAnalysis, message: String },
     Exported(String),
@@ -477,7 +510,6 @@ pub struct OpenedProject {
 #[derive(Clone, Default)]
 pub struct Snapshot {
     pub merged: Option<(PointCloud, Vec<u32>, String)>,
-    pub cleaned: Option<PointCloud>,
     pub mesh: Option<(Mesh, MeshAnalysis)>,
     pub passes: Vec<PassSnapshot>,
     pub label: String,
@@ -496,6 +528,7 @@ pub struct PassSnapshot {
     pub meta: PassMeta,
     pub mask: MaskCache,
     pub surface: Option<Arc<PointCloud>>,
+    pub edit: Option<Arc<PointCloud>>,
 }
 
 /// Bounded two-stack undo history (kept from the previous app; snapshots clone geometry, so the

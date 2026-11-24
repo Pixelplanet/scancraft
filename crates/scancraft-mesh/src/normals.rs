@@ -76,7 +76,7 @@ impl NormalEstimator {
 
 /// Eigenvector of the smallest eigenvalue of a symmetric 3x3 matrix (analytic eigenvalues,
 /// eigenvector from the best-conditioned cross product of the rows of `A − λI`).
-fn compute_normal_from_covariance(cov: Mat3) -> Vec3 {
+pub(crate) fn compute_normal_from_covariance(cov: Mat3) -> Vec3 {
     let a = cov.as_dmat3();
     let (a00, a01, a02) = (a.x_axis.x, a.y_axis.x, a.z_axis.x);
     let (a11, a12, a22) = (a.y_axis.y, a.z_axis.y, a.z_axis.z);

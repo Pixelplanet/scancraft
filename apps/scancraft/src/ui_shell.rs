@@ -5,6 +5,7 @@ use scancraft_ui::kit::{self, RibbonButton, RibbonGroup};
 use scancraft_ui::{Tokens, fonts};
 
 use crate::app::{Capture, ScanCraftApp, Tone};
+use crate::file_picker::PickPurpose;
 use crate::model::{ExportFormat, Node, Stage, Tool, thousands};
 
 /// The application bar along the top of the window (`toolbar::app_bar`).
@@ -44,7 +45,7 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         x += 32.0;
         let open = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
         if kit::app_bar_button(ui, open, "open", "Open project…", app.can_edit()).clicked() {
-            app.open_tool(Tool::OpenProject);
+            app.pick(&ui.ctx().clone(), PickPurpose::OpenProject);
         }
         x += 32.0;
         let save = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
@@ -61,12 +62,12 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         x += 22.0;
         let import = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
         if kit::app_bar_button(ui, import, "import", "Import scan… (PLY, OBJ, STL as a new pass)", app.import_blocked().is_none()).clicked() {
-            app.open_tool(Tool::ImportScan);
+            app.pick(&ui.ctx().clone(), PickPurpose::ImportScans);
         }
         x += 32.0;
         let add = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
         if kit::app_bar_button(ui, add, "folder", "Add project… (append another project's passes)", app.import_blocked().is_none()).clicked() {
-            app.open_tool(Tool::AddProject);
+            app.pick(&ui.ctx().clone(), PickPurpose::AddProjects);
         }
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
@@ -281,16 +282,16 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                         icon: "import",
                         label: "Import Scan",
                         enabled: app.import_blocked().is_none(),
-                        pressed: pressed(Tool::ImportScan),
-                        tip: reason(app.import_blocked(), "Add a PLY, OBJ or STL scan (yours or someone else's) as a new pass to align with the others"),
+                        pressed: false,
+                        tip: reason(app.import_blocked(), "Add PLY, OBJ or STL scans (yours or from other scan software) as new passes to align with the others"),
                     },
                     RibbonButton {
                         id: "add_project",
                         icon: "folder",
                         label: "Add Project",
                         enabled: app.import_blocked().is_none(),
-                        pressed: pressed(Tool::AddProject),
-                        tip: reason(app.import_blocked(), "Append the passes of another ScanCraft project, unaligned"),
+                        pressed: false,
+                        tip: reason(app.import_blocked(), "Append the passes of other ScanCraft projects, unaligned"),
                     },
                 ],
             },
@@ -378,28 +379,28 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ],
             },
             RibbonGroup {
-                label: "Result",
+                label: "Reset",
                 buttons: vec![RibbonButton {
                     id: "revert",
                     icon: "revert",
-                    label: "Discard Cleaned",
-                    enabled: app.cleaned.is_some() && app.can_edit(),
+                    label: "Reset Cleaning",
+                    enabled: app.can_reset_cleaning() && app.can_edit(),
                     pressed: false,
-                    tip: if app.cleaned.is_some() { "Throw away the cleaned cloud and start from the passes again" } else { "No cleaned cloud yet" },
+                    tip: if app.can_reset_cleaning() { "Take the shown scans back to how they were scanned or imported (undoable)" } else { "No shown scan is cleaned" },
                 }],
             },
         ],
         Stage::Mesh => vec![
             RibbonGroup {
                 label: "Create",
-                buttons: vec![RibbonButton { id: "reconstruct", icon: "mesh_body", label: "Reconstruct", enabled: app.tool_blocked(Tool::Reconstruct).is_none(), pressed: pressed(Tool::Reconstruct), tip: reason(app.tool_blocked(Tool::Reconstruct), "Build a surface from the points (marching cubes)") }],
+                buttons: vec![RibbonButton { id: "reconstruct", icon: "mesh_body", label: "Reconstruct", enabled: app.tool_blocked(Tool::Reconstruct).is_none(), pressed: pressed(Tool::Reconstruct), tip: reason(app.tool_blocked(Tool::Reconstruct), "Build a smooth surface from the points") }],
             },
             RibbonGroup {
                 label: "Refine",
                 buttons: vec![
-                    RibbonButton { id: "smooth", icon: "surface", label: "Smooth", enabled: app.tool_blocked(Tool::Smooth).is_none(), pressed: pressed(Tool::Smooth), tip: reason(app.tool_blocked(Tool::Smooth), "Laplacian smoothing") },
+                    RibbonButton { id: "smooth", icon: "surface", label: "Smooth", enabled: app.tool_blocked(Tool::Smooth).is_none(), pressed: pressed(Tool::Smooth), tip: reason(app.tool_blocked(Tool::Smooth), "Smooth the surface while keeping edges") },
                     RibbonButton { id: "decimate", icon: "reach", label: "Decimate", enabled: app.tool_blocked(Tool::Decimate).is_none(), pressed: pressed(Tool::Decimate), tip: reason(app.tool_blocked(Tool::Decimate), "Reduce the triangle count") },
-                    RibbonButton { id: "fill_holes", icon: "patch", label: "Fill Holes", enabled: false, pressed: false, tip: "Not available yet" },
+                    RibbonButton { id: "fill_holes", icon: "patch", label: "Fill Holes", enabled: app.tool_blocked(Tool::FillHoles).is_none(), pressed: pressed(Tool::FillHoles), tip: reason(app.tool_blocked(Tool::FillHoles), "Close holes up to a size, shaped to continue the surface") },
                 ],
             },
             RibbonGroup {
@@ -416,7 +417,7 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                     label: "Point Cloud PLY",
                     enabled: app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)).is_none(),
                     pressed: pressed(Tool::Export(ExportFormat::PlyCloud)),
-                    tip: reason(app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)), "Binary PLY of the cleaned cloud, or of the visible passes"),
+                    tip: reason(app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)), "Binary PLY of the merged model when shown, else of the shown passes"),
                 }],
             },
             RibbonGroup {
@@ -455,8 +456,8 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         "inset" => app.show_inset = !app.show_inset,
         "clear" => app.clear_session(),
-        "import_scan" => app.open_tool(Tool::ImportScan),
-        "add_project" => app.open_tool(Tool::AddProject),
+        "import_scan" => app.pick(&ui.ctx().clone(), PickPurpose::ImportScans),
+        "add_project" => app.pick(&ui.ctx().clone(), PickPurpose::AddProjects),
         "align_all" => app.align_all(),
         "align_auto" => {
             if let Some(id) = app.align_target() {
@@ -485,10 +486,11 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         "outliers" => app.open_tool(Tool::Outliers),
         "crop" => app.open_tool(Tool::Crop),
         "downsample" => app.open_tool(Tool::Downsample),
-        "revert" => app.discard_cleaned(),
+        "revert" => app.reset_cleaning(),
         "reconstruct" => app.open_tool(Tool::Reconstruct),
         "smooth" => app.open_tool(Tool::Smooth),
         "decimate" => app.open_tool(Tool::Decimate),
+        "fill_holes" => app.open_tool(Tool::FillHoles),
         "delete_mesh" => app.discard_mesh(),
         "export_ply_cloud" => app.open_tool(Tool::Export(ExportFormat::PlyCloud)),
         "export_ply_mesh" => app.open_tool(Tool::Export(ExportFormat::PlyMesh)),

@@ -217,3 +217,81 @@ fn decimate_keeps_open_patch_manifold() {
     assert_eq!(a.inconsistent_edges, 0, "{a:?}");
     assert!((a.triangle_count as f32 / mesh.triangles.len() as f32 - 0.3).abs() < 0.05);
 }
+
+// ---------------------------------------------------------------- robust implicit surface
+
+/// Deterministic noise in [-a, a].
+fn jitter(i: usize, salt: u32, a: f32) -> f32 {
+    let x = (i as u32).wrapping_mul(2654435761).wrapping_add(salt.wrapping_mul(40503));
+    let x = x ^ (x >> 15);
+    let x = x.wrapping_mul(2246822519) ^ (x >> 13);
+    ((x % 10_000) as f32 / 5000.0 - 1.0) * a
+}
+
+/// Adds position noise along the normal and normal noise (degrees) to a cloud.
+fn noisy(mut c: PointCloud, pos_mm: f32, normal_deg: f32) -> PointCloud {
+    for (i, p) in c.points.iter_mut().enumerate() {
+        let n = Vec3::from_array(p.normal);
+        let q = Vec3::from_array(p.position) + n * jitter(i, 1, pos_mm);
+        let t = n.any_orthonormal_vector();
+        let b = n.cross(t);
+        let a = normal_deg.to_radians();
+        let nn = (n + t * jitter(i, 2, a) + b * jitter(i, 3, a)).normalize();
+        p.position = q.to_array();
+        p.normal = nn.to_array();
+    }
+    c
+}
+
+#[test]
+fn implicit_surface_of_a_noisy_sphere_is_closed_smooth_and_accurate() {
+    let r = 30.0;
+    let c = Vec3::new(5.0, -3.0, 200.0);
+    let cloud = noisy(sphere(r, 0.5, c), 0.08, 15.0);
+    let (mesh, stats) = crate::implicit::reconstruct(&cloud, &crate::SurfaceConfig::default());
+    let a = Mesher::analyze(&mesh);
+    assert!(a.is_watertight, "{a:?} {stats:?}");
+    assert!(a.signed_volume_mm3 > 0.0, "outward winding expected");
+    // Vertices on the true sphere within a fraction of the noise.
+    let err: Vec<f32> = mesh.vertices.iter().map(|v| (Vec3::from_array(v.position).distance(c) - r).abs()).collect();
+    let mean = err.iter().sum::<f32>() / err.len() as f32;
+    let max = err.iter().copied().fold(0.0, f32::max);
+    assert!(mean < 0.03 && max < 0.15, "mean {mean} max {max} mm off the sphere (noise ±0.08)");
+    // Normals (field gradients) point outwards and close to radial.
+    let off = mesh.vertices.iter().map(|v| Vec3::from_array(v.normal).dot((Vec3::from_array(v.position) - c).normalize())).fold(1.0f32, f32::min);
+    assert!(off > 0.95, "a vertex normal is {:.1}° off radial", off.acos().to_degrees());
+}
+
+#[test]
+fn implicit_surface_keeps_both_sides_of_a_thin_wall() {
+    // Two parallel plates 2 mm apart facing away from each other (a 2 mm wall), 0.4 mm spacing.
+    let mut c = PointCloud::new();
+    let k = 100;
+    for i in 0..=k {
+        for j in 0..=k {
+            let (x, y) = (i as f32 * 0.4, j as f32 * 0.4);
+            c.push(pt(Vec3::new(x, y, 1.0), Vec3::Z));
+            c.push(pt(Vec3::new(x, y, -1.0), -Vec3::Z));
+        }
+    }
+    let (mesh, _) = crate::implicit::reconstruct(&c, &crate::SurfaceConfig { cell_mm: 0.5, detail: 4.0, ..Default::default() });
+    // Every vertex away from the plate border lies on one of the two plates.
+    let inner: Vec<f32> = mesh.vertices.iter().filter(|v| v.position[0] > 3.0 && v.position[0] < 37.0 && v.position[1] > 3.0 && v.position[1] < 37.0).map(|v| v.position[2]).collect();
+    assert!(inner.len() > 1000);
+    let worst = inner.iter().map(|z| (z.abs() - 1.0).abs()).fold(0.0f32, f32::max);
+    assert!(worst < 0.1, "a vertex is {worst} mm off the wall faces");
+    let top = inner.iter().filter(|z| **z > 0.0).count();
+    assert!(top > inner.len() / 3 && top < inner.len() * 2 / 3, "both faces present: {top} of {}", inner.len());
+}
+
+#[test]
+fn implicit_surface_of_an_open_patch_stays_open_and_on_the_data() {
+    let cloud = noisy(patch(0.4), 0.05, 10.0);
+    let (mesh, _) = crate::implicit::reconstruct(&cloud, &crate::SurfaceConfig { cell_mm: 0.7, ..Default::default() });
+    let a = Mesher::analyze(&mesh);
+    assert!(!a.is_watertight && a.open_edges > 0, "{a:?}");
+    assert_eq!(a.non_manifold_edges, 0, "{a:?}");
+    assert_eq!(a.inconsistent_edges, 0, "{a:?}");
+    assert!(max_distance_to_cloud(&mesh, &cloud) < 1.0);
+    assert!(a.surface_area_mm2 > 1600.0 && a.surface_area_mm2 < 2200.0, "{a:?}");
+}

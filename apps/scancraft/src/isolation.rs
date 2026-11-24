@@ -140,17 +140,19 @@ pub struct ObjectPicking {
     pub generation: u64,
     /// Points that can be clicked: a spread subset of `input`.
     pub targets: Arc<Vec<Vec3>>,
+    /// The pass or merged model `input` is, which the kept object replaces.
+    pub target: crate::model::CleanTarget,
 }
 
 /// Object, support and other colours of the Isolate Object preview.
 pub const LABEL_COLOURS: [[u8; 3]; 3] = [[120, 200, 110], [125, 130, 142], [215, 90, 80]];
 
 impl ObjectPicking {
-    pub fn new(input: PointCloud, generation: u64) -> Self {
+    pub fn new(input: PointCloud, generation: u64, target: crate::model::CleanTarget) -> Self {
         let stride = (input.len() / 200_000).max(1);
         let targets = input.points.iter().step_by(stride).map(|p| Vec3::from(p.position)).collect();
         let layer = Arc::new(crate::model::tinted_points(&input, LABEL_COLOURS[0]));
-        ObjectPicking { input: Arc::new(input), picks: Vec::new(), result: None, layer, generation, targets: Arc::new(targets) }
+        ObjectPicking { input: Arc::new(input), picks: Vec::new(), result: None, layer, generation, targets: Arc::new(targets), target }
     }
 
     pub fn seeds(&self) -> Seeds {
@@ -291,7 +293,7 @@ mod tests {
     #[test]
     fn picks_become_seeds_and_results_follow_them() {
         let cloud = PointCloud::from_points(scene().into_iter().map(|(p, n)| Point3D::new(p.to_array()).with_normal(n.to_array())).collect());
-        let mut picking = ObjectPicking::new(cloud, 1);
+        let mut picking = ObjectPicking::new(cloud, 1, crate::model::CleanTarget::Merged);
         picking.picks.push((Vec3::new(0.0, 0.0, 40.0), true));
         picking.picks.push((Vec3::new(90.0, 90.0, 0.0), false));
         let seeds = picking.seeds();
@@ -308,7 +310,7 @@ mod tests {
     #[test]
     fn a_result_for_other_picks_of_the_same_count_is_stale() {
         let cloud = PointCloud::from_points(scene().into_iter().map(|(p, n)| Point3D::new(p.to_array()).with_normal(n.to_array())).collect());
-        let mut picking = ObjectPicking::new(cloud, 1);
+        let mut picking = ObjectPicking::new(cloud, 1, crate::model::CleanTarget::Merged);
         let (a, b, c, d) = (Vec3::new(0.0, 0.0, 40.0), Vec3::new(90.0, 90.0, 0.0), Vec3::new(-90.0, 90.0, 0.0), Vec3::new(90.0, -90.0, 0.0));
         picking.picks = vec![(a, true), (b, false), (c, false)];
         let made_for = picking.picks.clone();

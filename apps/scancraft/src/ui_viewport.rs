@@ -96,8 +96,12 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
                 let (generation, points) = if colour_passes { (m.layer.generation | 1 << 62, Arc::clone(&m.tinted)) } else { (m.layer.generation, Arc::clone(&m.layer.gpu)) };
                 frame.points.push(PointLayer { generation, points, overlay: false });
             }
-            if let Some(c) = app.cleaned.as_ref().filter(|c| c.visible && c.len() > 0) {
-                frame.points.push(PointLayer { generation: c.generation, points: Arc::clone(&c.gpu), overlay: false });
+        }
+        // Fill Holes: the hole outlines, over everything.
+        if app.tool == Some(crate::model::Tool::FillHoles) {
+            app.refresh_holes();
+            if let Some((_, layer)) = app.holes.as_ref().and_then(|h| h.outline.as_ref()) {
+                frame.points.push(PointLayer { generation: layer.generation, points: Arc::clone(&layer.gpu), overlay: true });
             }
         }
         // The selected keyframe, over everything.

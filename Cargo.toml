@@ -71,6 +71,8 @@ wgpu = "30"
 resvg = { version = "0.45", default-features = false }
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# Native open / save / folder dialogs.
+rfd = "0.17"
 
 # Gaussian splatting: Brush (Apache-2.0, https://github.com/ArthurBrussee/brush) used as a library.
 # Not published on crates.io, so pinned to a git revision. Brush tracks Burn's git `main`; the

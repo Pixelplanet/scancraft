@@ -250,7 +250,12 @@ pub fn fixed_cloud(surface: &PointCloud) -> PassCloud {
 
 /// Observations credited to each point of a fixed surface when merging: an imported scan is
 /// already a fused surface, so its points are not treated as single stray measurements.
-const FIXED_OBSERVATIONS: u32 = 2;
+pub const FIXED_OBSERVATIONS: u32 = 2;
+
+/// A cleaned point's observation count, kept in `Point3D::confidence`.
+fn observations(p: &Point3D) -> u32 {
+    (p.confidence.round() as i64).clamp(1, u32::MAX as i64) as u32
+}
 
 /// Where background jobs read a pass's surface from (in the pass's own frame).
 #[derive(Clone)]
@@ -259,6 +264,9 @@ pub enum PassSource {
     Tracked(SharedTracker),
     /// An imported scan: a fixed surface.
     Fixed(Arc<PointCloud>),
+    /// A cleaned pass: its edited surface (observation counts in `confidence`), and for a
+    /// captured pass its tracker, whose keyframes still give the views.
+    Edited { surface: Arc<PointCloud>, tracker: Option<SharedTracker> },
 }
 
 impl PassSource {
@@ -267,6 +275,13 @@ impl PassSource {
         match self {
             PassSource::Tracked(t) => t.lock().map(|t| pass_cloud(&t)).map_err(|_| "A pass's tracker is unavailable".to_string()),
             PassSource::Fixed(s) => Ok(fixed_cloud(s)),
+            PassSource::Edited { surface, tracker } => {
+                let mut cloud = fixed_cloud(surface);
+                if let Some(t) = tracker {
+                    cloud.views = t.lock().map(|t| pass_cloud(&t).views).map_err(|_| "A pass's tracker is unavailable".to_string())?;
+                }
+                Ok(cloud)
+            }
         }
     }
 
@@ -279,6 +294,37 @@ impl PassSource {
                 .map(|t| t.fused_surfels().iter().map(|s| (s.position, s.normal.normalize_or_zero(), s.count)).collect())
                 .map_err(|_| "A pass's tracker is unavailable".to_string()),
             PassSource::Fixed(s) => Ok(fixed_cloud(s).points.into_iter().map(|(p, n)| (p, n, FIXED_OBSERVATIONS)).collect()),
+            PassSource::Edited { surface, .. } => {
+                Ok(surface.points.iter().map(|p| (Vec3::from(p.position), Vec3::from(p.normal).normalize_or_zero(), observations(p))).collect())
+            }
+        }
+    }
+
+    /// The surface as points to clean, in the pass's own frame, with each point's observation
+    /// count in `confidence` (what a pass's `edit` holds).
+    pub fn editable(&self) -> Result<PointCloud, String> {
+        match self {
+            PassSource::Tracked(t) => {
+                let surfels = t.lock().map(|t| t.fused_surfels()).map_err(|_| "A pass's tracker is unavailable".to_string())?;
+                Ok(PointCloud::from_points(
+                    surfels
+                        .iter()
+                        .map(|s| {
+                            let mut p = Point3D::new(s.position.to_array()).with_normal(s.normal.normalize_or_zero().to_array()).with_color(scancraft_core::ColorRgba::GRAY);
+                            p.confidence = s.count as f32;
+                            p
+                        })
+                        .collect(),
+                ))
+            }
+            PassSource::Fixed(s) => {
+                let mut cloud = (**s).clone();
+                for p in &mut cloud.points {
+                    p.confidence = FIXED_OBSERVATIONS as f32;
+                }
+                Ok(cloud)
+            }
+            PassSource::Edited { surface, .. } => Ok((**surface).clone()),
         }
     }
 }
@@ -308,6 +354,8 @@ pub struct StoredPass {
     pub keyframes: Vec<KeyframeData>,
     /// An imported pass's fixed surface (its own frame); `None` for a captured pass.
     pub surface: Option<Arc<PointCloud>>,
+    /// The cleaned surface (own frame, observation counts in `confidence`), if cleaned.
+    pub edit: Option<Arc<PointCloud>>,
 }
 
 /// What a project folder holds.
@@ -317,6 +365,8 @@ pub struct StoredProject {
     pub next_pass_id: u32,
     pub passes: Vec<StoredPass>,
     pub merged: Option<(PointCloud, Vec<u32>)>,
+    /// Only read, from projects saved before cleaning became per pass: one cleaned cloud of
+    /// all passes. Never written.
     pub cleaned: Option<PointCloud>,
     pub mesh: Option<Mesh>,
     pub settings: serde_json::Value,
@@ -387,6 +437,20 @@ pub fn surface_path(id: u32) -> String {
     format!("{}/surface.ply", files::pass_dir(id))
 }
 
+/// A cleaned pass's surface file, and the file with its points' observation counts (one
+/// little-endian u32 per point, in order), relative to the project folder.
+pub fn cleaned_path(id: u32) -> String {
+    format!("{}/cleaned.ply", files::pass_dir(id))
+}
+
+pub fn cleaned_counts_path(id: u32) -> String {
+    format!("{}/cleaned_observations.bin", files::pass_dir(id))
+}
+
+/// Key in a pass's `scan_config` JSON naming its cleaned surface file. Older versions ignore it
+/// (and open the pass uncleaned).
+const CLEANED_KEY: &str = "cleaned";
+
 /// Key in a pass's free-form `scan_config` JSON that says where the pass came from. Projects
 /// without it (all older ones) hold captured passes only; older versions of the app ignore it.
 const ORIGIN_KEY: &str = "origin";
@@ -402,7 +466,30 @@ fn scan_config_json(p: &StoredPass) -> serde_json::Value {
     if let (Some(origin), Some(map)) = (origin, value.as_object_mut()) {
         map.insert(ORIGIN_KEY.into(), origin);
     }
+    if let (true, Some(map)) = (p.edit.is_some(), value.as_object_mut()) {
+        map.insert(CLEANED_KEY.into(), serde_json::json!(cleaned_path(p.id)));
+    }
     value
+}
+
+/// Writes a cleaned surface and its observation counts.
+fn write_cleaned(dir: &Path, id: u32, edit: &PointCloud) -> Result<(), String> {
+    write_surface(&dir.join(cleaned_path(id)), edit)?;
+    let bytes: Vec<u8> = edit.points.iter().flat_map(|p| observations(p).to_le_bytes()).collect();
+    std::fs::write(dir.join(cleaned_counts_path(id)), bytes).map_err(|e| e.to_string())
+}
+
+/// Reads a cleaned surface; without a matching counts file every point counts as a fused one.
+fn read_cleaned(dir: &Path, id: u32, file: &str) -> Result<PointCloud, String> {
+    let mut cloud = read_surface(&files::resolve(dir, file))?;
+    let counts = std::fs::read(dir.join(cleaned_counts_path(id))).ok().filter(|b| b.len() == cloud.len() * 4);
+    for (i, p) in cloud.points.iter_mut().enumerate() {
+        p.confidence = match &counts {
+            Some(b) => u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]) as f32,
+            None => FIXED_OBSERVATIONS as f32,
+        };
+    }
+    Ok(cloud)
 }
 
 /// The origin stored in a pass's `scan_config` JSON, and for an imported file its surface file.
@@ -462,11 +549,19 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
         if let Some(surface) = &p.surface {
             write_surface(&dir.join(surface_path(p.id)), surface)?;
         }
+        match &p.edit {
+            Some(edit) => write_cleaned(dir, p.id, edit)?,
+            None => {
+                let _ = std::fs::remove_file(dir.join(cleaned_path(p.id)));
+                let _ = std::fs::remove_file(dir.join(cleaned_counts_path(p.id)));
+            }
+        }
     }
     let mut outputs = Vec::new();
     std::fs::create_dir_all(dir.join("outputs")).map_err(|e| e.to_string())?;
     // Outputs that no longer exist are removed so an opened project shows what was saved.
-    for (file, present) in [(MERGED_FILE, project.merged.is_some()), (CLEANED_FILE, project.cleaned.is_some()), (MESH_FILE, project.mesh.is_some())] {
+    // The old project-wide cleaned cloud is never written again.
+    for (file, present) in [(MERGED_FILE, project.merged.is_some()), (CLEANED_FILE, false), (MESH_FILE, project.mesh.is_some())] {
         if !present {
             let _ = std::fs::remove_file(dir.join(file));
         }
@@ -474,10 +569,6 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
     if let Some((cloud, from)) = &project.merged {
         scancraft_io::save_ply_binary(cloud, dir.join(MERGED_FILE)).map_err(e)?;
         outputs.push(OutputRecord { kind: "merged".into(), file: MERGED_FILE.into(), points: cloud.len(), passes: from.clone() });
-    }
-    if let Some(cloud) = &project.cleaned {
-        scancraft_io::save_ply_binary(cloud, dir.join(CLEANED_FILE)).map_err(e)?;
-        outputs.push(OutputRecord { kind: "cleaned".into(), file: CLEANED_FILE.into(), points: cloud.len(), passes: Vec::new() });
     }
     if let Some(mesh) = &project.mesh {
         scancraft_io::save_mesh_ply_binary(mesh, dir.join(MESH_FILE)).map_err(e)?;
@@ -513,6 +604,10 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             (PassOrigin::File { .. }, None) => return Err(format!("{} is an imported pass without a surface file", record.name)),
             _ => None,
         };
+        let edit = match record.scan_config.get(CLEANED_KEY).and_then(|v| v.as_str()) {
+            Some(file) => Some(Arc::new(read_cleaned(dir, record.id, file).map_err(|e| format!("the cleaned surface of {} cannot be read ({e})", record.name))?)),
+            None => None,
+        };
         passes.push(StoredPass {
             id: record.id,
             name: record.name.clone(),
@@ -531,6 +626,7 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             },
             keyframes: kfs.into_iter().map(from_record).collect(),
             surface,
+            edit,
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
@@ -555,9 +651,10 @@ pub fn rebuild(mut stored: StoredPass) -> LoadedPass {
     let config = tracker_config(&stored.meta.scan_config, stored.meta.device.as_ref());
     let kfs = std::mem::take(&mut stored.keyframes).into_iter().map(Keyframe::from_data).collect();
     let tracker = Tracker::from_keyframes(config, kfs);
-    let own = match &stored.surface {
-        Some(surface) => surface.points.clone(),
-        None => tracker.fused_points(),
+    let own = match (&stored.edit, &stored.surface) {
+        (Some(edit), _) => edit.points.clone(),
+        (None, Some(surface)) => surface.points.clone(),
+        (None, None) => tracker.fused_points(),
     };
     let points = place(own, &stored.meta.transform);
     let keyframes = tracker.keyframes().iter().map(KeyframeInfo::of).collect();
@@ -605,8 +702,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None },
-                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None },
+                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None },
             ],
             merged: Some((merged, vec![1])),
             cleaned: None,
@@ -689,8 +786,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None },
-                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)) },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None },
+                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None },
             ],
             merged: None,
             cleaned: None,
@@ -725,6 +822,44 @@ mod tests {
     }
 
     #[test]
+    fn a_cleaned_pass_round_trips_with_its_observation_counts() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-cleaned-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut meta = PassMeta::imported("shell.ply".into());
+        meta.alignment = AlignState::Reference;
+        let s = surface();
+        let mut edit = PointCloud::from_points(s.points[..300].to_vec());
+        for (i, p) in edit.points.iter_mut().enumerate() {
+            p.confidence = (1 + i % 7) as f32;
+        }
+        let edit = Arc::new(edit);
+        let mut project = StoredProject {
+            name: "Cleaned".into(),
+            reference: Some(1),
+            next_pass_id: 2,
+            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)) }],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        let loaded = load(&dir).unwrap();
+        let back = loaded.passes[0].edit.as_ref().expect("the cleaning is stored");
+        assert_eq!(back.len(), 300);
+        assert!(back.points.iter().zip(&edit.points).all(|(a, b)| a.position == b.position && a.confidence == b.confidence));
+        assert_eq!(loaded.passes[0].surface.as_ref().map(|s| s.len()), Some(500), "the imported surface is kept as well");
+        let rebuilt = rebuild(loaded.passes.into_iter().next().unwrap());
+        assert_eq!(rebuilt.points.len(), 300, "an opened cleaned pass shows its cleaned surface");
+        // Saved again without cleaning, the files go and the pass opens as imported.
+        project.passes[0].edit = None;
+        save(&dir, &project).unwrap();
+        assert!(!dir.join(cleaned_path(1)).exists() && !dir.join(cleaned_counts_path(1)).exists());
+        assert!(load(&dir).unwrap().passes[0].edit.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_project_without_origins_loads_as_captured_passes() {
         let dir = std::env::temp_dir().join(format!("scancraft-app-old-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -734,7 +869,7 @@ mod tests {
             name: "Old".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None }],
+            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None }],
             merged: None,
             cleaned: None,
             mesh: None,

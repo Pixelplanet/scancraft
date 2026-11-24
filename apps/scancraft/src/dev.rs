@@ -57,8 +57,8 @@ pub fn write_demo_project(dir: &Path) -> Result<(), String> {
         reference: Some(1),
         next_pass_id: 3,
         passes: vec![
-            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None },
-            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None },
+            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None, edit: None },
+            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None, edit: None },
         ],
         merged: None,
         cleaned: None,

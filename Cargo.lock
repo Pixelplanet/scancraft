@@ -6893,6 +6893,7 @@ dependencies = [
  "image",
  "log",
  "rayon",
+ "rfd",
  "scancraft-align",
  "scancraft-core",
  "scancraft-driver",
@@ -7063,11 +7064,15 @@ name = "scancraft-mesh"
 version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
+ "image",
  "kdtree",
  "log",
  "rayon",
+ "scancraft-align",
  "scancraft-core",
+ "scancraft-io",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 

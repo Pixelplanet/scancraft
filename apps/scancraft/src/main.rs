@@ -6,6 +6,7 @@
 mod alignment;
 mod app;
 mod dev;
+mod file_picker;
 mod imports;
 mod isolation;
 mod model;
@@ -91,6 +92,7 @@ impl eframe::App for ScanCraft {
         if !dropped.is_empty() {
             self.app.queue_imports(dropped);
         }
+        self.app.poll_picker();
         self.app.poll_jobs();
         self.app.poll_device_events();
         self.app.poll_updates(&ctx);

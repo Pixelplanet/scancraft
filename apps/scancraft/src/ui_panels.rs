@@ -9,6 +9,7 @@ use crate::alignment::{self, EdgeKind};
 use crate::app::{Capture, Proposal, ScanCraftApp, Tone};
 use crate::project::{AlignState, PassStart};
 use crate::scan_modes::{self, OptionState};
+use crate::file_picker::PickPurpose;
 use crate::model::{ExportFormat, Node, Quality, Stage, Tool, thousands};
 
 /// Status-dot colour of a pass's alignment.
@@ -172,7 +173,7 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             let pass_key = format!("pass:{}", p.id);
             // A fixed surface has no frames to list.
             let pass_open = !p.is_fixed() && app.folded(&pass_key, true);
-            let left_out = if p.meta.included { "" } else { " · left out of Merge" };
+            let left_out = format!("{}{}", if p.is_cleaned() { " · cleaned" } else { "" }, if p.meta.included { "" } else { " · left out of Merge" });
             let tip = if p.is_fixed() {
                 format!("{} · {}{left_out}\n{} points · a fixed surface: no frames, not continued", p.meta.alignment.label(), p.meta.origin.label(), thousands(p.layer.len()))
             } else {
@@ -214,9 +215,19 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
             if let Some(resp) = r.response {
                 resp.context_menu(|ui| {
-                    let why = if p.is_fixed() { "An imported scan cannot be continued" } else { "Connect a scanner and stop the current capture" };
-                    if ui.add_enabled(can_continue && !p.is_fixed(), egui::Button::new("Continue pass")).on_disabled_hover_text(why).clicked() {
+                    let why = if p.is_fixed() {
+                        "An imported scan cannot be continued"
+                    } else if p.is_cleaned() {
+                        "A cleaned pass cannot be continued: reset its cleaning first"
+                    } else {
+                        "Connect a scanner and stop the current capture"
+                    };
+                    if ui.add_enabled(can_continue && !p.is_fixed() && !p.is_cleaned(), egui::Button::new("Continue pass")).on_disabled_hover_text(why).clicked() {
                         actions.push(BrowserAction::Continue(p.id));
+                        ui.close();
+                    }
+                    if ui.add_enabled(app.can_edit() && p.is_cleaned(), egui::Button::new("Reset cleaning")).on_disabled_hover_text("Not cleaned").clicked() {
+                        actions.push(BrowserAction::ResetCleaning(p.id));
                         ui.close();
                     }
                     ui.separator();
@@ -353,6 +364,7 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 BrowserAction::Fold(key, open) => {
                     app.folds.insert(key, open);
                 }
+                BrowserAction::ResetCleaning(id) => app.reset_cleaning_of(&[id]),
                 BrowserAction::Continue(id) => {
                     app.stage = Stage::Scan;
                     app.continue_scan(id);
@@ -384,8 +396,8 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
 
     // Results.
     let open = app.folded("results", true);
-    let in_results = matches!(sel, Some(Node::Merged | Node::Cleaned | Node::Mesh));
-    let n = app.merged.is_some() as usize + app.cleaned.is_some() as usize + app.mesh.is_some() as usize;
+    let in_results = matches!(sel, Some(Node::Merged | Node::Mesh));
+    let n = app.merged.is_some() as usize + app.mesh.is_some() as usize;
     let n_label = n.to_string();
     let r = kit::tree_row(ui, egui::Id::new("row_results"), &Row { depth: 0, fold: Some(open), icon: "folder", label: "Results", count: &n_label, mark: branch(in_results), dim: n == 0, ..Default::default() });
     if r.fold || r.double {
@@ -393,7 +405,7 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
     if open {
         if n == 0 {
-            empty_row(ui, "Merge, clean or mesh to add results");
+            empty_row(ui, "Merge or mesh to add results");
         }
         if let Some(m) = &app.merged {
             let count = thousands(m.layer.len());
@@ -435,32 +447,6 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 app.discard_merged();
             }
         }
-        if let Some(c) = &app.cleaned {
-            let count = thousands(c.len());
-            let r = kit::tree_row(
-                ui,
-                egui::Id::new("row_cleaned"),
-                &Row {
-                    depth: 1,
-                    eye: Some(c.visible),
-                    icon: "filter",
-                    label: "Cleaned cloud",
-                    count: &count,
-                    selected: sel == Some(Node::Cleaned),
-                    dim: !c.visible,
-                    mark: if sel == Some(Node::Cleaned) { Mark::Here } else { Mark::None },
-                    ..Default::default()
-                },
-            );
-            if r.clicked {
-                app.selection = Some(Node::Cleaned);
-            }
-            if r.eye {
-                if let Some(c) = &mut app.cleaned {
-                    c.visible = !c.visible;
-                }
-            }
-        }
         if let Some(m) = &app.mesh {
             let count = format!("{} tris", thousands(m.analysis.triangle_count));
             let r = kit::tree_row(
@@ -496,6 +482,7 @@ enum BrowserAction {
     TogglePass(u32),
     Fold(String, bool),
     Continue(u32),
+    ResetCleaning(u32),
     DeletePass(u32),
     Discard(u32, u64, bool),
     DiscardFrom(u32, u64),
@@ -572,10 +559,8 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     Tool::Export(_) => "Export",
                     Tool::PointPairs(_) => "Align",
                     Tool::SaveProject => "Save",
-                    Tool::OpenProject => "Open",
-                    Tool::ImportScan => "Import",
-                    Tool::AddProject => "Add passes",
                     Tool::IsolateObject => "Keep object",
+                    Tool::FillHoles => "Fill",
                     _ => "OK",
                 };
                 let ok_enabled = blocked.is_none() && (tool != Tool::ConnectIp || app.ip_valid()) && (!matches!(tool, Tool::PointPairs(_)) || app.picked_pairs().len() >= 3);
@@ -686,13 +671,18 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         }
         Tool::Reconstruct => {
             kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
-            kit::slider_row(ui, "Cell size", &mut s.mc_cell_mm, 0.5..=5.0, 1, "mm");
-            kit::note(ui, "Smaller cells keep more detail and take longer. Clean the cloud first for a better surface.");
+            kit::slider_row(ui, "Triangle size", &mut s.mc_cell_mm, 0.3..=3.0, 1, "mm");
+            kit::slider_row(ui, "Smoothness", &mut s.mesh_smoothness, 2.0..=6.0, 1, "");
+            kit::slider_row(ui, "Then smooth", &mut s.mesh_auto_smooth, 0..=10, 0, "");
+            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "");
+            kit::note(ui, "Triangle size: smaller keeps finer detail, takes longer and makes a bigger file. Smoothness: how far the surface averages over neighbouring points (in point spacings); more hides noise and small misalignment between passes, less keeps fine detail. Then smooth: edge-preserving smoothing right after (0 = off). Open areas stay open: Fill Holes closes them.");
         }
         Tool::Smooth => {
-            kit::slider_row(ui, "Iterations", &mut s.smooth_iterations, 1..=10, 0, "");
-            kit::slider_row(ui, "Strength", &mut s.smooth_lambda, 0.05..=0.9, 2, "");
+            kit::slider_row(ui, "Strength", &mut s.smooth_iterations, 1..=15, 0, "");
+            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "");
+            kit::note(ui, "Smooths flat and curved areas while keeping edges and ribs (Keep edges high), or rounds everything like a plain smoothing filter (Keep edges low). Folded spots from bad scan data are relaxed first.");
         }
+        Tool::FillHoles => fill_holes_form(app, ui),
         Tool::Decimate => {
             let tris = app.mesh.as_ref().map(|m| m.analysis.triangle_count);
             let s = &mut app.settings;
@@ -706,46 +696,10 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         Tool::PointPairs(id) => pairs_form(app, ui, id),
         Tool::IsolateObject => isolate_form(app, ui),
         Tool::SaveProject => {
-            kit::row(ui, "Folder", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.settings.project_path).desired_width(f32::INFINITY));
-            });
+            kit::row(ui, "Folder", |ui| path_field(app, ui, PickPurpose::SaveFolder));
             let n = app.passes.len();
             kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
             kit::note(ui, "Saves project.json and each pass's keyframes into the folder (created if needed). Saving again overwrites it.");
-        }
-        Tool::ImportScan => {
-            kit::row(ui, "File", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.settings.import_path).hint_text("scan.ply").desired_width(f32::INFINITY));
-            });
-            let path = std::path::PathBuf::from(app.settings.import_path.trim().trim_matches('"'));
-            if app.settings.import_path.trim().is_empty() {
-                kit::note(ui, "A PLY, OBJ or STL file: a point cloud or a mesh.");
-            } else if !path.is_file() {
-                kit::status_line(ui, "No such file", t.warning);
-            }
-            kit::note(ui, "The scan becomes a new pass, not aligned yet: Align All places it with the others. Coordinates are read as mm; a scan under 2 units across is offered a conversion from metres. The table and loose fragments are told apart as for captured passes. Undoable.");
-        }
-        Tool::AddProject => {
-            kit::row(ui, "Folder", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.settings.add_project_path).desired_width(f32::INFINITY));
-            });
-            let dir = std::path::PathBuf::from(app.settings.add_project_path.trim().trim_matches('"'));
-            if scancraft_io::project::is_project(&dir) {
-                kit::note(ui, "Its passes are added to this project with new numbers, each in its own frame and not aligned: Align All connects them. Its results (merged model, mesh) are not copied. Undoable.");
-            } else {
-                kit::status_line(ui, "No project.json in this folder", t.warning);
-            }
-        }
-        Tool::OpenProject => {
-            kit::row(ui, "Folder", |ui| {
-                ui.add(egui::TextEdit::singleline(&mut app.settings.project_path).desired_width(f32::INFINITY));
-            });
-            let exists = scancraft_io::project::is_project(std::path::Path::new(app.settings.project_path.trim()));
-            if exists {
-                kit::note(ui, "Opening replaces what is open now (undoable).");
-            } else {
-                kit::status_line(ui, "No project.json in this folder", t.warning);
-            }
         }
     }
 }
@@ -831,6 +785,39 @@ fn isolate_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
 }
 
+/// A path that can be typed, with a Browse button that opens the native dialog.
+fn path_field(app: &mut ScanCraftApp, ui: &mut egui::Ui, purpose: PickPurpose) {
+    let browsing = app.picker.is_open();
+    ui.horizontal(|ui| {
+        let button = ui.add_enabled(!browsing, egui::Button::new("Browse…")).on_hover_text("Choose with the Windows file browser");
+        let text = match purpose {
+            PickPurpose::ExportFile => &mut app.settings.export_path,
+            _ => &mut app.settings.project_path,
+        };
+        ui.add(egui::TextEdit::singleline(text).desired_width((ui.available_width() - button.rect.width() - ui.spacing().item_spacing.x).max(40.0)));
+        if button.clicked() {
+            app.pick(&ui.ctx().clone(), purpose);
+        }
+    });
+}
+
+fn fill_holes_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    app.refresh_holes();
+    let s = &mut app.settings;
+    // Slider in boundary length; the holes are listed by it.
+    kit::slider_row(ui, "Up to", &mut s.fill_max_mm, 5.0..=1000.0, 0, "mm around");
+    kit::checkbox(ui, "Leave the largest opening (open scan border)", &mut s.fill_keep_largest);
+    let Some(h) = &app.holes else { return };
+    let (fill, skip) = h.split(app.settings.fill_max_mm, app.settings.fill_keep_largest);
+    kit::row(ui, "Holes", |ui| kit::value_text(ui, &format!("{} · {fill} to fill, {skip} left open", h.holes.len()), false));
+    if let Some(big) = h.holes.first() {
+        kit::row(ui, "Largest", |ui| kit::value_text(ui, &format!("{:.0} mm around, {:.0} mm across", big.perimeter_mm, big.diameter_mm), false));
+    }
+    ui.add_space(t.space_4);
+    kit::note(ui, "Holes to fill are outlined in the view (accent), those left open in grey. Each hole is closed with triangles of the surrounding size and shaped to continue the surface around it. Undoable.");
+}
+
 fn export_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let labels: Vec<&str> = ExportFormat::ALL.iter().map(|f| f.label()).collect();
     let enabled: Vec<bool> = ExportFormat::ALL.iter().map(|f| app.tool_blocked(Tool::Export(*f)).is_none()).collect();
@@ -843,9 +830,7 @@ fn export_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
         }
     });
-    kit::row(ui, "File", |ui| {
-        ui.add(egui::TextEdit::singleline(&mut app.settings.export_path).desired_width(f32::INFINITY));
-    });
+    kit::row(ui, "File", |ui| path_field(app, ui, PickPurpose::ExportFile));
     let source = if app.settings.export_format.needs_mesh() {
         app.mesh.as_ref().map(|m| format!("Mesh · {} triangles", thousands(m.analysis.triangle_count))).unwrap_or_else(|| "—".into())
     } else {
@@ -1259,14 +1244,14 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
 
 fn clean_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    let visible_passes = app.passes.iter().filter(|p| p.layer.visible).count();
-    kit::row(ui, "Works on", |ui| kit::value_text(ui, app.working_source(), false));
-    kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(app.working_len()), false));
-    if app.cleaned.is_none() && app.merged.is_none() {
-        kit::row(ui, "Passes", |ui| kit::value_text(ui, &format!("{visible_passes} of {}", app.passes.len()), false));
-    }
+    let targets = app.clean_targets();
+    let label = app.clean_targets_label();
+    kit::row(ui, "Works on", |ui| kit::value_text(ui, &label, targets.is_empty()));
+    kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(app.clean_len()), targets.is_empty()));
+    let cleaned = app.passes.iter().filter(|p| p.is_cleaned()).count();
+    kit::row(ui, "Cleaned", |ui| kit::value_text(ui, &format!("{cleaned} of {} passes", app.passes.len()), false));
     ui.add_space(t.space_6);
-    kit::note(ui, "Isolate Object keeps the scanned object and drops the table, marker blocks and loose fragments. The filters in the ribbon do the rest. Each one replaces the cleaned cloud and can be undone.");
+    kit::note(ui, "Each tool works on every shown scan separately; hidden scans are left alone. Hide the others (eye in the browser) to work on one scan. Isolate Object works on one shown scan at a time and keeps the object, dropping the table, marker blocks and loose fragments. Clean each scan, then align them. All steps can be undone.");
 }
 
 fn mesh_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -1279,7 +1264,7 @@ fn mesh_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     kit::row(ui, "Watertight", |ui| kit::value_text(ui, &dash(a.as_ref().map(|a| if a.is_watertight { "Yes".into() } else { format!("No · {} open edges", thousands(a.open_edges)) })), a.is_none()));
     ui.add_space(t.space_6);
     if a.is_none() {
-        kit::note(ui, "Reconstruct builds a surface from the cleaned cloud, or from the visible passes.");
+        kit::note(ui, "Reconstruct builds a surface from the merged model when it is shown, else from the shown passes.");
     }
 }
 
@@ -1290,7 +1275,6 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         Node::Device | Node::Frame(..) => return,
         Node::Pass(_) => "Selected pass",
         Node::Merged => "Merged model",
-        Node::Cleaned => "Selected cloud",
         Node::Mesh => return,
     };
     let mut delete = None;
@@ -1298,6 +1282,7 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let mut weight_change = None;
     let mut include_change = None;
     let mut scale = None;
+    let mut reset = None;
     kit::section(ui, "selection", title, true, |ui| match node {
         Node::Pass(id) => {
             let Some(p) = app.passes.iter().find(|p| p.id == id) else { return };
@@ -1341,6 +1326,10 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 };
                 kit::row(ui, "Object", |ui| kit::value_text(ui, &text, true));
             }
+            kit::row(ui, "Cleaning", |ui| kit::value_text(ui, if p.is_cleaned() { "Cleaned" } else { "As scanned" }, !p.is_cleaned()));
+            if p.is_cleaned() && kit::wide_button(ui, "Reset cleaning", Button::Normal, app.can_edit()).on_hover_text("Go back to the pass as scanned or imported (undoable)").clicked() {
+                reset = Some(id);
+            }
             let (mut weight, mut included) = (p.meta.weight, p.meta.included);
             if kit::slider_row(ui, "Merge weight", &mut weight, 0.5..=5.0, 1, "").changed() {
                 weight_change = Some((id, weight));
@@ -1350,8 +1339,9 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
             ui.add_space(Tokens::get().space_4);
             if !p.is_fixed() {
-                let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
-                if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text("Capture more into this pass, carrying on from its last kept frame").clicked() {
+                let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none() && !p.is_cleaned();
+                let tip = if p.is_cleaned() { "A cleaned pass cannot be continued: reset its cleaning first" } else { "Capture more into this pass, carrying on from its last kept frame" };
+                if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text(tip).clicked() {
                     continue_pass = Some(id);
                 }
             }
@@ -1367,17 +1357,13 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             kit::row(ui, "From", |ui| kit::value_text(ui, &from, false));
             kit::note(ui, &m.summary);
         }
-        Node::Cleaned => {
-            let Some(c) = &app.cleaned else { return };
-            kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(c.len()), false));
-            let b = c.cloud.bbox;
-            let size = if b.is_empty() { "—".to_string() } else { let e = b.max - b.min; format!("{:.0} × {:.0} × {:.0} mm", e.x, e.y, e.z) };
-            kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
-        }
         _ => {}
     });
     if let Some(id) = scale {
         app.scale_pass(id, 1000.0);
+    }
+    if let Some(id) = reset {
+        app.reset_cleaning_of(&[id]);
     }
     if let Some((id, w)) = weight_change {
         app.set_weight(id, w);
