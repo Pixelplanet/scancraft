@@ -3,6 +3,7 @@ pub mod marching_cubes;
 pub mod metrics;
 pub mod normals;
 pub mod smooth;
+pub mod solid;
 pub mod tables;
 
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub use marching_cubes::{MarchingCubes, ReconstructionStats};
 pub use metrics::{MeshAnalysis, MeshMetrics};
 pub use normals::NormalEstimator;
 pub use smooth::LaplacianSmoother;
+pub use solid::{build_solid, fill_holes, remove_markers, Solid, SolidConfig, SolidPoint, SolidReport, VertexOrigin};
 
 use scancraft_core::{Mesh, PointCloud};
 

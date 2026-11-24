@@ -95,8 +95,23 @@ pair).
 Solid model test case (user, 2026-11-24): the merged shell part is the benchmark for turning
 points into a watertight solid: outer and inner surface joined at the rim with the 3 mm wall
 kept, holes filled, raised marker stickers removed with a smooth surface, ribs and bosses kept.
-Two meshing pipelines are prototyped against each other in `scancraft-mesh` and judged on this
-data (geometry, wall thickness, smoothness at every marker site).
+Two meshing pipelines were prototyped against each other and judged on this data (a banded
+screened Poisson solve won over a material-band field). The result is `scancraft-mesh::solid`
+(`build_solid`, plus standalone `remove_markers`, `fill_holes`, `fair_marker_sites`):
+clean (outliers, ghost layers, one layer per sheet with a trusted scan first), cut and refill
+marker stickers from a quadric fitted to the surrounding ring, complete faces that were never
+scanned by offsetting the other face by the measured wall, fill and bridge holes, solve a banded
+screened Poisson field at 0.4 mm, extract, collapse slivers, repair self-intersections, fair the
+marker sites on the mesh. Every vertex is tagged measured / marker fill / hole fill / completed.
+
+On the three Revo scans with the `align_all` poses (1.22 M points, about 41 s, 0.9 GB): watertight,
+manifold, one component; wall median 3.10 mm; outside scan to mesh median 0.011 mm, p95 0.044 mm;
+82.8 % of vertices measured, 13.4 % completed; 20 of 23 marker sites faired (median deviation
+from the ring fit about 25 µm on the earlier run). Open: genus 23 (the real part has about 5
+openings; data gaps near the hinge bracket stay open as tunnels), a two-sided gap next to the
+hinge bracket only partly bridged, a few marker sites at edges and ridges not smooth, inside
+accuracy limited by the remaining S2/S3 misfit, marker positions come from Revo's
+`marker_framework.mkf` or a geometric detector.
 
 Research on community exports, the runtime download and integrated-GPU speed: section 5.
 
@@ -165,7 +180,7 @@ assistant never controls the scanner without explicit approval, and the scanner 
 | Object isolation (`scancraft-fusion::segment_object`), used by default; "Use whole scene" | done 2026-11-24 |
 | App: stale-result fixes, Refine preview, Align All, Isolate Object, wall read-outs, Import Scan (PLY/OBJ/STL), Add Project | done 2026-11-24 (no file picker yet: paths are typed or dropped) |
 | Real-data regression (`merge_ply`, `tests/real_data.rs`, `SCANCRAFT_ALIGN_DATA`) | done; criteria loose (1.5° / 3 mm): tighten with the `.mkf` marker positions |
-| Solid model (watertight mesh, holes, markers) | in progress |
+| Solid model library (`scancraft-mesh::solid`, example `solid_ply`) | done 2026-11-24; not yet wired into the app's Mesh stage |
 | Colour keyframes, segmentation crate, AI pack, ORT backend, SAM 2 video loop | not started |
 
 ## 8. Backlog (later)
