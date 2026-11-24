@@ -80,6 +80,8 @@ Set-Content (Join-Path $work 'install.cmd') "@echo off`r`npowershell.exe -NoProf
 $setup = Join-Path $Out "ScanCraft-Setup-$version.exe"
 if (Test-Path $setup) { Remove-Item $setup -Force }
 $files = 'payload.zip', 'install.ps1', 'uninstall.ps1', 'install.cmd'
+$fileLines = ($files | ForEach-Object -Begin { $i = 0 } -Process { "FILE$i=`"$_`""; $i++ }) -join "`r`n"
+$sourceLines = (0..($files.Count - 1) | ForEach-Object { "%FILE$_%=" }) -join "`r`n"
 $sed = @"
 [Version]
 Class=IEXPRESS
@@ -103,15 +105,17 @@ PostInstallCmd=<None>
 AdminQuietInstCmd=
 UserQuietInstCmd=
 SourceFiles=SourceFiles
-$(for ($i = 0; $i -lt $files.Count; $i++) { "FILE$i=`"$($files[$i])`"`r`n" })[SourceFiles]
+[SourceFiles]
 SourceFiles0=$work\
 [SourceFiles0]
-$(for ($i = 0; $i -lt $files.Count; $i++) { "%FILE$i%=`r`n" })
+$sourceLines
+[Strings]
+$fileLines
 "@
 $sedPath = Join-Path $work 'scancraft.sed'
-Set-Content $sedPath $sed -Encoding ascii
+Set-Content $sedPath ($sed -replace "`r?`n", "`r`n") -Encoding ascii
 $p = Start-Process "$env:SystemRoot\System32\iexpress.exe" -ArgumentList '/N', '/Q', $sedPath -Wait -PassThru
-if (-not (Test-Path $setup)) { throw "IExpress did not produce $setup (exit $($p.ExitCode))" }
+if (-not (Test-Path $setup)) { throw "IExpress did not produce $setup (exit $($p.ExitCode)); see $sedPath" }
 Remove-Item $work -Recurse -Force
 
 foreach ($f in $zip, $setup) {
