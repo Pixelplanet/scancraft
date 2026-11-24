@@ -14,6 +14,7 @@ documents disagree, the one higher in this list wins.
 | [protocol/device-internals.md](protocol/device-internals.md) | Ground truth about the POP 4: control interface as a shell and its encoding rules, the DSP log, DSP reload on format change, the start order, the DSP's own name for every message, firmware v5.3.99 changes |
 | [architecture/scan-sessions.md](architecture/scan-sessions.md) | Projects, passes, alignment: the application's data model |
 | [architecture/splatting.md](architecture/splatting.md) | Gaussian-splat output |
+| [architecture/merge-and-ai.md](architecture/merge-and-ai.md) | Merging scans and AI object segmentation: decisions, Revo's approach, alignment test on real scans, plan |
 
 ## Per-mode notebooks (current at the end, history above)
 

@@ -14,5 +14,6 @@ scancraft-color.workspace = true
 scancraft-laser.workspace = true
 scancraft-stereo.workspace = true
 scancraft-hybrid.workspace = true
+scancraft-fusion.workspace = true
 glam.workspace = true
 log.workspace = true

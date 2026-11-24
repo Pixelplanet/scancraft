@@ -636,7 +636,8 @@ fn main() {
     writeln!(csv, "pair,source,target,src_pts,tgt_pts,voxel_mm,status,seconds,rot_deg,axis_x,axis_y,axis_z,tx,ty,tz,qx,qy,qz,qw,overlap,rmse_mm,visibility_conflict,inliers,score,verdict,nn_frac_1mm,nn_rms_1mm,nn_frac_3mm,nn_rms_3mm,nn_median_mm").unwrap();
 
     let mut rows = Vec::new();
-    let passes: Vec<PassCloud> = scans.iter().map(|s| PassCloud { points: s.points.clone(), views: Vec::new() }).collect();
+    // No support plane: this tool reproduces the original study, which scored without one.
+    let passes: Vec<PassCloud> = scans.iter().map(|s| PassCloud { points: s.points.clone(), views: Vec::new(), support: None }).collect();
     let mut indices: HashMap<usize, GridIndex> = HashMap::new();
     for &(i, j) in &pairs {
         let (src, tgt) = (&scans[i], &scans[j]);

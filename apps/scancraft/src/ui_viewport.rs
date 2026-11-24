@@ -53,11 +53,22 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if let Some(b) = &bbox {
             frame.height_range = [b.min.z, b.max.z.max(b.min.z + 1.0)];
         }
-        let previewed = app.align_preview.as_ref().map(|a| a.pass);
-        if colour_passes {
+        // Passes drawn where a proposal would put them instead of where they are.
+        let mut previewed: Vec<u32> = app.align_preview.as_ref().map(|a| a.pass).into_iter().collect();
+        if let Some(pp) = &app.poses_preview {
+            previewed.extend(pp.layers.iter().map(|(id, _)| *id));
+        }
+        // Isolate Object shows only its input, coloured by label.
+        let isolating = app.tool == Some(crate::model::Tool::IsolateObject) && app.object_picking.is_some();
+        if isolating {
+            frame.point_shading = PointShading::Vertex;
+            if let Some(o) = &app.object_picking {
+                frame.points.push(PointLayer { generation: o.generation | 1 << 60, points: Arc::clone(&o.layer), overlay: false });
+            }
+        } else if colour_passes {
             let colours: Vec<[u8; 3]> = app.passes.iter().map(|p| app.pass_colour(p.id)).collect();
             for (p, colour) in app.passes.iter_mut().zip(colours) {
-                if !p.layer.visible || p.layer.len() == 0 || Some(p.id) == previewed {
+                if !p.layer.visible || p.layer.len() == 0 || previewed.contains(&p.id) {
                     continue;
                 }
                 let fresh = p.tinted.as_ref().is_some_and(|(g, n, _)| *g == p.layer.generation && *n == p.layer.len());
@@ -70,19 +81,24 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
                 }
             }
         } else {
-            for p in app.passes.iter().filter(|p| p.layer.visible && p.layer.len() > 0 && Some(p.id) != previewed) {
+            for p in app.passes.iter().filter(|p| p.layer.visible && p.layer.len() > 0 && !previewed.contains(&p.id)) {
                 frame.points.push(PointLayer { generation: p.layer.generation, points: Arc::clone(&p.layer.gpu), overlay: false });
             }
         }
-        if let Some(a) = &app.align_preview {
-            frame.points.push(PointLayer { generation: a.layer.generation, points: Arc::clone(&a.layer.gpu), overlay: false });
-        }
-        if let Some(m) = app.merged.as_ref().filter(|m| m.layer.visible && m.layer.len() > 0) {
-            let (generation, points) = if colour_passes { (m.layer.generation | 1 << 62, Arc::clone(&m.tinted)) } else { (m.layer.generation, Arc::clone(&m.layer.gpu)) };
-            frame.points.push(PointLayer { generation, points, overlay: false });
-        }
-        if let Some(c) = app.cleaned.as_ref().filter(|c| c.visible && c.len() > 0) {
-            frame.points.push(PointLayer { generation: c.generation, points: Arc::clone(&c.gpu), overlay: false });
+        if !isolating {
+            if let Some(a) = &app.align_preview {
+                frame.points.push(PointLayer { generation: a.layer.generation, points: Arc::clone(&a.layer.gpu), overlay: false });
+            }
+            for (_, layer) in app.poses_preview.iter().flat_map(|pp| pp.layers.iter()) {
+                frame.points.push(PointLayer { generation: layer.generation, points: Arc::clone(&layer.gpu), overlay: false });
+            }
+            if let Some(m) = app.merged.as_ref().filter(|m| m.layer.visible && m.layer.len() > 0) {
+                let (generation, points) = if colour_passes { (m.layer.generation | 1 << 62, Arc::clone(&m.tinted)) } else { (m.layer.generation, Arc::clone(&m.layer.gpu)) };
+                frame.points.push(PointLayer { generation, points, overlay: false });
+            }
+            if let Some(c) = app.cleaned.as_ref().filter(|c| c.visible && c.len() > 0) {
+                frame.points.push(PointLayer { generation: c.generation, points: Arc::clone(&c.gpu), overlay: false });
+            }
         }
         // The selected keyframe, over everything.
         app.update_highlight([t.sel_edge.r(), t.sel_edge.g(), t.sel_edge.b()], [t.warning.r(), t.warning.g(), t.warning.b()]);
@@ -93,7 +109,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if let Some((generation, points)) = marker_map_layer(app, &t) {
             frame.points.push(PointLayer { generation, points, overlay: true });
         }
-        if let Some(m) = app.mesh.as_ref().filter(|m| m.visible) {
+        if let Some(m) = app.mesh.as_ref().filter(|m| m.visible && !isolating) {
             frame.mesh = Some(GpuMeshLayer { generation: m.generation, mesh: Arc::clone(&m.gpu), faces: true, edges: app.show_edges });
         }
         if app.show_grid {
@@ -109,6 +125,9 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         } else {
             ui.painter().add(frame.into_shape(view));
             camera_input(app, ui, &response, view);
+            if isolating {
+                object_picks(app, ui, &response, view);
+            }
         }
 
         // Ribbon cards.
@@ -188,6 +207,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if let Some((dot, text)) = pill {
             kit::viewport_status(ui.painter(), pos2(bar.center().x, bar.top() - 8.0), Some(dot), &text);
         }
+        toast(app, ctx, pos2(view.center().x, cards.bottom + kit::SHELL_GAP));
 
         // Empty view hint.
         if !app.has_geometry() && app.capture == Capture::Idle {
@@ -261,6 +281,80 @@ fn camera_input(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response
             NavTool::Zoom => egui::CursorIcon::ResizeVertical,
         };
         ui.ctx().set_cursor_icon(cursor);
+    }
+}
+
+/// The toast under the ribbon: its message, Undo and a close button.
+fn toast(app: &mut ScanCraftApp, ctx: &egui::Context, top_centre: egui::Pos2) {
+    let Some(message) = app.current_toast().map(str::to_string) else { return };
+    let t = Tokens::get();
+    let mut undo = false;
+    let mut close = false;
+    let mut act = false;
+    let action = app.toast_action;
+    egui::Area::new(egui::Id::new("toast")).pivot(egui::Align2::CENTER_TOP).fixed_pos(top_centre).order(egui::Order::Foreground).show(ctx, |ui| {
+        kit::frame(Surface::Toast).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.set_max_width(520.0);
+                ui.add(egui::Label::new(egui::RichText::new(&message).size(t.font_body).color(t.text)).wrap());
+                if let Some(a) = action {
+                    if ui.add_enabled(app.can_edit(), egui::Button::new(a.label())).clicked() {
+                        act = true;
+                    }
+                }
+                if ui.add_enabled(app.history.can_undo() && app.can_edit(), egui::Button::new("Undo")).clicked() {
+                    undo = true;
+                }
+                if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                    close = true;
+                }
+            });
+        });
+    });
+    if act {
+        app.run_toast_action();
+    }
+    if undo {
+        app.undo();
+    }
+    if undo || close {
+        app.toast = None;
+        app.toast_action = None;
+    }
+    ctx.request_repaint_after(std::time::Duration::from_millis(250));
+}
+
+/// The point under `pos` nearest to the eye, of candidates given as (screen position, view
+/// depth, point): what a click picks, in the main view and in the point-pair panes.
+fn pick_point(candidates: impl Iterator<Item = (egui::Pos2, f32, glam::Vec3)>, pos: egui::Pos2) -> Option<glam::Vec3> {
+    candidates.filter(|(s, ..)| s.distance(pos) <= 6.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(.., p)| p)
+}
+
+/// Isolate Object in the main view: a click keeps the cluster under the cursor, Shift+click
+/// leaves it out; the picks are drawn as numbered rings.
+fn object_picks(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response, view: Rect) {
+    let t = Tokens::get();
+    let vp = app.camera.view_projection();
+    if response.clicked() && app.busy.is_none() {
+        if let (Some(pos), Some(o)) = (response.interact_pointer_pos(), app.object_picking.as_ref()) {
+            let targets = Arc::clone(&o.targets);
+            let shift = ui.input(|i| i.modifiers.shift);
+            let hit = pick_point(targets.iter().filter_map(|&p| project(&vp, view, p).map(|(s, d)| (s, d, p))), pos);
+            if let Some(p) = hit {
+                app.add_object_pick(p, !shift);
+            }
+        }
+    }
+    let Some(o) = app.object_picking.as_ref() else { return };
+    for (i, (p, keep)) in o.picks.iter().enumerate() {
+        if let Some((s, _)) = project(&vp, view, *p) {
+            let colour = if *keep { t.agent_ok } else { t.error };
+            ui.painter().circle(s, 7.0, colour, egui::Stroke::new(1.5, egui::Color32::WHITE));
+            ui.painter().text(s, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
 }
 
@@ -345,8 +439,7 @@ fn pair_panes(app: &mut ScanCraftApp, ui: &mut egui::Ui, area: Rect) {
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
                 // The nearest-to-the-eye point under the cursor.
-                let hit = shown.iter().filter(|(s, ..)| s.distance(pos) <= 6.0).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(.., p)| *p);
-                clicked[side] = hit;
+                clicked[side] = pick_point(shown.iter().map(|(s, d, _, p)| (*s, *d, *p)), pos);
             }
         }
     }

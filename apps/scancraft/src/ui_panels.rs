@@ -5,7 +5,8 @@ use scancraft_driver::{AccuracyPreset, DeviceParam, LightSource, TurntableMode};
 use scancraft_ui::kit::{self, Button, Mark, Row, Surface};
 use scancraft_ui::Tokens;
 
-use crate::app::{Capture, ScanCraftApp, Tone};
+use crate::alignment::{self, EdgeKind};
+use crate::app::{Capture, Proposal, ScanCraftApp, Tone};
 use crate::project::{AlignState, PassStart};
 use crate::scan_modes::{self, OptionState};
 use crate::model::{ExportFormat, Node, Quality, Stage, Tool, thousands};
@@ -28,14 +29,41 @@ fn verdict_colour(v: scancraft_align::Verdict, t: &Tokens) -> egui::Color32 {
     }
 }
 
-/// Quality read-outs of an alignment.
-fn quality_rows(ui: &mut egui::Ui, q: &scancraft_align::Quality) {
+/// Quality read-outs of an alignment, under `verdict` (the quality's own, or one the caller
+/// checked further). Wall thickness and piercing show where an inside meets an outside scan.
+fn quality_rows(ui: &mut egui::Ui, q: &scancraft_align::Quality, verdict: scancraft_align::Verdict) {
     let t = Tokens::get();
-    kit::row(ui, "Verdict", |ui| kit::status_line(ui, q.verdict().label(), verdict_colour(q.verdict(), &t)));
+    kit::row(ui, "Verdict", |ui| kit::status_line(ui, verdict.label(), verdict_colour(verdict, &t)));
     kit::row(ui, "Overlap", |ui| kit::value_text(ui, &format!("{:.0} % of the pass", q.overlap * 100.0), false));
     let rms = if q.rmse_mm.is_finite() { format!("{:.2} mm", q.rmse_mm) } else { "—".to_string() };
     kit::row(ui, "RMS error", |ui| kit::value_text(ui, &rms, false));
+    if let Some(s) = q.shell.filter(|s| s.significant()) {
+        let wall = if s.is_wall() { format!("{:.2} mm (spread {:.2})", s.thickness_mm(), s.iqr_mm) } else { format!("{:.1} mm, uneven (spread {:.1})", s.thickness_mm(), s.iqr_mm) };
+        kit::row(ui, "Wall", |ui| kit::value_text(ui, &wall, !s.is_wall()));
+        kit::row(ui, "Piercing", |ui| kit::value_text(ui, &format!("{:.1} % pokes through", s.piercing * 100.0), false));
+    }
     kit::row(ui, "See-through", |ui| kit::value_text(ui, &format!("{:.1} %", q.visibility_conflict * 100.0), false));
+    if q.below_support > 0.005 {
+        kit::row(ui, "Under table", |ui| kit::value_text(ui, &format!("{:.1} % of the object", q.below_support * 100.0), false));
+    }
+    if q.sliding() {
+        kit::status_line(ui, &format!("May slide: the surfaces do not pin the fit down in one direction (about {:.0} mm of play)", q.slide_mm.min(999.0)), t.warning);
+    }
+}
+
+/// One line on a fit: verdict, then the measure that matters (wall or RMS).
+fn quality_summary(q: &scancraft_align::Quality) -> String {
+    let mut parts = vec![q.verdict().label().to_string()];
+    if let Some(w) = q.wall() {
+        parts.push(format!("wall {:.2} mm", w.thickness_mm()));
+    }
+    if q.inliers >= 100 && q.rmse_mm.is_finite() {
+        parts.push(format!("RMS {:.2} mm", q.rmse_mm));
+    }
+    if q.sliding() {
+        parts.push("may slide".into());
+    }
+    parts.join(" · ")
 }
 
 pub const BROWSER_WIDTH: f32 = 248.0;
@@ -137,27 +165,35 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
         let mut actions: Vec<BrowserAction> = Vec::new();
         for p in &app.passes {
-            let count = thousands(p.layer.len());
+            let imported = p.meta.origin.is_imported();
+            // Imported passes say so where the point count would be (the name needs the room).
+            let count = if imported { "imported".to_string() } else { thousands(p.layer.len()) };
             let recording = app.active_pass == Some(p.id) && app.capture == Capture::Running;
             let pass_key = format!("pass:{}", p.id);
-            let pass_open = app.folded(&pass_key, true);
-            let tip = format!(
-                "{} · {}{}\n{} frames captured · {} keyframes stored",
-                p.meta.alignment.label(),
-                p.meta.scan_config.light.label(),
-                if p.meta.included { "" } else { " · left out of Merge" },
-                p.frames,
-                p.keyframes.len()
-            );
+            // A fixed surface has no frames to list.
+            let pass_open = !p.is_fixed() && app.folded(&pass_key, true);
+            let left_out = if p.meta.included { "" } else { " · left out of Merge" };
+            let tip = if p.is_fixed() {
+                format!("{} · {}{left_out}\n{} points · a fixed surface: no frames, not continued", p.meta.alignment.label(), p.meta.origin.label(), thousands(p.layer.len()))
+            } else {
+                format!(
+                    "{} · {}{left_out}{}\n{} frames captured · {} keyframes stored",
+                    p.meta.alignment.label(),
+                    p.meta.scan_config.light.label(),
+                    if imported { format!("\n{}", p.meta.origin.label()) } else { String::new() },
+                    p.frames,
+                    p.keyframes.len()
+                )
+            };
             let frame_selected = matches!(sel, Some(Node::Frame(id, _)) if id == p.id);
             let r = kit::tree_row(
                 ui,
                 egui::Id::new(("row_pass", p.id)),
                 &Row {
                     depth: 1,
-                    fold: Some(pass_open),
+                    fold: (!p.is_fixed()).then_some(pass_open),
                     eye: Some(p.layer.visible),
-                    icon: "capture",
+                    icon: if imported { "import" } else { "capture" },
                     label: &p.name,
                     count: &count,
                     selected: sel == Some(Node::Pass(p.id)),
@@ -178,7 +214,8 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
             if let Some(resp) = r.response {
                 resp.context_menu(|ui| {
-                    if ui.add_enabled(can_continue, egui::Button::new("Continue pass")).on_disabled_hover_text("Connect a scanner and stop the current capture").clicked() {
+                    let why = if p.is_fixed() { "An imported scan cannot be continued" } else { "Connect a scanner and stop the current capture" };
+                    if ui.add_enabled(can_continue && !p.is_fixed(), egui::Button::new("Continue pass")).on_disabled_hover_text(why).clicked() {
                         actions.push(BrowserAction::Continue(p.id));
                         ui.close();
                     }
@@ -511,8 +548,7 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
             ui.spacing_mut().item_spacing.y = 0.0;
             if kit::dialog_header(ui, icon, &title, tool.is_some() || frame.is_some()) {
                 if tool.is_some() {
-                    app.tool = None;
-                    app.picking = None;
+                    app.close_tool();
                 } else if let Some((pass, _)) = frame {
                     app.selection = Some(Node::Pass(pass));
                 }
@@ -537,13 +573,15 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     Tool::PointPairs(_) => "Align",
                     Tool::SaveProject => "Save",
                     Tool::OpenProject => "Open",
+                    Tool::ImportScan => "Import",
+                    Tool::AddProject => "Add passes",
+                    Tool::IsolateObject => "Keep object",
                     _ => "OK",
                 };
                 let ok_enabled = blocked.is_none() && (tool != Tool::ConnectIp || app.ip_valid()) && (!matches!(tool, Tool::PointPairs(_)) || app.picked_pairs().len() >= 3);
                 let (cancel, accept) = egui::Frame::NONE.fill(t.dialog_footer).corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: t.radius_xl, se: t.radius_xl }).show(ui, |ui| kit::dialog_footer(ui, ok, ok_enabled, Some("Cancel"))).inner;
                 if cancel {
-                    app.tool = None;
-                    app.picking = None;
+                    app.close_tool();
                 }
                 if accept {
                     app.run_tool(tool);
@@ -666,6 +704,7 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         }
         Tool::Export(_) => export_form(app, ui),
         Tool::PointPairs(id) => pairs_form(app, ui, id),
+        Tool::IsolateObject => isolate_form(app, ui),
         Tool::SaveProject => {
             kit::row(ui, "Folder", |ui| {
                 ui.add(egui::TextEdit::singleline(&mut app.settings.project_path).desired_width(f32::INFINITY));
@@ -673,6 +712,29 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             let n = app.passes.len();
             kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
             kit::note(ui, "Saves project.json and each pass's keyframes into the folder (created if needed). Saving again overwrites it.");
+        }
+        Tool::ImportScan => {
+            kit::row(ui, "File", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.settings.import_path).hint_text("scan.ply").desired_width(f32::INFINITY));
+            });
+            let path = std::path::PathBuf::from(app.settings.import_path.trim().trim_matches('"'));
+            if app.settings.import_path.trim().is_empty() {
+                kit::note(ui, "A PLY, OBJ or STL file: a point cloud or a mesh.");
+            } else if !path.is_file() {
+                kit::status_line(ui, "No such file", t.warning);
+            }
+            kit::note(ui, "The scan becomes a new pass, not aligned yet: Align All places it with the others. Coordinates are read as mm; a scan under 2 units across is offered a conversion from metres. The table and loose fragments are told apart as for captured passes. Undoable.");
+        }
+        Tool::AddProject => {
+            kit::row(ui, "Folder", |ui| {
+                ui.add(egui::TextEdit::singleline(&mut app.settings.add_project_path).desired_width(f32::INFINITY));
+            });
+            let dir = std::path::PathBuf::from(app.settings.add_project_path.trim().trim_matches('"'));
+            if scancraft_io::project::is_project(&dir) {
+                kit::note(ui, "Its passes are added to this project with new numbers, each in its own frame and not aligned: Align All connects them. Its results (merged model, mesh) are not copied. Undoable.");
+            } else {
+                kit::status_line(ui, "No project.json in this folder", t.warning);
+            }
         }
         Tool::OpenProject => {
             kit::row(ui, "Folder", |ui| {
@@ -725,6 +787,48 @@ fn pairs_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
     let complete = app.picked_pairs().len();
     ui.add_space(t.space_4);
     kit::row(ui, "Pairs", |ui| kit::value_text(ui, &format!("{complete} complete (3 needed)"), complete < 3));
+}
+
+/// The Isolate Object card: the result so far and the picks.
+fn isolate_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let source = app.working_source();
+    let Some(o) = &app.object_picking else { return };
+    kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {} points", thousands(o.input.len())), true));
+    let (object, table) = match &o.result {
+        Some((seg, _)) => (
+            format!("{} points", thousands(seg.count(scancraft_fusion::SegmentLabel::Object))),
+            if seg.support.is_some() { format!("found · {} points", thousands(seg.count(scancraft_fusion::SegmentLabel::Support))) } else { "none found".to_string() },
+        ),
+        None => ("…".to_string(), "…".to_string()),
+    };
+    kit::row(ui, "Object", |ui| kit::value_text(ui, &object, !o.current()));
+    kit::row(ui, "Table", |ui| kit::value_text(ui, &table, !o.current()));
+    ui.add_space(t.space_4);
+    kit::note(ui, "Green is kept, grey is the table, red is left out. Click a cluster in the view to keep it; Shift+click one to leave it out.");
+    ui.add_space(t.space_6);
+    let mut remove = None;
+    if o.picks.is_empty() {
+        kit::note(ui, "No picks: the largest object is kept (the one standing on the table, if a table was found).");
+    }
+    for (i, (_, keep)) in o.picks.iter().enumerate() {
+        ui.horizontal(|ui| {
+            kit::value_text(ui, &format!("{}  {}", i + 1, if *keep { "keep this cluster" } else { "leave this cluster out" }), false);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button("✕").on_hover_text("Remove this pick").clicked() {
+                    remove = Some(i);
+                }
+            });
+        });
+    }
+    let can_undo = !o.picks.is_empty();
+    if let Some(i) = remove {
+        app.remove_object_pick(i);
+    }
+    ui.add_space(t.space_4);
+    if kit::wide_button(ui, "Undo last pick", Button::Normal, can_undo).clicked() {
+        app.undo_object_pick();
+    }
 }
 
 fn export_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -964,22 +1068,133 @@ fn mode_row<T: Copy + PartialEq>(ui: &mut egui::Ui, label: &str, id: &str, optio
     ui.add_space(t.space_4);
 }
 
+/// The name of pass `id`, for reports.
+fn pass_name(app: &ScanCraftApp, id: u32) -> String {
+    app.passes.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_else(|| format!("Pass {id}"))
+}
+
+/// Align All or Refine All waiting for a decision: per pass and per pair, then Accept / Reject.
+fn poses_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    let t = Tokens::get();
+    let Some(preview) = &app.poses_preview else { return };
+    match &preview.proposal {
+        Proposal::AlignAll(o) => {
+            kit::section_heading(ui, "Align All");
+            kit::note(ui, "Every pass was aligned against every other; the passes are shown in their colours where they would go.");
+            ui.add_space(t.space_4);
+            for p in &o.placements {
+                let name = pass_name(app, p.id);
+                let (text, colour) = match (p.reference, p.pose, p.quality) {
+                    (true, _, _) => ("reference".to_string(), t.accent),
+                    (false, None, _) => ("could not be placed".to_string(), t.error),
+                    (false, Some(_), q) => {
+                        let from = p.parent.map(|id| format!(" · from {}", pass_name(app, id))).unwrap_or_default();
+                        match q {
+                            Some(q) => (format!("{}{from}", quality_summary(&q)), verdict_colour(q.verdict(), &t)),
+                            None => (format!("placed{from}"), t.warning),
+                        }
+                    }
+                };
+                kit::row(ui, &name, |ui| kit::status_line(ui, &text, colour));
+            }
+            kit::section(ui, "align_all_pairs", "Pairs", true, |ui| {
+                for e in &o.edges {
+                    let pair = format!("{} ↔ {}", pass_name(app, e.from), pass_name(app, e.to));
+                    let fit = e.quality.map(|q| format!(" · {}", quality_summary(&q))).unwrap_or_default();
+                    let (text, colour) = match &e.kind {
+                        EdgeKind::Placed => (format!("{pair}: measured, places a pass{fit}"), t.agent_ok),
+                        EdgeKind::Confirmed => (format!("{pair}: measured, agrees{fit}"), t.agent_ok),
+                        EdgeKind::Composed { via } => {
+                            let via: Vec<String> = via.iter().map(|id| pass_name(app, *id)).collect();
+                            (format!("{pair}: composed via {}{fit}", via.join(" → ")), e.verdict.map_or(t.text_dim, |v| verdict_colour(v, &t)))
+                        }
+                        EdgeKind::Rejected(reason) => (format!("{pair}: rejected, {reason}"), t.error),
+                    };
+                    kit::status_line(ui, &text, colour);
+                    if let Some(a) = e.agreement.filter(|_| matches!(e.kind, EdgeKind::Placed | EdgeKind::Confirmed)) {
+                        kit::note(ui, &format!("    the other way round: {:.1}°, {:.1} mm apart", a.rotation_deg, a.offset_mm));
+                    }
+                }
+                if let Some(r) = o.refine {
+                    let mm = |v: Option<f32>| v.map_or("—".to_string(), |v| format!("{v:.2} mm"));
+                    let text = if r.kept {
+                        format!("Refined together: median pair error {} → {}", mm(r.before_mm), mm(r.after_mm))
+                    } else {
+                        format!("Joint refinement skipped: it made the fit worse ({} → {})", mm(r.before_mm), mm(r.after_mm))
+                    };
+                    ui.add_space(t.space_4);
+                    kit::note(ui, &text);
+                }
+            });
+        }
+        Proposal::Refine(r) => {
+            kit::section_heading(ui, "Proposed refinement");
+            let mm = |v: Option<f32>| v.map_or("—".to_string(), |v| format!("{v:.2} mm"));
+            kit::row(ui, "Pair error", |ui| kit::value_text(ui, &format!("{} → {} (median)", mm(r.median_before()), mm(r.median_after())), false));
+            kit::section(ui, "refine_pairs", "Pairs", true, |ui| {
+                for e in &r.edges {
+                    let (b, a) = (e.error_before(), e.error_after());
+                    let colour = if a <= b + 0.005 { t.agent_ok } else { t.warning };
+                    let fmt = |v: f32| if v.is_finite() { format!("{v:.2}") } else { "—".into() };
+                    let wall = e.thickness_mm.map(|w| format!(" · wall {w:.2} mm")).unwrap_or_default();
+                    kit::status_line(ui, &format!("{} ↔ {}: {} → {} mm{wall}", pass_name(app, e.a), pass_name(app, e.b), fmt(b), fmt(a)), colour);
+                }
+            });
+            kit::section(ui, "refine_passes", "Passes after", true, |ui| {
+                for (id, q) in &r.qualities {
+                    kit::row(ui, &pass_name(app, *id), |ui| kit::status_line(ui, &quality_summary(q), verdict_colour(q.verdict(), &t)));
+                }
+            });
+        }
+    }
+    ui.add_space(t.space_8);
+    ui.horizontal(|ui| {
+        if kit::button(ui, "Accept", Button::Primary, app.can_edit()).clicked() {
+            app.accept_poses();
+        }
+        if kit::button(ui, "Reject", Button::Normal, true).clicked() {
+            app.reject_poses();
+        }
+    });
+}
+
 fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
+    if app.poses_preview.is_some() {
+        poses_preview_body(app, ui);
+        return;
+    }
     // A proposed alignment waits for a decision.
     if let Some(preview) = &app.align_preview {
         let name = app.passes.iter().find(|p| p.id == preview.pass).map(|p| p.name.clone()).unwrap_or_default();
         let q = preview.alignment.quality;
+        let check = preview.check;
+        let verdict = alignment::checked_verdict(&q, check.as_ref());
         let method = preview.method.label();
         kit::section_heading(ui, "Proposed alignment");
         kit::row(ui, "Pass", |ui| kit::value_text(ui, &name, false));
         kit::row(ui, "Method", |ui| kit::value_text(ui, method, false));
-        quality_rows(ui, &q);
+        quality_rows(ui, &q, verdict);
+        if let Some(c) = check {
+            let both = match c.agreement {
+                Some(a) if c.consistent => format!("Yes · {:.1}°, {:.1} mm apart", a.rotation_deg, a.offset_mm),
+                Some(a) => format!("No · {:.0}°, {:.0} mm apart", a.rotation_deg, a.offset_mm),
+                None => "Not found the other way".to_string(),
+            };
+            kit::row(ui, "Both ways", |ui| kit::value_text(ui, &both, !c.consistent));
+            kit::row(ui, "Runs", |ui| kit::value_text(ui, &format!("{} of {} agree", c.agreeing, c.runs), true));
+            if c.reverse.contradicted() {
+                kit::status_line(ui, "Seen from the other pass this fit contradicts what was measured.", t.error);
+            }
+            if !c.object_only {
+                kit::note(ui, "Aligned with the whole scene (table included).");
+            }
+        }
         ui.add_space(t.space_4);
-        let note = match q.verdict() {
+        let note = match verdict {
             scancraft_align::Verdict::Good => "The pass is shown in its colour where it would go. It fits closely and hides nothing that was measured.",
-            scancraft_align::Verdict::Fair => "Check the fit in the view before accepting: the overlap is small or the surfaces do not agree everywhere.",
-            scancraft_align::Verdict::Poor => "This looks wrong: little overlap, or it puts surface where the scanner saw through. Try point pairs instead.",
+            scancraft_align::Verdict::Fair => "Check the fit in the view before accepting: the overlap is small, the surfaces do not agree everywhere, or aligning the other way round gives another result.",
+            scancraft_align::Verdict::Poor => "This looks wrong: little overlap, it puts surface where the scanner saw through, below the table or through the other surface. Try point pairs instead.",
         };
         kit::note(ui, note);
         ui.add_space(t.space_8);
@@ -1005,11 +1220,28 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let hint = if app.passes.len() < 2 {
         "Capture another pass (flip the object, or keep it in place and choose Same position) to align it here."
     } else if !unaligned.is_empty() {
-        "Select a pass and use Align Passes, or Point Pairs if the automatic result is wrong. Each result is previewed before it is accepted."
+        "Align All places every pass at once, also inside and outside scans of a shell. Align Pass places the selected pass; Point Pairs when the automatic result is wrong. Each result is previewed before it is accepted."
     } else {
         "All passes are aligned. Refine All spreads the remaining errors; Merge fuses the included passes into one model."
     };
     kit::note(ui, hint);
+    ui.add_space(t.space_6);
+    let blocked = app.align_all_blocked();
+    if kit::wide_button(ui, "Align All", if unaligned.is_empty() { Button::Normal } else { Button::Primary }, blocked.is_none()).on_hover_text(blocked.unwrap_or("Align every pass against every other and place them all from the reference")).clicked() {
+        app.align_all();
+    }
+    kit::section(ui, "isolation_settings", "Object", true, |ui| {
+        let mut whole = app.settings.whole_scene;
+        if kit::checkbox(ui, "Use whole scene", &mut whole).changed() {
+            app.settings.whole_scene = whole;
+        }
+        let note = if whole {
+            "Alignment and Merge use everything the passes saw, the table and loose fragments included."
+        } else {
+            "Alignment and Merge use the object only: the table it stood on and loose fragments are left out, and no fit may push one pass below another's table. Turn on Use whole scene if the object itself is cut off."
+        };
+        kit::note(ui, note);
+    });
     kit::section(ui, "merge_settings", "Merge", true, |ui| {
         kit::checkbox(ui, "Remove outliers", &mut app.settings.merge_outliers);
         ui.add_enabled_ui(app.settings.merge_outliers, |ui| {
@@ -1034,7 +1266,7 @@ fn clean_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         kit::row(ui, "Passes", |ui| kit::value_text(ui, &format!("{visible_passes} of {}", app.passes.len()), false));
     }
     ui.add_space(t.space_6);
-    kit::note(ui, "Pick a filter in the ribbon. Each filter replaces the cleaned cloud and can be undone.");
+    kit::note(ui, "Isolate Object keeps the scanned object and drops the table, marker blocks and loose fragments. The filters in the ribbon do the rest. Each one replaces the cleaned cloud and can be undone.");
 }
 
 fn mesh_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -1065,24 +1297,49 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let mut continue_pass = None;
     let mut weight_change = None;
     let mut include_change = None;
+    let mut scale = None;
     kit::section(ui, "selection", title, true, |ui| match node {
         Node::Pass(id) => {
             let Some(p) = app.passes.iter().find(|p| p.id == id) else { return };
             kit::row(ui, "Name", |ui| kit::value_text(ui, &p.name, false));
+            if p.meta.origin.is_imported() {
+                kit::row(ui, "Source", |ui| kit::value_text(ui, &p.meta.origin.label(), false));
+            }
             kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(p.layer.len()), false));
-            kit::row(ui, "Frames", |ui| kit::value_text(ui, &thousands(p.frames as usize), false));
             let b = p.layer.cloud.bbox;
             let size = if b.is_empty() { "—".to_string() } else { let e = b.max - b.min; format!("{:.0} × {:.0} × {:.0} mm", e.x, e.y, e.z) };
-            kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
+            let precise = if b.is_empty() { size.clone() } else { let e = b.max - b.min; format!("{:.3} × {:.3} × {:.3}", e.x, e.y, e.z) };
             let recording = app.active_pass == Some(id);
-            let kept = p.kept_frames();
-            let stored = p.keyframes.len();
-            kit::row(ui, "Keyframes", |ui| kit::value_text(ui, &if kept == stored { thousands(stored) } else { format!("{} of {} kept", thousands(kept), thousands(stored)) }, false));
-            kit::row(ui, "Mode", |ui| kit::value_text(ui, &format!("{} · {}", p.meta.scan_config.light.label(), p.meta.scan_config.tracking.label()), false));
+            if let Some(surface) = &p.surface {
+                let tiny = crate::imports::largest_extent(surface) < crate::imports::METRES_MAX_EXTENT;
+                kit::row(ui, "Size", |ui| kit::value_text(ui, if tiny { &precise } else { &size }, false));
+                if tiny {
+                    kit::status_line(ui, "Under 2 units across: probably in metres", Tokens::get().warning);
+                    if kit::wide_button(ui, "Convert metres to mm", Button::Primary, app.can_edit()).on_hover_text("Multiply the coordinates by 1000 (undoable)").clicked() {
+                        scale = Some(id);
+                    }
+                    ui.add_space(Tokens::get().space_4);
+                }
+            } else {
+                kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
+                kit::row(ui, "Frames", |ui| kit::value_text(ui, &thousands(p.frames as usize), false));
+                let kept = p.kept_frames();
+                let stored = p.keyframes.len();
+                kit::row(ui, "Keyframes", |ui| kit::value_text(ui, &if kept == stored { thousands(stored) } else { format!("{} of {} kept", thousands(kept), thousands(stored)) }, false));
+                kit::row(ui, "Mode", |ui| kit::value_text(ui, &format!("{} · {}", p.meta.scan_config.light.label(), p.meta.scan_config.tracking.label()), false));
+            }
             let t = Tokens::get();
             kit::row(ui, "Alignment", |ui| kit::status_line(ui, &p.meta.alignment.label(), align_colour(p.meta.alignment, &t)));
             if let AlignState::Aligned { quality: Some(q), .. } = p.meta.alignment {
-                quality_rows(ui, &q);
+                quality_rows(ui, &q, q.verdict());
+            }
+            if let Some(m) = crate::isolation::cached(&p.mask) {
+                let text = if m.fallback {
+                    "whole pass (no object told apart)".to_string()
+                } else {
+                    format!("{} of {} points{}", thousands(m.kept), thousands(m.object.len()), if m.support.is_some() { " · on a table" } else { "" })
+                };
+                kit::row(ui, "Object", |ui| kit::value_text(ui, &text, true));
             }
             let (mut weight, mut included) = (p.meta.weight, p.meta.included);
             if kit::slider_row(ui, "Merge weight", &mut weight, 0.5..=5.0, 1, "").changed() {
@@ -1092,9 +1349,11 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 include_change = Some((id, included));
             }
             ui.add_space(Tokens::get().space_4);
-            let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
-            if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text("Capture more into this pass, carrying on from its last kept frame").clicked() {
-                continue_pass = Some(id);
+            if !p.is_fixed() {
+                let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none();
+                if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text("Capture more into this pass, carrying on from its last kept frame").clicked() {
+                    continue_pass = Some(id);
+                }
             }
             ui.add_space(Tokens::get().space_4);
             if kit::wide_button(ui, "Delete pass", Button::Normal, !recording && app.can_edit()).clicked() {
@@ -1117,6 +1376,9 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         }
         _ => {}
     });
+    if let Some(id) = scale {
+        app.scale_pass(id, 1000.0);
+    }
     if let Some((id, w)) = weight_change {
         app.set_weight(id, w);
     }

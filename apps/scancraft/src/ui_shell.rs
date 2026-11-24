@@ -57,6 +57,19 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         }
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
+        // Passes from outside the project.
+        x += 22.0;
+        let import = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
+        if kit::app_bar_button(ui, import, "import", "Import scan… (PLY, OBJ, STL as a new pass)", app.import_blocked().is_none()).clicked() {
+            app.open_tool(Tool::ImportScan);
+        }
+        x += 32.0;
+        let add = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
+        if kit::app_bar_button(ui, add, "folder", "Add project… (append another project's passes)", app.import_blocked().is_none()).clicked() {
+            app.open_tool(Tool::AddProject);
+        }
+        x += 26.0;
+        kit::app_bar_separator(ui.painter(), r, x);
         // The project tab, as SolidCraft's document tab: name, and a dot while it has unsaved changes.
         let name = app.project.name.clone();
         let dirty = app.dirty();
@@ -261,6 +274,27 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                 ],
             },
             RibbonGroup {
+                label: "Add Passes",
+                buttons: vec![
+                    RibbonButton {
+                        id: "import_scan",
+                        icon: "import",
+                        label: "Import Scan",
+                        enabled: app.import_blocked().is_none(),
+                        pressed: pressed(Tool::ImportScan),
+                        tip: reason(app.import_blocked(), "Add a PLY, OBJ or STL scan (yours or someone else's) as a new pass to align with the others"),
+                    },
+                    RibbonButton {
+                        id: "add_project",
+                        icon: "folder",
+                        label: "Add Project",
+                        enabled: app.import_blocked().is_none(),
+                        pressed: pressed(Tool::AddProject),
+                        tip: reason(app.import_blocked(), "Append the passes of another ScanCraft project, unaligned"),
+                    },
+                ],
+            },
+            RibbonGroup {
                 label: "Session",
                 buttons: vec![RibbonButton {
                     id: "clear",
@@ -276,17 +310,27 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
             let target = app.align_target();
             let blocked = app.align_blocked(target);
             let picking = matches!(app.tool, Some(Tool::PointPairs(_)));
+            let proposed = app.align_preview.is_some() || app.poses_preview.is_some();
+            let all_blocked = app.align_all_blocked();
             vec![
                 RibbonGroup {
                     label: "Register",
                     buttons: vec![
                         RibbonButton {
-                            id: "align_auto",
+                            id: "align_all",
                             icon: "align",
-                            label: "Align Passes",
-                            enabled: blocked.is_none() && app.align_preview.is_none(),
-                            pressed: app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning")),
-                            tip: if app.align_preview.is_some() { "Accept or discard the proposed alignment first" } else { reason(blocked, "Find the selected (or next unaligned) pass's place in the project automatically") },
+                            label: "Align All",
+                            enabled: all_blocked.is_none(),
+                            pressed: app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning all")),
+                            tip: reason(all_blocked, "Align every pass against every other and place them all from the reference (also inside and outside scans of one part)"),
+                        },
+                        RibbonButton {
+                            id: "align_auto",
+                            icon: "checkpoint",
+                            label: "Align Pass",
+                            enabled: blocked.is_none() && !proposed,
+                            pressed: app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning") && !b.starts_with("Aligning all")),
+                            tip: if proposed { "Accept or reject the proposed alignment first" } else { reason(blocked, "Find the selected (or next unaligned) pass's place in the project automatically") },
                         },
                         RibbonButton {
                             id: "align_pick",
@@ -319,6 +363,14 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
             RibbonGroup {
                 label: "Filter",
                 buttons: vec![
+                    RibbonButton {
+                        id: "isolate",
+                        icon: "body",
+                        label: "Isolate Object",
+                        enabled: app.tool_blocked(Tool::IsolateObject).is_none() || pressed(Tool::IsolateObject),
+                        pressed: pressed(Tool::IsolateObject),
+                        tip: reason(app.tool_blocked(Tool::IsolateObject).filter(|_| !pressed(Tool::IsolateObject)), "Keep the object: the table, marker blocks and loose fragments go. Click a cluster to keep it, Shift+click to leave one out"),
+                    },
                     RibbonButton { id: "plane", icon: "plane", label: "Remove Plane", enabled: app.tool_blocked(Tool::RemovePlane).is_none(), pressed: pressed(Tool::RemovePlane), tip: reason(app.tool_blocked(Tool::RemovePlane), "Remove the turntable or table plane (RANSAC)") },
                     RibbonButton { id: "outliers", icon: "filter", label: "Outliers", enabled: app.tool_blocked(Tool::Outliers).is_none(), pressed: pressed(Tool::Outliers), tip: reason(app.tool_blocked(Tool::Outliers), "Remove isolated points (statistical outlier removal)") },
                     RibbonButton { id: "crop", icon: "box", label: "Crop Box", enabled: app.tool_blocked(Tool::Crop).is_none(), pressed: pressed(Tool::Crop), tip: reason(app.tool_blocked(Tool::Crop), "Keep only the points inside a box") },
@@ -381,8 +433,7 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
     if active != app.stage.index() {
         app.stage = Stage::ALL[active];
         if app.tool.is_some_and(|t| t.stage() != app.stage && !t.is_file()) {
-            app.tool = None;
-            app.picking = None;
+            app.close_tool();
         }
     }
     let Some(id) = clicked else { return };
@@ -404,6 +455,9 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         "inset" => app.show_inset = !app.show_inset,
         "clear" => app.clear_session(),
+        "import_scan" => app.open_tool(Tool::ImportScan),
+        "add_project" => app.open_tool(Tool::AddProject),
+        "align_all" => app.align_all(),
         "align_auto" => {
             if let Some(id) = app.align_target() {
                 app.align_auto(id);
@@ -420,6 +474,13 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         "refine" => app.refine_all(),
         "merge" => app.merge_passes(),
         "colour_passes" => app.colour_passes = !app.colour_passes,
+        "isolate" => {
+            if pressed(Tool::IsolateObject) {
+                app.close_tool();
+            } else {
+                app.open_tool(Tool::IsolateObject);
+            }
+        }
         "plane" => app.open_tool(Tool::RemovePlane),
         "outliers" => app.open_tool(Tool::Outliers),
         "crop" => app.open_tool(Tool::Crop),

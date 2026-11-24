@@ -11,7 +11,9 @@ use scancraft_render::{GpuMesh, GpuPoint};
 use scancraft_slam::{SeedState, TrackingStatus};
 use tokio::sync::mpsc;
 
-use crate::project::{AlignMethod, PassMeta};
+use crate::alignment::{AlignAllOutcome, RefineOutcome};
+use crate::isolation::MaskCache;
+use crate::project::{AlignMethod, PassMeta, PassSource};
 
 pub type SharedDevice = Arc<tokio::sync::Mutex<Box<dyn ScannerDevice>>>;
 
@@ -53,6 +55,8 @@ pub enum Tool {
     Outliers,
     Downsample,
     Crop,
+    /// Keep the object: click a cluster to keep it, shift-click one to leave it out.
+    IsolateObject,
     Reconstruct,
     Smooth,
     Decimate,
@@ -61,12 +65,16 @@ pub enum Tool {
     PointPairs(u32),
     SaveProject,
     OpenProject,
+    /// Read a scan file (PLY, OBJ, STL) as a new pass.
+    ImportScan,
+    /// Append the passes of another project.
+    AddProject,
 }
 
 impl Tool {
     /// Project-file commands: open from the app bar on any stage.
     pub fn is_file(self) -> bool {
-        matches!(self, Tool::SaveProject | Tool::OpenProject)
+        matches!(self, Tool::SaveProject | Tool::OpenProject | Tool::ImportScan | Tool::AddProject)
     }
 
     pub fn title(self) -> &'static str {
@@ -74,11 +82,14 @@ impl Tool {
             Tool::PointPairs(_) => "Point Pairs",
             Tool::SaveProject => "Save Project",
             Tool::OpenProject => "Open Project",
+            Tool::ImportScan => "Import Scan",
+            Tool::AddProject => "Add Project",
             Tool::ConnectIp => "Connect by IP",
             Tool::RemovePlane => "Remove Plane",
             Tool::Outliers => "Remove Outliers",
             Tool::Downsample => "Downsample",
             Tool::Crop => "Crop Box",
+            Tool::IsolateObject => "Isolate Object",
             Tool::Reconstruct => "Reconstruct Surface",
             Tool::Smooth => "Smooth",
             Tool::Decimate => "Decimate",
@@ -93,6 +104,7 @@ impl Tool {
             Tool::Outliers => "filter",
             Tool::Downsample => "snap",
             Tool::Crop => "box",
+            Tool::IsolateObject => "body",
             Tool::Reconstruct => "mesh_body",
             Tool::Smooth => "surface",
             Tool::Decimate => "reach",
@@ -100,14 +112,17 @@ impl Tool {
             Tool::PointPairs(_) => "point",
             Tool::SaveProject => "save",
             Tool::OpenProject => "open",
+            Tool::ImportScan => "import",
+            Tool::AddProject => "folder",
         }
     }
 
     pub fn stage(self) -> Stage {
         match self {
             Tool::ConnectIp | Tool::SaveProject | Tool::OpenProject => Stage::Connect,
+            Tool::ImportScan | Tool::AddProject => Stage::Scan,
             Tool::PointPairs(_) => Stage::Align,
-            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop => Stage::Clean,
+            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject => Stage::Clean,
             Tool::Reconstruct | Tool::Smooth | Tool::Decimate => Stage::Mesh,
             Tool::Export(_) => Stage::Export,
         }
@@ -253,11 +268,29 @@ pub struct ScanPass {
     pub meta: PassMeta,
     /// The layer in the pass's colour (Align stage): (layer generation, length, points).
     pub tinted: Option<(u64, usize, Arc<Vec<GpuPoint>>)>,
+    /// Which of its surfels are the object (computed when first needed).
+    pub mask: MaskCache,
+    /// An imported scan's fixed surface (pass frame). Such a pass has an empty tracker, no
+    /// keyframes and cannot be continued.
+    pub surface: Option<Arc<PointCloud>>,
 }
 
 impl ScanPass {
     pub fn kept_frames(&self) -> usize {
         self.keyframes.iter().filter(|k| !k.discarded).count()
+    }
+
+    /// A fixed surface (an imported scan) rather than a tracked capture.
+    pub fn is_fixed(&self) -> bool {
+        self.surface.is_some()
+    }
+
+    /// Where background jobs read its surface from.
+    pub fn source(&self) -> PassSource {
+        match &self.surface {
+            Some(s) => PassSource::Fixed(Arc::clone(s)),
+            None => PassSource::Tracked(self.tracker.clone()),
+        }
     }
 }
 
@@ -386,6 +419,22 @@ pub struct FrameRates {
     pub marker: Option<f32>,
 }
 
+/// How sure an automatic alignment is: the same fit seen from the other pass, and whether
+/// aligning the other way round finds it too (`scancraft_align::align_robust`).
+#[derive(Debug, Clone, Copy)]
+pub struct AlignCheck {
+    /// The target moved onto the pass by the inverse.
+    pub reverse: scancraft_align::Quality,
+    /// Best result against the closest one found the other way round.
+    pub agreement: Option<scancraft_align::Agreement>,
+    pub consistent: bool,
+    /// Runs (feature grids x directions) that found a result, and how many agree with the best.
+    pub runs: usize,
+    pub agreeing: usize,
+    /// The table and loose fragments were left out.
+    pub object_only: bool,
+}
+
 /// Results of background geometry jobs.
 pub enum JobResult {
     Cloud { cloud: PointCloud, message: String },
@@ -396,12 +445,20 @@ pub enum JobResult {
     /// A pass's model rebuilt from its kept keyframes (in the pass's own frame).
     Rebuilt { pass: u32, points: Vec<Point3D>, keyframes: Vec<KeyframeInfo>, message: String },
     /// A candidate alignment for a pass, to preview before accepting.
-    Aligned { pass: u32, method: AlignMethod, alignment: scancraft_align::Alignment, message: String },
-    /// Refined project <- pass transforms.
-    Refined { poses: Vec<(u32, scancraft_core::Transform)>, message: String },
+    Aligned { pass: u32, method: AlignMethod, alignment: scancraft_align::Alignment, check: Option<AlignCheck>, message: String },
+    /// Placements for all passes (Align All), to preview before accepting.
+    AlignedAll(Box<AlignAllOutcome>),
+    /// Refined project <- pass transforms with before / after measures, to preview.
+    Refined(Box<RefineOutcome>),
+    /// The Isolate Object tool's segmentation, and the picks it was made for.
+    Isolated { segmentation: Arc<scancraft_fusion::Segmentation>, picks: crate::isolation::Picks },
     Merged { cloud: PointCloud, passes: Vec<u32>, message: String },
     Saved { path: std::path::PathBuf, name: String, message: String },
     Opened(Box<OpenedProject>),
+    /// A scan file read as a new pass.
+    Imported(Box<crate::imports::ImportedScan>),
+    /// The passes of another project (ids still those of that project).
+    AddedProject { name: String, passes: Vec<crate::project::LoadedPass> },
 }
 
 /// A project read from disk with its trackers rebuilt.
@@ -437,6 +494,8 @@ pub struct PassSnapshot {
     pub tracker: SharedTracker,
     pub keyframes: Vec<KeyframeInfo>,
     pub meta: PassMeta,
+    pub mask: MaskCache,
+    pub surface: Option<Arc<PointCloud>>,
 }
 
 /// Bounded two-stack undo history (kept from the previous app; snapshots clone geometry, so the
@@ -468,11 +527,6 @@ impl History {
         let next = self.redo.pop()?;
         self.undo.push(current);
         Some(next)
-    }
-
-    /// Drop the newest undo entry (an operation that turned out to change nothing).
-    pub fn discard_last(&mut self) {
-        self.undo.pop();
     }
 
     pub fn can_undo(&self) -> bool {

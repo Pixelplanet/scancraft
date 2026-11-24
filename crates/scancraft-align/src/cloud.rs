@@ -1,35 +1,58 @@
 //! Point-set helpers: a nearest-neighbour index, voxel subsampling, transforms.
 
 use glam::Vec3;
-use kiddo::{ImmutableKdTree, SquaredEuclidean};
 use scancraft_core::Transform;
 use scancraft_slam::VoxelMap;
 
 use crate::Oriented;
 
-/// Nearest-neighbour index over 3D points.
+/// Points per kd-tree leaf.
+const LEAF: usize = 12;
+
+/// Nearest-neighbour index over 3D points: a balanced kd-tree split at the median of the widest
+/// axis, with exact answers.
+///
+/// It replaces kiddo's immutable tree, which grid-quantised clouds (Revo Scan exports, flat
+/// axis-aligned surfaces) break: when many points share a coordinate, kiddo 4.2's construction
+/// assumes equal keys end up next to each other after `select_nth_unstable`, picks a split value
+/// that does not separate its two halves, and then panics or returns wrong neighbours. Here ties
+/// are harmless: points equal to a split value may lie on either side, and the search bounds hold
+/// for both.
 pub struct Index {
     points: Vec<Vec3>,
-    tree: Option<ImmutableKdTree<f32, 3>>,
+    /// Point indices in tree order: the node over `order[lo..hi]` splits at `mid = (lo + hi) / 2`.
+    order: Vec<u32>,
+    /// Split axis of the node whose split point sits at `order[mid]`.
+    axis: Vec<u8>,
+}
+
+/// Search state for [`Index::nearest_n`]: the best `k` so far, nearest first.
+struct Best {
+    k: usize,
+    found: Vec<(f32, usize)>,
+}
+
+impl Best {
+    fn bound(&self) -> f32 {
+        if self.found.len() < self.k { f32::INFINITY } else { self.found[self.k - 1].0 }
+    }
+
+    fn offer(&mut self, d: f32, i: usize) {
+        if d >= self.bound() {
+            return;
+        }
+        let at = self.found.partition_point(|&(e, j)| (e, j) < (d, i));
+        self.found.insert(at, (d, i));
+        self.found.truncate(self.k);
+    }
 }
 
 impl Index {
     pub fn new(points: Vec<Vec3>) -> Self {
-        if points.is_empty() {
-            return Index { points, tree: None };
-        }
-        // kiddo's immutable tree panics when many points share one coordinate on an axis; break
-        // exact ties with a deterministic jitter of a few micrometres (see the tracker's target).
-        let jittered: Vec<[f32; 3]> = points
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let h = (i as u32).wrapping_mul(2654435761);
-                let j = |shift: u32| ((h >> shift) & 0xff) as f32 * 4e-6;
-                [p.x + j(0), p.y + j(8), p.z + j(16)]
-            })
-            .collect();
-        Index { tree: Some(ImmutableKdTree::new_from_slice(&jittered)), points }
+        let mut order: Vec<u32> = (0..points.len() as u32).collect();
+        let mut axis = vec![0u8; points.len()];
+        build(&points, &mut order, &mut axis);
+        Index { points, order, axis }
     }
 
     pub fn len(&self) -> usize {
@@ -46,26 +69,93 @@ impl Index {
 
     /// (squared distance, index) of the nearest point.
     pub fn nearest(&self, p: Vec3) -> Option<(f32, usize)> {
-        let nn = self.tree.as_ref()?.nearest_one::<SquaredEuclidean>(&p.to_array());
-        Some((nn.distance, nn.item as usize))
+        self.nearest_n(p, 1).first().copied()
     }
 
     /// Indices of the points within `radius`.
     pub fn within(&self, p: Vec3, radius: f32) -> Vec<usize> {
-        match &self.tree {
-            Some(t) => t.within_unsorted::<SquaredEuclidean>(&p.to_array(), radius * radius).into_iter().map(|n| n.item as usize).collect(),
-            None => Vec::new(),
-        }
+        let mut out = Vec::new();
+        self.collect_within(0, self.order.len(), p, radius * radius, &mut out);
+        out
     }
 
     /// (squared distance, index) of the `k` nearest points, nearest first.
     pub fn nearest_n(&self, p: Vec3, k: usize) -> Vec<(f32, usize)> {
-        match &self.tree {
-            Some(t) if k > 0 => t.nearest_n::<SquaredEuclidean>(&p.to_array(), k).into_iter().map(|n| (n.distance, n.item as usize)).collect(),
-            _ => Vec::new(),
+        if k == 0 || self.points.is_empty() {
+            return Vec::new();
+        }
+        let mut best = Best { k, found: Vec::with_capacity(k + 1) };
+        self.search(0, self.order.len(), p, &mut best);
+        best.found
+    }
+
+    fn search(&self, lo: usize, hi: usize, p: Vec3, best: &mut Best) {
+        if hi - lo <= LEAF {
+            for &i in &self.order[lo..hi] {
+                best.offer(self.points[i as usize].distance_squared(p), i as usize);
+            }
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        let i = self.order[mid] as usize;
+        best.offer(self.points[i].distance_squared(p), i);
+        let a = self.axis[mid] as usize;
+        let diff = p[a] - self.points[i][a];
+        let (near, far) = if diff < 0.0 { ((lo, mid), (mid + 1, hi)) } else { ((mid + 1, hi), (lo, mid)) };
+        self.search(near.0, near.1, p, best);
+        if diff * diff < best.bound() {
+            self.search(far.0, far.1, p, best);
+        }
+    }
+
+    fn collect_within(&self, lo: usize, hi: usize, p: Vec3, r_sq: f32, out: &mut Vec<usize>) {
+        if hi - lo <= LEAF {
+            out.extend(self.order[lo..hi].iter().map(|&i| i as usize).filter(|&i| self.points[i].distance_squared(p) <= r_sq));
+            return;
+        }
+        let mid = (lo + hi) / 2;
+        let i = self.order[mid] as usize;
+        if self.points[i].distance_squared(p) <= r_sq {
+            out.push(i);
+        }
+        let a = self.axis[mid] as usize;
+        let diff = p[a] - self.points[i][a];
+        if diff <= 0.0 || diff * diff <= r_sq {
+            self.collect_within(lo, mid, p, r_sq, out);
+        }
+        if diff >= 0.0 || diff * diff <= r_sq {
+            self.collect_within(mid + 1, hi, p, r_sq, out);
         }
     }
 }
+
+/// Arranges `order` (a node's points; `axis` the matching slice) into a kd-tree: the median on
+/// the widest axis in the middle, smaller-or-equal before it, greater-or-equal after it. Large
+/// halves are built in parallel.
+fn build(points: &[Vec3], order: &mut [u32], axis: &mut [u8]) {
+    if order.len() <= LEAF {
+        return;
+    }
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for &i in order.iter() {
+        lo = lo.min(points[i as usize]);
+        hi = hi.max(points[i as usize]);
+    }
+    let ext = hi - lo;
+    let a = if ext.x >= ext.y && ext.x >= ext.z { 0 } else if ext.y >= ext.z { 1 } else { 2 };
+    let mid = order.len() / 2;
+    order.select_nth_unstable_by(mid, |&i, &j| points[i as usize][a].total_cmp(&points[j as usize][a]));
+    axis[mid] = a as u8;
+    let (left, rest) = order.split_at_mut(mid);
+    let (axis_left, axis_rest) = axis.split_at_mut(mid);
+    if left.len() > 20_000 {
+        rayon::join(|| build(points, left, axis_left), || build(points, &mut rest[1..], &mut axis_rest[1..]));
+    } else {
+        build(points, left, axis_left);
+        build(points, &mut rest[1..], &mut axis_rest[1..]);
+    }
+}
+
 
 /// One point (mean position, normalised mean normal) per occupied voxel.
 pub fn downsample(points: &[Oriented], voxel_mm: f32) -> Vec<Oriented> {
@@ -142,5 +232,74 @@ impl Rng {
     /// Approximately normal (sum of uniforms), mean 0, standard deviation 1.
     pub fn normal(&mut self) -> f32 {
         (0..6).map(|_| self.unit()).sum::<f32>() * std::f32::consts::SQRT_2 - 6.0 * std::f32::consts::FRAC_1_SQRT_2
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A grid-quantised scene like a Revo Scan export far from the origin: a flat table (one exact
+    /// z for 40 000 points), a wall at one exact x, every point stored three times, and a pile of
+    /// 2000 identical points.
+    fn quantised_scene() -> Vec<Vec3> {
+        let mut pts = Vec::new();
+        for i in 0..200 {
+            for j in 0..200 {
+                pts.push(Vec3::new(420.0 + i as f32 * 0.25, -310.0 + j as f32 * 0.25, 812.5));
+            }
+        }
+        for j in 0..100 {
+            for k in 0..100 {
+                pts.push(Vec3::new(420.0, -310.0 + j as f32 * 0.5, 812.5 + k as f32 * 0.5));
+            }
+        }
+        let copies = pts.clone();
+        pts.extend_from_slice(&copies);
+        pts.extend_from_slice(&copies);
+        pts.extend(std::iter::repeat_n(Vec3::new(450.0, -300.0, 812.5), 2000));
+        pts
+    }
+
+    #[test]
+    fn index_over_quantised_cloud_builds_and_answers_exactly() {
+        let pts = quantised_scene();
+        let index = Index::new(pts.clone());
+        assert_eq!(index.len(), pts.len());
+        let mut rng = Rng::new(5);
+        for k in 0..200 {
+            // Half the queries close to the table and the wall, where the ties are.
+            let mut q = Vec3::new(415.0 + rng.unit() * 60.0, -315.0 + rng.unit() * 60.0, 808.0 + rng.unit() * 60.0);
+            if k % 2 == 0 {
+                q.z = 811.5 + rng.unit() * 2.0;
+            }
+            if k % 4 == 1 {
+                q.x = 419.0 + rng.unit() * 2.0;
+            }
+            let mut brute: Vec<f32> = pts.iter().map(|p| p.distance_squared(q)).collect();
+            brute.sort_by(f32::total_cmp);
+            let (d, i) = index.nearest(q).expect("non-empty");
+            assert_eq!(d, pts[i].distance_squared(q));
+            assert_eq!(d, brute[0], "nearest");
+            let knn = index.nearest_n(q, 7);
+            assert_eq!(knn.iter().map(|n| n.0).collect::<Vec<_>>(), brute[..7].to_vec(), "7 nearest");
+            let r = 1.3;
+            let mut within = index.within(q, r);
+            within.sort_unstable();
+            let expected: Vec<usize> = (0..pts.len()).filter(|&k| pts[k].distance_squared(q) <= r * r).collect();
+            assert_eq!(within, expected);
+        }
+        // Every copy of a duplicated point is found.
+        let pile = index.within(Vec3::new(450.0, -300.0, 812.5), 1e-3);
+        assert!(pile.len() >= 2000 + 3, "{} points at the pile", pile.len());
+    }
+
+    #[test]
+    fn index_handles_empty_and_single_points() {
+        let empty = Index::new(Vec::new());
+        assert!(empty.nearest(Vec3::ZERO).is_none() && empty.within(Vec3::ZERO, 1.0).is_empty() && empty.nearest_n(Vec3::ZERO, 3).is_empty());
+        let one = Index::new(vec![Vec3::new(1.0, 2.0, 3.0)]);
+        assert_eq!(one.nearest(Vec3::new(1.0, 2.0, 4.0)), Some((1.0, 0)));
+        assert_eq!(one.nearest_n(Vec3::ZERO, 4).len(), 1);
     }
 }

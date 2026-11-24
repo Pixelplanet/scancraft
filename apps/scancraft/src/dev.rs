@@ -4,10 +4,12 @@
 //!   second flipped upside down and moved, unaligned) and exits;
 //! - `--open <dir>` opens a project at start;
 //! - `--auto <steps>` runs comma-separated steps once the app is idle: `stage:<name>`,
-//!   `select:<pass>`, `start`, `stop`, `same`, `moved`, `align`, `accept`, `pairs`, `refine`,
-//!   `merge`, `save:<dir>`, `fit`, `wait:<frames>`, `drag:<x>,<y>,<dx>,<dy>` (a left-button drag
-//!   in points, injected as egui input so it works without window focus),
-//!   `shot:<png path>`, `quit`.
+//!   `select:<pass>`, `start`, `stop`, `same`, `moved`, `align`, `alignall`, `accept` (the open
+//!   proposal: one pass, Align All or Refine All), `pairs`, `refine`, `isolate`, `keep`,
+//!   `merge`, `save:<dir>`, `import:<scan file>`, `addproject:<dir>`, `metres` (the toast's
+//!   metres-to-mm conversion), `wholescene:<on|off>`, `fit`, `wait:<frames>`,
+//!   `drag:<x>,<y>,<dx>,<dy>` (a left-button drag in points, injected as egui input so it works
+//!   without window focus), `shot:<png path>`, `quit`.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -55,8 +57,8 @@ pub fn write_demo_project(dir: &Path) -> Result<(), String> {
         reference: Some(1),
         next_pass_id: 3,
         passes: vec![
-            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1) },
-            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2) },
+            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None },
+            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None },
         ],
         merged: None,
         cleaned: None,
@@ -161,7 +163,19 @@ impl Script {
                     app.align_auto(id);
                 }
             }
-            "accept" => app.accept_preview(),
+            "alignall" => app.align_all(),
+            "accept" => {
+                if app.poses_preview.is_some() {
+                    app.accept_poses();
+                } else {
+                    app.accept_preview();
+                }
+            }
+            "isolate" => {
+                app.stage = Stage::Clean;
+                app.open_tool(Tool::IsolateObject);
+            }
+            "keep" => app.run_tool(Tool::IsolateObject),
             "pairs" => {
                 if let Some(id) = app.align_target() {
                     app.stage = Stage::Align;
@@ -176,6 +190,10 @@ impl Script {
             "same" => app.next_start = PassStart::SamePosition,
             "moved" => app.next_start = PassStart::Moved,
             "save" => app.save_project(std::path::PathBuf::from(arg)),
+            "import" => app.import_scan(std::path::PathBuf::from(arg)),
+            "addproject" => app.add_project(std::path::PathBuf::from(arg)),
+            "metres" => app.run_toast_action(),
+            "wholescene" => app.settings.whole_scene = arg == "on",
             "refine" => app.refine_all(),
             "merge" => app.merge_passes(),
             "fit" => app.fit_view(),

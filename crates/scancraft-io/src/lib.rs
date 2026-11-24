@@ -1,11 +1,18 @@
+pub mod import;
+pub mod normals;
 pub mod obj;
 pub mod ply;
 pub mod project;
 pub mod stl;
 
+pub use import::{
+    detect_format, import_bytes, import_scan, import_scan_with, ImportOptions, ImportedScan, NormalSource,
+    ScanFormat, UnitsHint,
+};
+pub use normals::NormalEstimation;
 pub use obj::{load_obj, save_mesh_obj};
 pub use ply::{load_ply, save_mesh_ply_binary, save_ply_binary};
-pub use stl::save_mesh_stl_binary;
+pub use stl::{save_mesh_stl_ascii, save_mesh_stl_binary};
 
 use thiserror::Error;
 
@@ -15,6 +22,11 @@ pub enum IoError {
     Io(#[from] std::io::Error),
     #[error("Parse error: {0}")]
     Parse(String),
+    /// The file ends before the data its header or structure promises.
+    #[error("Truncated file: {0}")]
+    Truncated(String),
+    #[error("Unsupported file: {0}")]
+    Unsupported(String),
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@
 //! alignment into the project frame, and saving / opening the project as a folder.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use glam::{Quat, Vec3};
 use scancraft_align::{PassCloud, Quality, View};
@@ -10,7 +11,7 @@ use scancraft_driver::{DeviceInfo, LightSource, ScanConfig};
 use scancraft_io::project::{self as files, AlignmentRecord, KeyframeRecord, OutputRecord, PassRecord, ProjectFile};
 use scancraft_slam::{Keyframe, KeyframeData, SeedView, Tracker, TrackerConfig};
 
-use crate::model::KeyframeInfo;
+use crate::model::{KeyframeInfo, SharedTracker};
 
 /// How a pass got its place in the project frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +23,8 @@ pub enum AlignMethod {
     SamePosition,
     /// Adjusted by global refinement.
     Refined,
+    /// Placed by Align All (every pass against every other).
+    AllPasses,
 }
 
 impl AlignMethod {
@@ -32,6 +35,7 @@ impl AlignMethod {
             AlignMethod::Markers => "Markers",
             AlignMethod::SamePosition => "Same position",
             AlignMethod::Refined => "Refined",
+            AlignMethod::AllPasses => "Align all",
         }
     }
 
@@ -42,6 +46,7 @@ impl AlignMethod {
             AlignMethod::Markers => "markers",
             AlignMethod::SamePosition => "same_position",
             AlignMethod::Refined => "refined",
+            AlignMethod::AllPasses => "align_all",
         }
     }
 
@@ -51,6 +56,7 @@ impl AlignMethod {
             "markers" => AlignMethod::Markers,
             "same_position" => AlignMethod::SamePosition,
             "refined" => AlignMethod::Refined,
+            "align_all" => AlignMethod::AllPasses,
             _ => AlignMethod::Auto,
         }
     }
@@ -93,6 +99,36 @@ pub enum PassStart {
     SamePosition,
 }
 
+/// Where a pass came from.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum PassOrigin {
+    /// Captured in this project.
+    #[default]
+    Captured,
+    /// Read from a scan file (PLY, OBJ, STL): a fixed surface without tracker or keyframes.
+    /// `source` is the file name.
+    File { source: String },
+    /// Copied from another ScanCraft project (with its keyframes). `source` is that project's
+    /// name.
+    Project { source: String },
+}
+
+impl PassOrigin {
+    /// Brought in from outside this project (a file or another project).
+    pub fn is_imported(&self) -> bool {
+        !matches!(self, PassOrigin::Captured)
+    }
+
+    /// One line for tooltips and the properties card.
+    pub fn label(&self) -> String {
+        match self {
+            PassOrigin::Captured => "Captured".into(),
+            PassOrigin::File { source } => format!("Imported from {source}"),
+            PassOrigin::Project { source } => format!("Added from project {source}"),
+        }
+    }
+}
+
 /// Everything the project knows about a pass besides its geometry.
 #[derive(Clone, Debug)]
 pub struct PassMeta {
@@ -109,6 +145,7 @@ pub struct PassMeta {
     pub included: bool,
     pub start: PassStart,
     pub raw_recording: Option<String>,
+    pub origin: PassOrigin,
 }
 
 impl PassMeta {
@@ -122,7 +159,13 @@ impl PassMeta {
             included: true,
             start,
             raw_recording: std::env::var("SCANCRAFT_RECORD_DIR").ok(),
+            origin: PassOrigin::Captured,
         }
+    }
+
+    /// A pass read from the scan file `source` (unaligned, default merge weight).
+    pub fn imported(source: String) -> Self {
+        PassMeta { raw_recording: None, origin: PassOrigin::File { source }, ..PassMeta::new(ScanConfig::default(), None, PassStart::Moved) }
     }
 }
 
@@ -194,7 +237,50 @@ pub fn pass_cloud(tracker: &Tracker) -> PassCloud {
             View { pose: k.pose, points: pts.iter().step_by(s).map(|(p, _)| *p).collect() }
         })
         .collect();
-    PassCloud { points, views }
+    // The table plane comes from object isolation (`crate::isolation`).
+    PassCloud { points, views, support: None }
+}
+
+/// A fixed surface (an imported scan) as the alignment code sees it: its points, and no views,
+/// so the visibility checks are skipped for it.
+pub fn fixed_cloud(surface: &PointCloud) -> PassCloud {
+    let points = surface.points.iter().map(|p| (Vec3::from(p.position), Vec3::from(p.normal).normalize_or_zero())).collect();
+    PassCloud { points, views: Vec::new(), support: None }
+}
+
+/// Observations credited to each point of a fixed surface when merging: an imported scan is
+/// already a fused surface, so its points are not treated as single stray measurements.
+const FIXED_OBSERVATIONS: u32 = 2;
+
+/// Where background jobs read a pass's surface from (in the pass's own frame).
+#[derive(Clone)]
+pub enum PassSource {
+    /// A captured pass: its tracker's fused model and keyframes.
+    Tracked(SharedTracker),
+    /// An imported scan: a fixed surface.
+    Fixed(Arc<PointCloud>),
+}
+
+impl PassSource {
+    /// The pass for alignment (see [`pass_cloud`] and [`fixed_cloud`]).
+    pub fn pass_cloud(&self) -> Result<PassCloud, String> {
+        match self {
+            PassSource::Tracked(t) => t.lock().map(|t| pass_cloud(&t)).map_err(|_| "A pass's tracker is unavailable".to_string()),
+            PassSource::Fixed(s) => Ok(fixed_cloud(s)),
+        }
+    }
+
+    /// (position, unit normal, observation count) of each surface point, for merging. The order
+    /// matches [`pass_cloud`](Self::pass_cloud)'s points.
+    pub fn surfels(&self) -> Result<Vec<(Vec3, Vec3, u32)>, String> {
+        match self {
+            PassSource::Tracked(t) => t
+                .lock()
+                .map(|t| t.fused_surfels().iter().map(|s| (s.position, s.normal.normalize_or_zero(), s.count)).collect())
+                .map_err(|_| "A pass's tracker is unavailable".to_string()),
+            PassSource::Fixed(s) => Ok(fixed_cloud(s).points.into_iter().map(|(p, n)| (p, n, FIXED_OBSERVATIONS)).collect()),
+        }
+    }
 }
 
 /// The model of placed passes as a seed for a same-position pass: surface points and keyframe
@@ -220,6 +306,8 @@ pub struct StoredPass {
     pub visible: bool,
     pub meta: PassMeta,
     pub keyframes: Vec<KeyframeData>,
+    /// An imported pass's fixed surface (its own frame); `None` for a captured pass.
+    pub surface: Option<Arc<PointCloud>>,
 }
 
 /// What a project folder holds.
@@ -279,16 +367,66 @@ fn alignment_state(r: &AlignmentRecord) -> AlignState {
     match r.status.as_str() {
         "reference" => AlignState::Reference,
         "aligned" => {
+            // Only overlap, RMS and see-through are stored; the rest reads as not measured
+            // (no wall, no table violation, slide 0 = not judged).
             let quality = r.overlap.map(|overlap| Quality {
                 overlap,
                 rmse_mm: r.rmse_mm.unwrap_or(f32::INFINITY),
                 visibility_conflict: r.visibility_conflict.unwrap_or(0.0),
                 inliers: 1000,
+                ..Quality::NONE
             });
             AlignState::Aligned { method: AlignMethod::from_key(r.method.as_deref().unwrap_or("auto")), quality }
         }
         _ => AlignState::Unaligned,
     }
+}
+
+/// An imported pass's surface file, relative to the project folder.
+pub fn surface_path(id: u32) -> String {
+    format!("{}/surface.ply", files::pass_dir(id))
+}
+
+/// Key in a pass's free-form `scan_config` JSON that says where the pass came from. Projects
+/// without it (all older ones) hold captured passes only; older versions of the app ignore it.
+const ORIGIN_KEY: &str = "origin";
+
+/// The pass's `scan_config` JSON with its origin added (nothing for a captured pass).
+fn scan_config_json(p: &StoredPass) -> serde_json::Value {
+    let mut value = serde_json::to_value(&p.meta.scan_config).unwrap_or_default();
+    let origin = match &p.meta.origin {
+        PassOrigin::Captured => None,
+        PassOrigin::File { source } => Some(serde_json::json!({ "kind": "file", "source": source, "surface": surface_path(p.id) })),
+        PassOrigin::Project { source } => Some(serde_json::json!({ "kind": "project", "source": source })),
+    };
+    if let (Some(origin), Some(map)) = (origin, value.as_object_mut()) {
+        map.insert(ORIGIN_KEY.into(), origin);
+    }
+    value
+}
+
+/// The origin stored in a pass's `scan_config` JSON, and for an imported file its surface file.
+fn origin_of(scan_config: &serde_json::Value) -> (PassOrigin, Option<String>) {
+    let Some(o) = scan_config.get(ORIGIN_KEY) else { return (PassOrigin::Captured, None) };
+    let text = |key: &str| o.get(key).and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    match o.get("kind").and_then(|v| v.as_str()) {
+        Some("file") => (PassOrigin::File { source: text("source") }, Some(text("surface")).filter(|s| !s.is_empty())),
+        Some("project") => (PassOrigin::Project { source: text("source") }, None),
+        _ => (PassOrigin::Captured, None),
+    }
+}
+
+/// Writes a fixed surface with its normals and colours (a mesh file without faces).
+fn write_surface(path: &Path, surface: &PointCloud) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mesh = Mesh::from_geometry(surface.points.clone(), Vec::new());
+    scancraft_io::save_mesh_ply_binary(&mesh, path).map_err(|e| e.to_string())
+}
+
+fn read_surface(path: &Path) -> Result<PointCloud, String> {
+    scancraft_io::load_ply(path).map(|(cloud, _)| cloud).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 const MERGED_FILE: &str = "outputs/merged.ply";
@@ -304,7 +442,7 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
         .map(|p| PassRecord {
             id: p.id,
             name: p.name.clone(),
-            scan_config: serde_json::to_value(&p.meta.scan_config).unwrap_or_default(),
+            scan_config: scan_config_json(p),
             device: p.meta.device.as_ref().and_then(|d| serde_json::to_value(d).ok()).unwrap_or_default(),
             frames: p.frames,
             transform: p.meta.transform,
@@ -320,6 +458,11 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
             raw_recording: p.meta.raw_recording.clone(),
         })
         .collect();
+    for p in &project.passes {
+        if let Some(surface) = &p.surface {
+            write_surface(&dir.join(surface_path(p.id)), surface)?;
+        }
+    }
     let mut outputs = Vec::new();
     std::fs::create_dir_all(dir.join("outputs")).map_err(|e| e.to_string())?;
     // Outputs that no longer exist are removed so an opened project shows what was saved.
@@ -364,6 +507,12 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
         let kfs = keyframes.iter_mut().find(|(id, _)| *id == record.id).map(|(_, k)| std::mem::take(k)).unwrap_or_default();
         let scan_config: ScanConfig = serde_json::from_value(record.scan_config.clone()).unwrap_or_default();
         let device: Option<DeviceInfo> = serde_json::from_value(record.device.clone()).ok();
+        let (origin, surface_file) = origin_of(&record.scan_config);
+        let surface = match (&origin, surface_file) {
+            (PassOrigin::File { .. }, Some(file)) => Some(Arc::new(read_surface(&files::resolve(dir, &file)).map_err(|e| format!("the surface of {} cannot be read ({e})", record.name))?)),
+            (PassOrigin::File { .. }, None) => return Err(format!("{} is an imported pass without a surface file", record.name)),
+            _ => None,
+        };
         passes.push(StoredPass {
             id: record.id,
             name: record.name.clone(),
@@ -378,8 +527,10 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
                 included: record.included,
                 start: if record.start == "same_position" { PassStart::SamePosition } else { PassStart::Moved },
                 raw_recording: record.raw_recording.clone(),
+                origin,
             },
             keyframes: kfs.into_iter().map(from_record).collect(),
+            surface,
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
@@ -398,12 +549,17 @@ pub struct LoadedPass {
     pub keyframes: Vec<KeyframeInfo>,
 }
 
-/// Rebuilds a stored pass's tracker (the expensive part of opening a project).
+/// Rebuilds a stored pass's tracker (the expensive part of opening a project). An imported pass
+/// gets an empty tracker and its fixed surface.
 pub fn rebuild(mut stored: StoredPass) -> LoadedPass {
     let config = tracker_config(&stored.meta.scan_config, stored.meta.device.as_ref());
     let kfs = std::mem::take(&mut stored.keyframes).into_iter().map(Keyframe::from_data).collect();
     let tracker = Tracker::from_keyframes(config, kfs);
-    let points = place(tracker.fused_points(), &stored.meta.transform);
+    let own = match &stored.surface {
+        Some(surface) => surface.points.clone(),
+        None => tracker.fused_points(),
+    };
+    let points = place(own, &stored.meta.transform);
     let keyframes = tracker.keyframes().iter().map(KeyframeInfo::of).collect();
     LoadedPass { stored, tracker, points, keyframes }
 }
@@ -437,7 +593,7 @@ mod tests {
         tracker.set_discarded(first, true);
         let mut aligned = PassMeta::new(ScanConfig::default(), None, PassStart::Moved);
         aligned.transform = scancraft_align::rigid(Quat::from_rotation_x(2.0), Vec3::new(1.0, 2.0, 3.0));
-        aligned.alignment = AlignState::Aligned { method: AlignMethod::PointPairs, quality: Some(Quality { overlap: 0.4, rmse_mm: 0.2, visibility_conflict: 0.01, inliers: 1000 }) };
+        aligned.alignment = AlignState::Aligned { method: AlignMethod::AllPasses, quality: Some(Quality { overlap: 0.4, rmse_mm: 0.2, visibility_conflict: 0.01, inliers: 1000, ..Quality::NONE }) };
         aligned.weight = 3.0;
         aligned.included = false;
         let mut reference = PassMeta::new(ScanConfig::default(), None, PassStart::Moved);
@@ -449,8 +605,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone() },
-                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone() },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None },
+                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None },
             ],
             merged: Some((merged, vec![1])),
             cleaned: None,
@@ -501,5 +657,96 @@ mod tests {
         let err = (status.current_pose.translation - truth.translation).length();
         // The earlier pass itself tracked to ~0.5 mm (scanner pose, 260 mm from the object).
         assert!(err < 2.0, "pose error {err:.3} mm");
+    }
+
+    /// A small coloured patch with normals, as an imported scan.
+    fn surface() -> Arc<PointCloud> {
+        let normal = Vec3::new(-0.1, 0.0, 1.0).normalize().to_array();
+        let points = (0..500)
+            .map(|i| {
+                let (u, v) = ((i % 25) as f32, (i / 25) as f32);
+                Point3D::new([u, v, 0.1 * u]).with_normal(normal).with_color(scancraft_core::ColorRgba::new(10 + (i % 200) as u8, 20, 30, 255))
+            })
+            .collect();
+        Arc::new(PointCloud::from_points(points))
+    }
+
+    #[test]
+    fn imported_and_added_passes_round_trip() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-imported-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let views = synthetic::ring(Vec3::ZERO, 0.6, 0.0, 0.5, 4, 260.0);
+        let keyframes: Vec<KeyframeData> = tracker_for(&views).keyframes().iter().map(Keyframe::to_data).collect();
+        let mut reference = PassMeta::new(ScanConfig::default(), None, PassStart::Moved);
+        reference.alignment = AlignState::Reference;
+        reference.origin = PassOrigin::Project { source: "Bracket".into() };
+        let mut imported = PassMeta::imported("shell.ply".into());
+        imported.transform = scancraft_align::rigid(Quat::from_rotation_y(0.7), Vec3::new(-4.0, 5.0, 6.0));
+        imported.alignment = AlignState::Aligned { method: AlignMethod::AllPasses, quality: None };
+        let s = surface();
+        let project = StoredProject {
+            name: "Imports".into(),
+            reference: Some(1),
+            next_pass_id: 3,
+            passes: vec![
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None },
+                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)) },
+            ],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        assert!(dir.join(surface_path(2)).is_file());
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.passes[0].meta.origin, PassOrigin::Project { source: "Bracket".into() });
+        assert!(loaded.passes[0].surface.is_none());
+        let p = &loaded.passes[1];
+        assert_eq!(p.meta.origin, PassOrigin::File { source: "shell.ply".into() });
+        assert_eq!((p.meta.transform, p.meta.alignment), (imported.transform, imported.alignment));
+        assert!(p.keyframes.is_empty());
+        let back = p.surface.as_ref().expect("the imported surface is stored");
+        assert_eq!(back.len(), s.len());
+        for (a, b) in back.points.iter().zip(&s.points) {
+            assert_eq!(a.position, b.position);
+            assert_eq!(a.color, b.color);
+            assert!((Vec3::from(a.normal) - Vec3::from(b.normal)).length() < 1e-5);
+        }
+        // Rebuilt, it is its surface placed by its transform, with an empty tracker.
+        let rebuilt = rebuild(loaded.passes.into_iter().nth(1).unwrap());
+        assert!(rebuilt.tracker.keyframes().is_empty() && rebuilt.keyframes.is_empty());
+        let expected = place(s.points.clone(), &imported.transform);
+        assert!((Vec3::from(rebuilt.points[7].position) - Vec3::from(expected[7].position)).length() < 1e-4);
+        // A missing surface file is reported, not opened as an empty pass.
+        std::fs::remove_file(dir.join(surface_path(2))).unwrap();
+        assert!(load(&dir).err().is_some_and(|e| e.contains("shell.ply")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_without_origins_loads_as_captured_passes() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-old-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut meta = PassMeta::new(ScanConfig::default(), None, PassStart::Moved);
+        meta.alignment = AlignState::Reference;
+        let project = StoredProject {
+            name: "Old".into(),
+            reference: Some(1),
+            next_pass_id: 2,
+            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None }],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        // What older versions wrote: the scan settings without an origin.
+        let json = std::fs::read_to_string(dir.join(files::PROJECT_FILE)).unwrap();
+        assert!(!json.contains(&format!("\"{ORIGIN_KEY}\"")), "a captured pass stores no origin");
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.passes[0].meta.origin, PassOrigin::Captured);
+        assert!(loaded.passes[0].surface.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

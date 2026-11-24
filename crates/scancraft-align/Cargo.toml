@@ -12,7 +12,6 @@ glam.workspace = true
 rayon.workspace = true
 log.workspace = true
 thiserror.workspace = true
-kiddo = "4"
 
 [dev-dependencies]
 # examples/align_ply.rs: loads PLY scans, removes the table, renders PNG views of the result.

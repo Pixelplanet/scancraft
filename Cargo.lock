@@ -6916,7 +6916,6 @@ dependencies = [
  "env_logger",
  "glam 0.29.3",
  "image",
- "kiddo",
  "log",
  "rayon",
  "scancraft-core",
@@ -7005,6 +7004,7 @@ dependencies = [
  "log",
  "rayon",
  "scancraft-core",
+ "scancraft-io",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -7080,6 +7080,7 @@ dependencies = [
  "scancraft-color",
  "scancraft-core",
  "scancraft-driver",
+ "scancraft-fusion",
  "scancraft-hybrid",
  "scancraft-laser",
  "scancraft-markers",

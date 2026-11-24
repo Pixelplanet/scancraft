@@ -116,6 +116,167 @@ pub fn object(spacing: f32) -> Vec<Oriented> {
     out
 }
 
+/// Semi-axes of [`shell_part`]'s outer dome, mm.
+pub const SHELL_AXES: Vec3 = Vec3::new(100.0, 70.0, 45.0);
+/// Width of [`shell_part`]'s flange, mm.
+pub const SHELL_FLANGE: f32 = 15.0;
+
+/// A thick-walled shell part like a moulded cover, opening down at z = 0: an elliptic dome
+/// ([`SHELL_AXES`]) with walls `wall_mm` thick and a flat flange round the opening
+/// ([`SHELL_FLANGE`] wide, as thick as the wall, top face at z = 0). Sampled about `spacing`
+/// apart, as (outside faces, inside faces): what a scan of the part standing on its flange sees
+/// (outer dome, flange top) and what a scan of it lying upside down sees (inner dome, the inner
+/// wall under the dome's rim, flange underside). Both contain the flange's outer edge.
+pub fn shell_part(spacing: f32, wall_mm: f32) -> (Vec<Oriented>, Vec<Oriented>) {
+    dome_shell(spacing, wall_mm, SHELL_AXES, SHELL_AXES)
+}
+
+/// [`shell_part`] with a dome made of quarter ellipsoids: semi-axes `pos` towards +x / +y and
+/// `neg` towards -x / -y (the height `pos.z` for all).
+fn dome_shell(spacing: f32, wall_mm: f32, pos: Vec3, neg: Vec3) -> (Vec<Oriented>, Vec<Oriented>) {
+    let c = pos.z;
+    let axes = |theta: f32| (if theta.cos() >= 0.0 { pos.x } else { neg.x }, if theta.sin() >= 0.0 { pos.y } else { neg.y });
+    let (mean_a, mean_b) = ((pos.x + neg.x) / 2.0, (pos.y + neg.y) / 2.0);
+    let tau = std::f32::consts::TAU;
+    // Points round an ellipse of semi-axes (ea, eb), about `spacing` apart.
+    let around = |ea: f32, eb: f32| -> usize {
+        let h = ((ea - eb) / (ea + eb)).powi(2);
+        let perimeter = std::f32::consts::PI * (ea + eb) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()));
+        (perimeter / spacing).ceil().max(6.0) as usize
+    };
+    let (mut outside, mut inside) = (Vec::new(), Vec::new());
+    // Domes: the inner face is the outer one moved `wall_mm` inwards along the normal.
+    let rings = (std::f32::consts::FRAC_PI_2 * pos.x.max(neg.x).max(c) / spacing).ceil() as usize;
+    for r in 0..=rings {
+        let phi = std::f32::consts::FRAC_PI_2 * r as f32 / rings as f32;
+        let count = if r == rings { 1 } else { around(mean_a * phi.cos(), mean_b * phi.cos()) };
+        for k in 0..count {
+            let theta = tau * k as f32 / count as f32;
+            let (a, b) = axes(theta);
+            let p = Vec3::new(a * phi.cos() * theta.cos(), b * phi.cos() * theta.sin(), c * phi.sin());
+            let n = Vec3::new(p.x / (a * a), p.y / (b * b), p.z / (c * c)).normalize();
+            outside.push((p, n));
+            inside.push((p - n * wall_mm, -n));
+        }
+    }
+    // Flange round the outer footprint ellipse: `e(theta) + r * n(theta)`, r from the inner wall
+    // (-wall) out to the edge.
+    let count = around(mean_a + SHELL_FLANGE / 2.0, mean_b + SHELL_FLANGE / 2.0);
+    let steps = |len: f32| (len / spacing).ceil().max(1.0) as usize;
+    for k in 0..count {
+        let theta = tau * k as f32 / count as f32;
+        let (a, b) = axes(theta);
+        let e = Vec3::new(a * theta.cos(), b * theta.sin(), 0.0);
+        let n = Vec3::new(theta.cos() / a, theta.sin() / b, 0.0).normalize();
+        let (nr, nz) = (steps(SHELL_FLANGE + wall_mm), steps(wall_mm));
+        for i in 0..=nr {
+            let r = -wall_mm + (SHELL_FLANGE + wall_mm) * i as f32 / nr as f32;
+            if r > 0.0 {
+                outside.push((e + n * r, Vec3::Z));
+            }
+            inside.push((e + n * r - Vec3::Z * wall_mm, -Vec3::Z));
+        }
+        for j in 1..nz {
+            let z = -wall_mm * j as f32 / nz as f32;
+            let edge = (e + n * SHELL_FLANGE + Vec3::Z * z, n);
+            outside.push(edge);
+            inside.push(edge);
+            inside.push((e - n * wall_mm + Vec3::Z * z, -n));
+        }
+    }
+    (outside, inside)
+}
+
+/// Semi-axes of [`shell_cover`]'s outer dome towards +x and +y (and its height), mm.
+pub const COVER_AXES_POS: Vec3 = Vec3::new(110.0, 75.0, 45.0);
+/// Semi-axes of [`shell_cover`]'s outer dome towards -x and -y, mm.
+pub const COVER_AXES_NEG: Vec3 = Vec3::new(85.0, 60.0, 45.0);
+/// Bosses under [`shell_cover`]'s dome: (centre x, centre y, radius, bottom z), mm.
+const COVER_BOSSES: [(f32, f32, f32, f32); 3] = [(40.0, 20.0, 6.0, 10.0), (-35.0, -22.0, 5.0, 14.0), (10.0, -35.0, 4.0, 20.0)];
+
+/// A shell part without symmetries, like a real moulded cover: [`shell_part`]'s layout (opening
+/// down at z = 0, flange round it) with an egg-shaped dome ([`COVER_AXES_POS`] /
+/// [`COVER_AXES_NEG`]), three bosses hanging from the inside of the dome and a lug on the outside
+/// near the rim (+y side). Returns (outside faces, inside faces) like [`shell_part`].
+pub fn shell_cover(spacing: f32, wall_mm: f32) -> (Vec<Oriented>, Vec<Oriented>) {
+    let (mut outside, mut inside) = dome_shell(spacing, wall_mm, COVER_AXES_POS, COVER_AXES_NEG);
+    let semi = |x: f32, y: f32| (if x >= 0.0 { COVER_AXES_POS.x } else { COVER_AXES_NEG.x }, if y >= 0.0 { COVER_AXES_POS.y } else { COVER_AXES_NEG.y });
+    // Outer dome height over (x, y) and its normal's z component.
+    let dome = |x: f32, y: f32| -> (f32, f32) {
+        let (a, b) = semi(x, y);
+        let c = COVER_AXES_POS.z;
+        let z = c * (1.0 - (x / a).powi(2) - (y / b).powi(2)).max(0.0).sqrt();
+        (z, Vec3::new(x / (a * a), y / (b * b), z / (c * c)).normalize().z)
+    };
+    for (cx, cy, r, z0) in COVER_BOSSES {
+        // The dome's inside over the boss belongs to the boss's solid.
+        inside.retain(|(p, _)| p.z < z0 - 0.5 || Vec3::new(p.x - cx, p.y - cy, 0.0).length() > r);
+        let around = (std::f32::consts::TAU * r / spacing).ceil() as usize;
+        for i in 0..around {
+            let a = std::f32::consts::TAU * i as f32 / around as f32;
+            let n = Vec3::new(a.cos(), a.sin(), 0.0);
+            let (x, y) = (cx + r * n.x, cy + r * n.y);
+            let (h, nz) = dome(x, y);
+            let top = h - wall_mm / nz.max(0.3);
+            let steps = ((top - z0) / spacing).ceil().max(1.0) as usize;
+            for k in 0..=steps {
+                inside.push((Vec3::new(x, y, z0 + (top - z0) * k as f32 / steps as f32), n));
+            }
+        }
+        // Bottom face.
+        let rings = (r / spacing).ceil() as usize;
+        inside.push((Vec3::new(cx, cy, z0), -Vec3::Z));
+        for k in 1..rings {
+            let rr = r * k as f32 / rings as f32;
+            let m = (std::f32::consts::TAU * rr / spacing).ceil() as usize;
+            for i in 0..m {
+                let a = std::f32::consts::TAU * i as f32 / m as f32;
+                inside.push((Vec3::new(cx + rr * a.cos(), cy + rr * a.sin(), z0), -Vec3::Z));
+            }
+        }
+    }
+    // The lug: a block standing out of the dome near the rim.
+    let lug = Shape::Cuboid { center: Vec3::new(30.0, 70.0, 12.0), half: Vec3::new(9.0, 7.0, 10.0), rotation: Quat::IDENTITY };
+    outside.retain(|(p, _)| lug.sdf(*p) > 0.05);
+    let mut faces = Vec::new();
+    lug.sample(spacing, &mut faces);
+    outside.extend(faces.into_iter().filter(|(p, _)| {
+        let (a, b) = semi(p.x, p.y);
+        (p.x / a).powi(2) + (p.y / b).powi(2) + (p.z / COVER_AXES_POS.z).powi(2) > 1.0
+    }));
+    (outside, inside)
+}
+
+/// Three scan passes of [`shell_cover`] (1 mm samples, 3 mm wall) with their object poses
+/// (pass <- part), like the Revo Scan test part:
+///
+/// 0. the outside: standing on its flange, pass frame = part frame, seen from above all round;
+/// 1. the inside, lying upside down (turned and moved), seen from above;
+/// 2. the inside again, placed differently, from above and low down, so that it also contains the
+///    outside of the dome near the rim (with the lug).
+///
+/// Each pass has its table as support plane.
+pub fn cover_passes(wall_mm: f32) -> (Vec<PassCloud>, Vec<Transform>) {
+    let (outer, inner) = shell_cover(1.0, wall_mm);
+    let band: Vec<Oriented> = inner.iter().copied().chain(outer.iter().copied().filter(|(p, _)| p.z < 25.0)).collect();
+    let upside_down = |turn: f32, at: Vec3| rigid(Quat::from_rotation_x(std::f32::consts::PI) * Quat::from_rotation_z(turn), at);
+    let poses = vec![Transform::default(), upside_down(0.7, Vec3::new(40.0, -25.0, 60.0)), upside_down(-2.0, Vec3::new(-30.0, 45.0, 55.0))];
+    let ring_at = |pose: &Transform, elevation: f32, az0: f32| ring(pose.transform_point3(Vec3::ZERO), elevation, az0, az0 + 5.6, 8, 340.0);
+    let mut low = ring_at(&poses[2], 1.0, 0.3);
+    low.extend(ring_at(&poses[2], 0.15, 0.0));
+    let mut passes = vec![
+        pass(&outer, &poses[0], &ring_at(&poses[0], 0.7, 0.0), 0.08, 1.0, 50),
+        pass(&inner, &poses[1], &ring_at(&poses[1], 1.0, 0.2), 0.08, 1.0, 51),
+        pass(&band, &poses[2], &low, 0.08, 1.0, 52),
+    ];
+    passes[0].support = Some(crate::Plane::through(Vec3::new(0.0, 0.0, -wall_mm), Vec3::Z));
+    for (p, pose) in passes.iter_mut().zip(&poses).skip(1) {
+        // Upside down it rests on the dome's apex.
+        p.support = Some(crate::Plane::through(pose.transform_point3(Vec3::new(0.0, 0.0, COVER_AXES_POS.z)), Vec3::Z));
+    }
+    (passes, poses)
+}
+
 /// Distance from `p` to the object's surface (for measuring merged results).
 pub fn surface_distance(p: Vec3) -> f32 {
     shapes().iter().map(|s| s.sdf(p)).fold(f32::MAX, f32::min).abs()
@@ -181,5 +342,5 @@ pub fn pass(object: &[Oriented], object_pose: &Transform, views: &[Transform], n
         all.extend(seen.iter().map(|&(q, n)| (pose.transform_point3(q), pose.rotation * n)));
         out_views.push(View { pose: *pose, points: seen.iter().map(|(q, _)| *q).collect() });
     }
-    PassCloud { points: downsample(&all, pitch_mm), views: out_views }
+    PassCloud { points: downsample(&all, pitch_mm), views: out_views, support: None }
 }

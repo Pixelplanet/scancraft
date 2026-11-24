@@ -1,6 +1,10 @@
-//! Project-level actions of the app: alignment (auto, point pairs, global refinement) with a
-//! preview before accepting, merging, the reference pass, same-position seeding, and saving /
-//! opening the project folder. A child module of `app`, so it shares the app's private state.
+//! Project-level actions of the app: alignment (auto, point pairs, Align All, global
+//! refinement) with a preview before accepting, merging, the reference pass, same-position
+//! seeding, and saving / opening the project folder. A child module of `app`, so it shares the
+//! app's private state.
+//!
+//! Alignment, refinement and merging use each pass's object only (`crate::isolation`) unless the
+//! user turns on "Use whole scene".
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -12,25 +16,66 @@ use scancraft_mesh::Mesher;
 use scancraft_render::{Camera, CameraPreset};
 use scancraft_slam::SeedState;
 
-use super::{AlignPreview, PairPicking, ScanCraftApp, Tone};
+use super::{AlignPreview, PairPicking, PosesPreview, Proposal, ScanCraftApp, ToastAction, Tone};
+use crate::alignment::{self, AlignAllOutcome, PassInput, RefineOutcome};
+use crate::isolation::{self, MaskCache};
 use crate::model::*;
-use crate::project::{self, AlignMethod, AlignState, LoadedPass, ProjectInfo, StoredPass, StoredProject};
+use crate::project::{self, AlignMethod, AlignState, LoadedPass, PassSource, ProjectInfo, StoredPass, StoredProject};
 
-/// Passes placed in the project frame, as (transform, tracker), optionally leaving one out.
-fn placed(app: &ScanCraftApp, except: Option<u32>) -> Vec<(Transform, SharedTracker)> {
-    app.passes.iter().filter(|p| p.meta.alignment.is_placed() && Some(p.id) != except).map(|p| (p.meta.transform, p.tracker.clone())).collect()
+/// What a background job needs of one pass: (id, project <- pass, placed, reference, surface,
+/// isolation cache).
+type JobPass = (u32, Transform, bool, bool, PassSource, MaskCache);
+
+/// Passes with fewer points take no part in Align All.
+const ALIGN_ALL_MIN_POINTS: usize = 200;
+
+/// Passes placed in the project frame, as (transform, surface, isolation), optionally leaving one
+/// out.
+fn placed(app: &ScanCraftApp, except: Option<u32>) -> Vec<(Transform, PassSource, MaskCache)> {
+    app.passes.iter().filter(|p| p.meta.alignment.is_placed() && Some(p.id) != except).map(|p| (p.meta.transform, p.source(), p.mask.clone())).collect()
 }
 
-/// The union of passes in the project frame, for aligning against.
-fn project_model(passes: &[(Transform, SharedTracker)]) -> Result<PassCloud, String> {
+/// A pass as alignment sees it, in its own frame: its object only unless `whole_scene`.
+fn pass_input(source: &PassSource, mask: &MaskCache, whole_scene: bool) -> Result<PassCloud, String> {
+    Ok(isolation::pass_input(source.pass_cloud()?, mask, whole_scene))
+}
+
+/// The union of passes in the project frame, for aligning against. It keeps a table plane only
+/// when it is a single pass (the passes stood differently on the table).
+fn project_model(passes: &[(Transform, PassSource, MaskCache)], whole_scene: bool) -> Result<PassCloud, String> {
     let mut model = PassCloud::default();
-    for (t, tracker) in passes {
-        let tracker = tracker.lock().map_err(|_| "A pass's tracker is unavailable".to_string())?;
-        let moved = scancraft_align::quality::moved(&project::pass_cloud(&tracker), t);
+    for (t, source, mask) in passes {
+        let moved = scancraft_align::quality::moved(&pass_input(source, mask, whole_scene)?, t);
         model.points.extend(moved.points);
         model.views.extend(moved.views);
+        model.support = if passes.len() == 1 { moved.support } else { None };
     }
     Ok(model)
+}
+
+/// The passes' clouds for a job, in their own frames.
+fn job_inputs(passes: &[JobPass], whole_scene: bool) -> Result<Vec<PassInput>, String> {
+    use rayon::prelude::*;
+    passes
+        .par_iter()
+        .map(|(id, pose, placed, reference, source, mask)| Ok(PassInput { id: *id, pose: *pose, placed: *placed, reference: *reference, cloud: pass_input(source, mask, whole_scene)? }))
+        .collect()
+}
+
+/// A pass read from a project (opened or added), shown by `layer`.
+fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
+    ScanPass {
+        id: lp.stored.id,
+        name: lp.stored.name,
+        layer,
+        frames: lp.stored.frames,
+        tracker: Arc::new(std::sync::Mutex::new(lp.tracker)),
+        keyframes: lp.keyframes,
+        meta: lp.stored.meta,
+        tinted: None,
+        mask: isolation::new_cache(),
+        surface: lp.stored.surface,
+    }
 }
 
 /// Display samples of a cloud for the point-pair panes.
@@ -112,16 +157,23 @@ impl ScanCraftApp {
     // ------------------------------------------------------------------ same position
 
     /// Seeds a new pass's tracker with the placed passes, so it starts in the project frame.
+    /// Imported passes add their surface but no views.
     pub(super) fn seed_tracker(&self, tracker: &SharedTracker) -> bool {
         let sources = placed(self, None);
-        let guards: Vec<_> = sources.iter().filter_map(|(t, tr)| tr.try_lock().ok().map(|g| (*t, g))).collect();
-        if guards.len() != sources.len() {
+        let tracked: Vec<(Transform, &SharedTracker)> = sources.iter().filter_map(|(t, s, _)| if let PassSource::Tracked(tr) = s { Some((*t, tr)) } else { None }).collect();
+        let guards: Vec<_> = tracked.iter().filter_map(|(t, tr)| tr.try_lock().ok().map(|g| (*t, g))).collect();
+        if guards.len() != tracked.len() {
             return false;
         }
         let refs: Vec<(Transform, &scancraft_slam::Tracker)> = guards.iter().map(|(t, g)| (*t, &**g)).collect();
-        let (points, views) = project::seed_from(&refs);
+        let (mut points, views) = project::seed_from(&refs);
         drop(refs);
         drop(guards);
+        for (t, source, _) in &sources {
+            if let PassSource::Fixed(surface) = source {
+                points.extend(project::fixed_cloud(surface).points.into_iter().map(|(p, n)| (t.transform_point3(p), t.rotation * n)));
+            }
+        }
         tracker.lock().map(|mut t| t.seed_model(&points, &views)).unwrap_or(false)
     }
 
@@ -179,6 +231,7 @@ impl ScanCraftApp {
             self.place_pass(pid, scancraft_align::compose(&inv, &t), state);
         }
         self.merged = None;
+        self.invalidate_derived("The project frame changed");
     }
 
     pub fn set_reference(&mut self, id: u32) {
@@ -187,7 +240,7 @@ impl ScanCraftApp {
         }
         let name = self.pass_name(id);
         self.history.push(self.snapshot(&format!("make {name} the reference")));
-        self.align_preview = None;
+        self.clear_previews();
         self.rebase_project(id);
         self.say(Tone::Normal, format!("{name} is the reference; the project frame is now its frame"));
     }
@@ -199,7 +252,10 @@ impl ScanCraftApp {
         }
         let name = self.pass_name(id);
         self.history.push(self.snapshot(&format!("reset alignment of {name}")));
+        self.clear_previews();
         self.place_pass(id, Transform::default(), AlignState::Unaligned);
+        self.merged = None;
+        self.invalidate_derived(&format!("{name} was moved"));
         self.say(Tone::Normal, format!("{name} is back in its own frame"));
     }
 
@@ -223,33 +279,172 @@ impl ScanCraftApp {
 
     // ------------------------------------------------------------------ aligning
 
-    /// Global registration of a pass against the project model, shown as a preview.
+    /// Global registration of a pass against the project model (several feature grids, both
+    /// directions), shown as a preview.
     pub fn align_auto(&mut self, id: u32) {
         if self.align_blocked(Some(id)).is_some() {
             return;
         }
-        let Some(tracker) = self.passes.iter().find(|p| p.id == id).map(|p| p.tracker.clone()) else { return };
+        let Some((pass_source, mask)) = self.passes.iter().find(|p| p.id == id).map(|p| (p.source(), p.mask.clone())) else { return };
         let targets = placed(self, Some(id));
         let name = self.pass_name(id);
-        self.align_preview = None;
+        let whole_scene = self.settings.whole_scene;
+        self.clear_previews();
         self.spawn_job(&format!("Aligning {name}"), move || {
             let t0 = std::time::Instant::now();
-            let source = match tracker.lock() {
-                Ok(t) => project::pass_cloud(&t),
-                Err(_) => return JobResult::Failed("The pass's tracker is unavailable".into()),
+            let source = match pass_input(&pass_source, &mask, whole_scene) {
+                Ok(s) => s,
+                Err(e) => return JobResult::Failed(e),
             };
-            let target = match project_model(&targets) {
+            let target = match project_model(&targets, whole_scene) {
                 Ok(m) => m,
                 Err(e) => return JobResult::Failed(e),
             };
-            match scancraft_align::align_global(&source, &target, &scancraft_align::GlobalConfig::default()) {
-                Ok(alignment) => {
+            match scancraft_align::align_robust(&source, &target, &scancraft_align::RobustConfig::default()) {
+                Ok(r) => {
+                    let check = AlignCheck {
+                        reverse: r.best.reverse,
+                        agreement: r.agreement,
+                        consistent: r.consistent,
+                        runs: r.candidates.len(),
+                        agreeing: r.agreeing,
+                        object_only: !whole_scene,
+                    };
+                    let alignment = Alignment { transform: r.transform(), quality: r.best.alignment.quality };
                     let message = format!("Found a placement for {name} in {:.1} s · check it, then Accept", t0.elapsed().as_secs_f32());
-                    JobResult::Aligned { pass: id, method: AlignMethod::Auto, alignment, message }
+                    JobResult::Aligned { pass: id, method: AlignMethod::Auto, alignment, check: Some(check), message }
                 }
                 Err(e) => JobResult::Failed(format!("Could not align {name}: {e}. Try point pairs.")),
             }
         });
+    }
+
+    /// Why Align All cannot run now.
+    pub fn align_all_blocked(&self) -> Option<&'static str> {
+        if self.busy.is_some() {
+            return Some("Another operation is running");
+        }
+        if self.capture != super::Capture::Idle {
+            return Some("Stop the capture first");
+        }
+        if self.align_preview.is_some() || self.poses_preview.is_some() {
+            return Some("Accept or reject the proposed alignment first");
+        }
+        if self.passes.iter().filter(|p| p.layer.len() >= ALIGN_ALL_MIN_POINTS).count() < 2 {
+            return Some("Capture at least two passes first");
+        }
+        // Every pass is placed in the reference's frame, so the reference must take part.
+        if !self.passes.iter().any(|p| p.meta.alignment == AlignState::Reference && p.layer.len() >= ALIGN_ALL_MIN_POINTS) {
+            return Some("The reference pass has too few points · make another pass the reference");
+        }
+        None
+    }
+
+    /// Aligns every pass against every other at once and places them all from the reference;
+    /// shown as a preview with a report of every pair.
+    pub fn align_all(&mut self) {
+        if self.align_all_blocked().is_some() {
+            return;
+        }
+        let passes: Vec<JobPass> = self
+            .passes
+            .iter()
+            .filter(|p| p.layer.len() >= ALIGN_ALL_MIN_POINTS)
+            .map(|p| (p.id, p.meta.transform, p.meta.alignment.is_placed(), p.meta.alignment == AlignState::Reference, p.source(), p.mask.clone()))
+            .collect();
+        let whole_scene = self.settings.whole_scene;
+        self.clear_previews();
+        let n = passes.len();
+        self.spawn_job(&format!("Aligning all {n} passes"), move || match job_inputs(&passes, whole_scene) {
+            Ok(inputs) => JobResult::AlignedAll(Box::new(alignment::align_all_passes(&inputs, &scancraft_align::GraphConfig::default()))),
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    /// Preview layers: each pass placed at a proposed project <- pass transform, in its colour.
+    fn preview_layers(&mut self, poses: &[(u32, Transform)]) -> Vec<(u32, CloudLayer)> {
+        let mut layers = Vec::new();
+        for (id, pose) in poses {
+            let g = self.generation();
+            let colour = self.pass_colour(*id);
+            let Some(p) = self.passes.iter().find(|p| p.id == *id) else { continue };
+            let delta = scancraft_align::compose(pose, &p.meta.transform.inverse());
+            let mut layer = CloudLayer::new(PointCloud::from_points(project::place(p.layer.cloud.points.clone(), &delta)), g);
+            layer.gpu = Arc::new(tinted_points(&layer.cloud, colour));
+            layers.push((*id, layer));
+        }
+        layers
+    }
+
+    pub(super) fn show_align_all(&mut self, outcome: AlignAllOutcome) {
+        let poses: Vec<(u32, Transform)> = outcome.moved().filter_map(|p| p.pose.map(|t| (p.id, t))).collect();
+        let placed = poses.len();
+        let unconnected: Vec<String> = outcome.unconnected().map(|p| self.pass_name(p.id)).collect();
+        let worst = outcome.moved().filter_map(|p| p.quality).map(|q| q.verdict()).max_by_key(|v| match v {
+            scancraft_align::Verdict::Good => 0,
+            scancraft_align::Verdict::Fair => 1,
+            scancraft_align::Verdict::Poor => 2,
+        });
+        let seconds = outcome.seconds;
+        if placed == 0 {
+            self.say(Tone::Error, format!("Align All found no pass it could place ({:.0} s) · try point pairs", seconds));
+            return;
+        }
+        let layers = self.preview_layers(&poses);
+        self.poses_preview = Some(PosesPreview { proposal: Proposal::AlignAll(Box::new(outcome)), layers });
+        self.picking = None;
+        self.stage = Stage::Align;
+        let mut message = format!("Placed {placed} pass{} in {:.0} s", if placed == 1 { "" } else { "es" }, seconds);
+        if !unconnected.is_empty() {
+            message.push_str(&format!(" · could not place {}", unconnected.join(", ")));
+        }
+        message.push_str(" · check the report, then Accept");
+        let tone = if unconnected.is_empty() && worst == Some(scancraft_align::Verdict::Good) { Tone::Success } else { Tone::Warning };
+        self.say(tone, message);
+    }
+
+    /// Accepts the proposed Align All or Refine All placements (undoable).
+    pub fn accept_poses(&mut self) {
+        let Some(preview) = self.poses_preview.take() else { return };
+        if !self.can_edit() {
+            self.poses_preview = Some(preview);
+            return;
+        }
+        let (label, placements): (&str, Vec<(u32, Transform, AlignState)>) = match &preview.proposal {
+            Proposal::AlignAll(o) => (
+                "align all passes",
+                o.moved().filter_map(|p| p.pose.map(|t| (p.id, t, AlignState::Aligned { method: AlignMethod::AllPasses, quality: p.quality }))).collect(),
+            ),
+            Proposal::Refine(r) => (
+                "refine alignments",
+                r.poses
+                    .iter()
+                    .map(|(id, t)| {
+                        let quality = r.qualities.iter().find(|(q, _)| q == id).map(|(_, q)| *q);
+                        (*id, *t, AlignState::Aligned { method: AlignMethod::Refined, quality })
+                    })
+                    .collect(),
+            ),
+        };
+        self.history.push(self.snapshot(label));
+        let n = placements.len();
+        for (id, pose, state) in placements {
+            self.place_pass(id, pose, state);
+        }
+        self.merged = None;
+        self.invalidate_derived("The alignment changed");
+        let next = self.passes.iter().find(|p| p.meta.alignment == AlignState::Unaligned).map(|p| p.name.clone());
+        match (&preview.proposal, next) {
+            (Proposal::Refine(_), _) => self.say(Tone::Success, format!("Refined {n} pass{}. Next: Merge", if n == 1 { "" } else { "es" })),
+            (_, Some(name)) => self.say(Tone::Warning, format!("Placed {n} pass{}; {name} is still not aligned (try point pairs)", if n == 1 { "" } else { "es" })),
+            (_, None) => self.say(Tone::Success, format!("Placed {n} pass{}. Next: Merge", if n == 1 { "" } else { "es" })),
+        }
+    }
+
+    pub fn reject_poses(&mut self) {
+        if self.poses_preview.take().is_some() {
+            self.say(Tone::Normal, "Rejected the proposed alignment; the passes are unchanged");
+        }
     }
 
     /// Opens the split view for picking pairs on `id` and the project model.
@@ -294,27 +489,28 @@ impl ScanCraftApp {
             return;
         }
         let Some(p) = self.passes.iter().find(|p| p.id == id) else { return };
-        let tracker = p.tracker.clone();
+        let (pass_source, mask) = (p.source(), p.mask.clone());
         let fine = p.meta.scan_config.accuracy.point_pitch_mm().max(1.0);
         let targets = placed(self, Some(id));
         let name = self.pass_name(id);
+        let whole_scene = self.settings.whole_scene;
         self.spawn_job(&format!("Aligning {name} from {} pairs", pairs.len()), move || {
-            let source = match tracker.lock() {
-                Ok(t) => project::pass_cloud(&t),
-                Err(_) => return JobResult::Failed("The pass's tracker is unavailable".into()),
+            let source = match pass_input(&pass_source, &mask, whole_scene) {
+                Ok(s) => s,
+                Err(e) => return JobResult::Failed(e),
             };
-            let target = match project_model(&targets) {
+            let target = match project_model(&targets, whole_scene) {
                 Ok(m) => m,
                 Err(e) => return JobResult::Failed(e),
             };
             match scancraft_align::align_point_pairs(&source, &target, &pairs, fine) {
-                Ok(alignment) => JobResult::Aligned { pass: id, method: AlignMethod::PointPairs, alignment, message: format!("Placed {name} from {} point pairs · check it, then Accept", pairs.len()) },
+                Ok(alignment) => JobResult::Aligned { pass: id, method: AlignMethod::PointPairs, alignment, check: None, message: format!("Placed {name} from {} point pairs · check it, then Accept", pairs.len()) },
                 Err(e) => JobResult::Failed(format!("Could not align {name}: {e}")),
             }
         });
     }
 
-    pub(super) fn show_preview(&mut self, pass: u32, method: AlignMethod, alignment: Alignment, message: String) {
+    pub(super) fn show_preview(&mut self, pass: u32, method: AlignMethod, alignment: Alignment, check: Option<AlignCheck>, message: String) {
         let g = self.generation();
         let colour = self.pass_colour(pass);
         let Some(p) = self.passes.iter().find(|p| p.id == pass) else { return };
@@ -322,13 +518,13 @@ impl ScanCraftApp {
         let cloud = PointCloud::from_points(project::place(p.layer.cloud.points.clone(), &delta));
         let mut layer = CloudLayer::new(cloud, g);
         layer.gpu = Arc::new(tinted_points(&layer.cloud, colour));
-        self.align_preview = Some(AlignPreview { pass, method, alignment, layer });
+        self.align_preview = Some(AlignPreview { pass, method, alignment, check, layer });
         self.picking = None;
         if matches!(self.tool, Some(Tool::PointPairs(_))) {
             self.tool = None;
         }
         self.selection = Some(Node::Pass(pass));
-        let tone = match alignment.quality.verdict() {
+        let tone = match alignment::checked_verdict(&alignment.quality, check.as_ref()) {
             scancraft_align::Verdict::Good => Tone::Success,
             _ => Tone::Warning,
         };
@@ -345,6 +541,7 @@ impl ScanCraftApp {
         self.history.push(self.snapshot(&format!("align {name}")));
         self.place_pass(preview.pass, preview.alignment.transform, AlignState::Aligned { method: preview.method, quality: Some(preview.alignment.quality) });
         self.merged = None;
+        self.invalidate_derived(&format!("{name} was aligned"));
         let next = self.passes.iter().find(|p| p.meta.alignment == AlignState::Unaligned).map(|p| p.name.clone());
         match next {
             Some(n) => self.say(Tone::Success, format!("Aligned {name}. Next: {n}")),
@@ -358,40 +555,29 @@ impl ScanCraftApp {
         }
     }
 
-    /// Pairwise ICP between overlapping placed passes and pose-graph optimisation.
+    /// Pairwise ICP between overlapping placed passes (the two faces of a wall paired too) and
+    /// pose-graph optimisation, shown as a preview with every link before and after.
     pub fn refine_all(&mut self) {
         if self.refine_blocked().is_some() {
             return;
         }
-        let inputs: Vec<(u32, Transform, bool, SharedTracker)> = self
+        let passes: Vec<JobPass> = self
             .passes
             .iter()
             .filter(|p| p.meta.alignment.is_placed())
-            .map(|p| (p.id, p.meta.transform, p.meta.alignment == AlignState::Reference, p.tracker.clone()))
+            .map(|p| (p.id, p.meta.transform, true, p.meta.alignment == AlignState::Reference, p.source(), p.mask.clone()))
             .collect();
-        self.align_preview = None;
+        let whole_scene = self.settings.whole_scene;
+        self.clear_previews();
         self.spawn_job("Refining all alignments", move || {
-            let t0 = std::time::Instant::now();
-            let mut clouds = Vec::new();
-            for (_, _, _, tracker) in &inputs {
-                match tracker.lock() {
-                    Ok(t) => clouds.push(project::pass_cloud(&t)),
-                    Err(_) => return JobResult::Failed("A pass's tracker is unavailable".into()),
-                }
+            let inputs = match job_inputs(&passes, whole_scene) {
+                Ok(i) => i,
+                Err(e) => return JobResult::Failed(e),
+            };
+            match alignment::refine_passes(&inputs) {
+                Some(outcome) => JobResult::Refined(Box::new(outcome)),
+                None => JobResult::NoChange("No passes overlap enough to refine".into()),
             }
-            let refine_inputs: Vec<scancraft_align::RefineInput> = inputs.iter().zip(&clouds).map(|((_, pose, fixed, _), cloud)| scancraft_align::RefineInput { cloud, pose: *pose, fixed: *fixed }).collect();
-            let result = scancraft_align::refine_global(&refine_inputs, &scancraft_align::RefineConfig::default());
-            if result.edges.is_empty() {
-                return JobResult::NoChange("No passes overlap enough to refine".into());
-            }
-            let message = format!(
-                "Refined {} links in {:.1} s · mismatch {:.2} → {:.2} mm",
-                result.edges.len(),
-                t0.elapsed().as_secs_f32(),
-                result.rms_before(),
-                result.rms_after()
-            );
-            JobResult::Refined { poses: inputs.iter().map(|i| i.0).zip(result.poses).collect(), message }
         });
     }
 
@@ -402,20 +588,23 @@ impl ScanCraftApp {
         if self.capture != super::Capture::Idle {
             return Some("Stop the capture first");
         }
+        if self.align_preview.is_some() || self.poses_preview.is_some() {
+            return Some("Accept or reject the proposed alignment first");
+        }
         (self.passes.iter().filter(|p| p.meta.alignment.is_placed()).count() < 2).then_some("Align at least two passes first")
     }
 
-    pub(super) fn apply_refinement(&mut self, poses: Vec<(u32, Transform)>, message: String) {
-        self.history.push(self.snapshot("refine alignments"));
-        for (id, pose) in poses {
-            let Some(state) = self.passes.iter().find(|p| p.id == id).map(|p| p.meta.alignment) else { continue };
-            let state = match state {
-                AlignState::Aligned { quality, .. } => AlignState::Aligned { method: AlignMethod::Refined, quality },
-                other => other,
-            };
-            self.place_pass(id, pose, state);
+    /// A finished refinement: previewed, or rejected at once when it made the fit worse.
+    pub(super) fn show_refinement(&mut self, outcome: RefineOutcome) {
+        let (before, after) = (outcome.median_before(), outcome.median_after());
+        let mm = |v: Option<f32>| v.map_or("—".to_string(), |v| format!("{v:.2} mm"));
+        if outcome.worse() {
+            self.say(Tone::Warning, format!("Refinement would make the fit worse (median pair error {} → {}); the alignment is unchanged", mm(before), mm(after)));
+            return;
         }
-        self.merged = None;
+        let message = format!("Refined {} links in {:.1} s · median pair error {} → {} · check it, then Accept", outcome.edges.len(), outcome.seconds, mm(before), mm(after));
+        let layers = self.preview_layers(&outcome.poses);
+        self.poses_preview = Some(PosesPreview { proposal: Proposal::Refine(Box::new(outcome)), layers });
         self.say(Tone::Success, message);
     }
 
@@ -439,23 +628,50 @@ impl ScanCraftApp {
         if self.merge_blocked().is_some() {
             return;
         }
-        let inputs: Vec<(u32, Transform, f32, SharedTracker)> =
-            self.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).map(|p| (p.id, p.meta.transform, p.meta.weight, p.tracker.clone())).collect();
-        let pitch = self.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).map(|p| p.meta.scan_config.accuracy.point_pitch_mm()).fold(f32::MAX, f32::min);
+        let inputs: Vec<(u32, Transform, f32, PassSource, MaskCache)> = self
+            .passes
+            .iter()
+            .filter(|p| p.meta.included && p.meta.alignment.is_placed())
+            .map(|p| (p.id, p.meta.transform, p.meta.weight, p.source(), p.mask.clone()))
+            .collect();
+        // Imported scans have no scan settings: the captured passes set the pitch.
+        let pitch = self
+            .passes
+            .iter()
+            .filter(|p| p.meta.included && p.meta.alignment.is_placed() && !p.is_fixed())
+            .map(|p| p.meta.scan_config.accuracy.point_pitch_mm())
+            .reduce(f32::min)
+            .unwrap_or_else(|| scancraft_driver::ScanConfig::default().accuracy.point_pitch_mm());
         let skipped = self.passes.iter().filter(|p| p.meta.included && !p.meta.alignment.is_placed()).count();
         let config = MergeConfig { pitch_mm: pitch, outliers: self.settings.merge_outliers.then_some((12, self.settings.merge_sigma)), ..MergeConfig::default() };
-        self.history.push(self.snapshot("merge"));
-        self.align_preview = None;
-        self.spawn_job("Merging passes", move || {
+        let whole_scene = self.settings.whole_scene;
+        self.clear_previews();
+        self.spawn_undoable("Merging passes", "merge", move || {
             let t0 = std::time::Instant::now();
             let mut merge_inputs = Vec::new();
-            for (_, t, weight, tracker) in &inputs {
-                let Ok(tracker) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
+            let mut left_out = 0;
+            for (_, t, weight, source, mask) in &inputs {
+                let surfels = match source.surfels() {
+                    Ok(s) => s,
+                    Err(e) => return JobResult::Failed(e),
+                };
+                let surfels = if whole_scene {
+                    surfels
+                } else {
+                    let points: Vec<(Vec3, Vec3)> = surfels.iter().map(|s| (s.0, s.1)).collect();
+                    let before = surfels.len();
+                    let kept = isolation::mask_for(mask, &points).keep(surfels);
+                    left_out += before - kept.len();
+                    kept
+                };
                 let m = t.to_mat4();
-                let points = tracker.fused_surfels().iter().map(|s| (m.transform_point3(s.position), (t.rotation * s.normal).normalize_or_zero(), s.count)).collect();
+                let points = surfels.into_iter().map(|(p, n, count)| (m.transform_point3(p), (t.rotation * n).normalize_or_zero(), count)).collect();
                 merge_inputs.push(MergeInput { points, weight: *weight });
             }
             let r = scancraft_align::merge(&merge_inputs, &config);
+            if r.points.is_empty() {
+                return JobResult::Failed("The merge produced no points".into());
+            }
             let mut message = format!(
                 "Merged {} passes · {} points ({} outweighed by more accurate passes, {} isolated, {} outliers removed) in {:.1} s",
                 inputs.len(),
@@ -465,6 +681,9 @@ impl ScanCraftApp {
                 thousands(r.outliers),
                 t0.elapsed().as_secs_f32()
             );
+            if left_out > 0 {
+                message.push_str(&format!(" · {} table and loose points left out", thousands(left_out)));
+            }
             if skipped > 0 {
                 message.push_str(&format!(" · {skipped} unaligned pass{} left out", if skipped == 1 { "" } else { "es" }));
             }
@@ -500,8 +719,9 @@ impl ScanCraftApp {
         self.merged = None;
         self.cleaned = None;
         self.mesh = None;
-        self.align_preview = None;
+        self.clear_previews();
         self.picking = None;
+        self.object_picking = None;
         self.selection = None;
         self.highlight = None;
         self.next_pass_id = 1;
@@ -517,8 +737,8 @@ impl ScanCraftApp {
             return;
         }
         let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
-        let passes: Vec<(u32, String, u64, bool, crate::project::PassMeta, SharedTracker)> =
-            self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone())).collect();
+        let passes: Vec<_> =
+            self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone())).collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
         let merged = self.merged.as_ref().map(|m| (m.layer.cloud.clone(), m.passes.clone()));
@@ -529,12 +749,13 @@ impl ScanCraftApp {
             "max_mm": self.settings.max_mm,
             "merge_outliers": self.settings.merge_outliers,
             "merge_sigma": self.settings.merge_sigma,
+            "whole_scene": self.settings.whole_scene,
         });
         self.spawn_job("Saving the project", move || {
             let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker) in passes {
+            for (id, name, frames, visible, meta, tracker, surface) in passes {
                 let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect() });
+                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface });
             }
             let n = stored.len();
             let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned, mesh, settings };
@@ -579,25 +800,21 @@ impl ScanCraftApp {
         if self.has_geometry() {
             self.history.push(self.snapshot("Open project"));
         }
-        self.align_preview = None;
+        self.clear_previews();
         self.picking = None;
+        self.object_picking = None;
         self.highlight = None;
         self.passes.clear();
+        // The open project's results are replaced, not invalidated, by the opened ones.
+        self.merged = None;
+        self.cleaned = None;
+        self.mesh = None;
         let n = opened.passes.len();
-        for lp in opened.passes {
+        for mut lp in opened.passes {
             let g = self.generation();
-            let mut layer = CloudLayer::new(PointCloud::from_points(lp.points), g);
+            let mut layer = CloudLayer::new(PointCloud::from_points(std::mem::take(&mut lp.points)), g);
             layer.visible = lp.stored.visible;
-            self.passes.push(ScanPass {
-                id: lp.stored.id,
-                name: lp.stored.name,
-                layer,
-                frames: lp.stored.frames,
-                tracker: Arc::new(std::sync::Mutex::new(lp.tracker)),
-                keyframes: lp.keyframes,
-                meta: lp.stored.meta,
-                tinted: None,
-            });
+            self.passes.push(loaded_pass(lp, layer));
         }
         // A project without a reference (e.g. edited by hand) gets the first pass.
         if !self.passes.iter().any(|p| p.meta.alignment == AlignState::Reference) {
@@ -643,6 +860,7 @@ impl ScanCraftApp {
         if let Some(v) = opened.settings.get("merge_outliers").and_then(|v| v.as_bool()) {
             self.settings.merge_outliers = v;
         }
+        self.settings.whole_scene = opened.settings.get("whole_scene").and_then(|v| v.as_bool()).unwrap_or(false);
         self.settings.project_path = opened.path.display().to_string();
         self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation: self.next_generation };
         self.selection = None;
@@ -650,5 +868,160 @@ impl ScanCraftApp {
         self.framed_radius = 0.0;
         self.fit_view();
         self.say(Tone::Success, format!("Opened {} · {n} pass{}", self.project.name, if n == 1 { "" } else { "es" }));
+    }
+
+    // ------------------------------------------------------------------ imports
+
+    /// Why a scan file or another project cannot be added now.
+    pub fn import_blocked(&self) -> Option<&'static str> {
+        if self.busy.is_some() {
+            return Some("Another operation is running");
+        }
+        if self.capture != super::Capture::Idle {
+            return Some("Stop the capture first");
+        }
+        None
+    }
+
+    /// Reads a PLY, OBJ or STL file as a new, unaligned pass (undoable).
+    pub fn import_scan(&mut self, path: PathBuf) {
+        if self.import_blocked().is_some() {
+            return;
+        }
+        if path.as_os_str().is_empty() {
+            self.say(Tone::Error, "Enter the scan file to import");
+            return;
+        }
+        let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        self.spawn_undoable(&format!("Importing {file}"), &format!("import {file}"), move || match crate::imports::read_scan(&path) {
+            Ok(scan) => JobResult::Imported(Box::new(scan)),
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    /// Appends the passes of the project in `dir`, unaligned and with fresh ids (undoable).
+    pub fn add_project(&mut self, dir: PathBuf) {
+        if self.import_blocked().is_some() {
+            return;
+        }
+        if !scancraft_io::project::is_project(&dir) {
+            self.say(Tone::Error, format!("{} holds no {}", dir.display(), scancraft_io::project::PROJECT_FILE));
+            return;
+        }
+        let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+        self.spawn_undoable(&format!("Adding {label}"), &format!("add project {label}"), move || match crate::imports::read_project(&dir) {
+            Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
+            Ok((name, passes)) => JobResult::AddedProject { name, passes },
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    /// Adds new passes to the project. If no pass is in the project frame yet, the first of them
+    /// becomes the reference (as the first captured pass does).
+    fn append_passes(&mut self, passes: Vec<ScanPass>) -> usize {
+        let n = passes.len();
+        let first = passes.first().map(|p| p.id);
+        let any_placed = self.passes.iter().any(|p| p.meta.alignment.is_placed());
+        self.clear_previews();
+        self.passes.extend(passes);
+        if let (false, Some(id)) = (any_placed, first) {
+            self.place_pass(id, Transform::default(), AlignState::Reference);
+        }
+        // New passes are shown with the passes, not hidden behind an older result.
+        for p in &mut self.passes {
+            p.layer.visible = true;
+        }
+        if let Some(m) = &mut self.merged {
+            m.layer.visible = false;
+        }
+        if let Some(c) = &mut self.cleaned {
+            c.visible = false;
+        }
+        if let Some(m) = &mut self.mesh {
+            m.visible = false;
+        }
+        self.stage = Stage::Align;
+        self.framed_radius = 0.0;
+        self.fit_view();
+        n
+    }
+
+    pub(super) fn install_imported(&mut self, scan: crate::imports::ImportedScan) {
+        let id = self.next_pass_id;
+        self.next_pass_id += 1;
+        let g = self.generation();
+        let points = scan.surface.len();
+        let taken: Vec<String> = self.passes.iter().map(|p| p.name.clone()).collect();
+        let pass = ScanPass {
+            id,
+            name: crate::imports::unique_name(&scan.name, &taken),
+            layer: CloudLayer::new(PointCloud::from_points(scan.surface.points.clone()), g),
+            frames: 0,
+            tracker: Arc::new(std::sync::Mutex::new(scancraft_slam::Tracker::new())),
+            keyframes: Vec::new(),
+            meta: scan.meta,
+            tinted: None,
+            mask: scan.mask,
+            surface: Some(scan.surface),
+        };
+        let name = pass.name.clone();
+        self.append_passes(vec![pass]);
+        self.selection = Some(Node::Pass(id));
+        let normals = match scan.normals {
+            scancraft_io::NormalSource::File => "normals from the file",
+            scancraft_io::NormalSource::Faces => "normals from its faces",
+            scancraft_io::NormalSource::Estimated => "normals estimated",
+            scancraft_io::NormalSource::None => "no normals",
+        };
+        self.say(Tone::Success, format!("Imported {name} · {} points, {normals}. Next: Align All", thousands(points)));
+        if scan.likely_metres {
+            self.show_choice_toast(format!("{name} is under {} units across, so probably in metres.", crate::imports::METRES_MAX_EXTENT), ToastAction::MetresToMm(id));
+        }
+    }
+
+    pub(super) fn install_added(&mut self, project: String, mut passes: Vec<LoadedPass>) {
+        let taken: Vec<String> = self.passes.iter().map(|p| p.name.clone()).collect();
+        self.next_pass_id = crate::imports::remap(&mut passes, self.next_pass_id, &taken, &project);
+        let added: Vec<ScanPass> = passes
+            .into_iter()
+            .map(|mut lp| {
+                let g = self.generation();
+                let layer = CloudLayer::new(PointCloud::from_points(std::mem::take(&mut lp.points)), g);
+                loaded_pass(lp, layer)
+            })
+            .collect();
+        let n = self.append_passes(added);
+        self.say(Tone::Success, format!("Added {n} pass{} from {project}, unaligned. Next: Align All", if n == 1 { "" } else { "es" }));
+    }
+
+    /// Multiplies an imported pass's coordinates by `factor` (e.g. metres to mm; undoable). An
+    /// aligned pass goes back to its own frame, as its alignment no longer fits.
+    pub fn scale_pass(&mut self, id: u32, factor: f32) {
+        if !self.can_edit() {
+            return;
+        }
+        let Some(surface) = self.passes.iter().find(|p| p.id == id).and_then(|p| p.surface.clone()) else { return };
+        let name = self.pass_name(id);
+        self.history.push(self.snapshot(&format!("scale {name}")));
+        self.clear_previews();
+        let surface = Arc::new(crate::imports::scaled(&surface, factor));
+        let g = self.generation();
+        let Some(p) = self.passes.iter_mut().find(|p| p.id == id) else { return };
+        if matches!(p.meta.alignment, AlignState::Aligned { .. }) {
+            p.meta.alignment = AlignState::Unaligned;
+            p.meta.transform = Transform::default();
+        }
+        let visible = p.layer.visible;
+        p.layer = CloudLayer::new(PointCloud::from_points(project::place(surface.points.clone(), &p.meta.transform)), g);
+        p.layer.visible = visible;
+        p.surface = Some(surface);
+        p.mask = isolation::new_cache();
+        p.tinted = None;
+        self.merged = None;
+        self.invalidate_derived(&format!("{name} was scaled"));
+        self.framed_radius = 0.0;
+        self.fit_view();
+        let note = if factor == 1000.0 { " (metres to mm)" } else { "" };
+        self.say(Tone::Success, format!("Scaled {name} by {factor}{note}"));
     }
 }

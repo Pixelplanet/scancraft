@@ -8,9 +8,10 @@
 //! a valid free-space measurement for the tracker's visibility check and carving.
 
 use crate::{DepthSource, FrameGeometry};
-use glam::{Mat3, Vec2, Vec3};
+use glam::{Vec2, Vec3};
 use scancraft_core::{PointCloud, SensorFrame};
-use std::collections::{HashMap, VecDeque};
+use scancraft_fusion::{cell_components, ransac_plane, refine_plane, CellComponents, NormalOrientation, PlaneSearch};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurntableConfig {
@@ -158,73 +159,26 @@ fn median(values: &mut [f32]) -> f32 {
     *values.select_nth_unstable_by(mid, f32::total_cmp).1
 }
 
-/// Least-squares plane through `points`: (unit normal, centroid).
-fn fit_plane(points: &[Vec3]) -> Option<(Vec3, Vec3)> {
-    if points.len() < 3 {
-        return None;
-    }
-    let c = points.iter().sum::<Vec3>() / points.len() as f32;
-    let mut cov = Mat3::ZERO;
-    for p in points {
-        let d = *p - c;
-        cov += Mat3::from_cols(d * d.x, d * d.y, d * d.z);
-    }
-    // Smallest eigenvector by inverse iteration on the (slightly regularised) covariance.
-    let inv = (cov + Mat3::IDENTITY * (1e-6 * cov.determinant().abs().cbrt() + 1e-6)).inverse();
-    let mut n = Vec3::new(0.3, 0.3, 0.9).normalize();
-    for _ in 0..40 {
-        n = (inv * n).normalize_or_zero();
-        if n == Vec3::ZERO {
-            return None;
-        }
-    }
-    Some((n, c))
-}
-
 /// Finds the turntable plane and the object on it in pooled sensor-frame points.
 pub fn estimate_region(points: &[Vec3], config: &TurntableConfig) -> Option<TurntableRegion> {
     if points.len() < 500 {
         return None;
     }
-    // 1. Plane: RANSAC, preferring planes whose normal points up in the sensor frame.
+    // 1. Plane: RANSAC, preferring planes whose normal points up in the sensor frame, oriented
+    //    towards the sensor (origin): the object side. Then refined on all inliers.
     const INLIER_MM: f32 = 2.0;
-    let mut seed = 0x9e37_79b9u32;
-    let mut rand = |n: usize| {
-        seed ^= seed << 13;
-        seed ^= seed >> 17;
-        seed ^= seed << 5;
-        seed as usize % n
-    };
     let sample: Vec<Vec3> = points.iter().step_by((points.len() / 4000).max(1)).copied().collect();
-    let mut best_up: Option<(usize, Vec3, f32)> = None;
-    let mut best_any: Option<(usize, Vec3, f32)> = None;
-    for _ in 0..400 {
-        let (a, b, c) = (sample[rand(sample.len())], sample[rand(sample.len())], sample[rand(sample.len())]);
-        let mut n = (b - a).cross(c - a).normalize_or_zero();
-        if n == Vec3::ZERO {
-            continue;
-        }
-        // Orient towards the sensor (origin): the object side.
-        if n.dot(a) > 0.0 {
-            n = -n;
-        }
-        let d = n.dot(a);
-        let count = sample.iter().filter(|p| (n.dot(**p) - d).abs() < INLIER_MM).count();
-        if best_any.is_none_or(|(c0, _, _)| count > c0) {
-            best_any = Some((count, n, d));
-        }
-        if n.z >= config.min_up && best_up.is_none_or(|(c0, _, _)| count > c0) {
-            best_up = Some((count, n, d));
-        }
-    }
-    let (_, mut normal, mut offset) = best_up.or(best_any)?;
-    // Refine on all inliers.
-    for _ in 0..2 {
-        let inliers: Vec<Vec3> = points.iter().filter(|p| (normal.dot(**p) - offset).abs() < INLIER_MM).copied().collect();
-        let (n, c) = fit_plane(&inliers)?;
-        normal = if n.dot(normal) < 0.0 { -n } else { n };
-        offset = normal.dot(c);
-    }
+    let search = PlaneSearch {
+        iterations: 400,
+        inlier_mm: INLIER_MM,
+        orientation: NormalOrientation::TowardsPoint(Vec3::ZERO),
+        prefer: Some((Vec3::Z, config.min_up)),
+        seed: 0x9e37_79b9,
+        ..PlaneSearch::default()
+    };
+    let plane = refine_plane(points, ransac_plane(&sample, None, &search)?.plane, &[INLIER_MM; 2])?;
+    let normal = plane.normal;
+    let mut offset = -plane.d;
 
     // 2. Object: points above the plane, clustered on a grid in plane coordinates, starting from
     //    the one nearest the optical axis (the user aims at the object).
@@ -249,29 +203,7 @@ pub fn estimate_region(points: &[Vec3], config: &TurntableConfig) -> Option<Turn
     // Connected components of occupied cells. Gaps of up to one empty cell are bridged: parts of
     // one object often do not touch in view (occlusion, dropped silhouette pixels), while the
     // background is usually further away. Cells with a single point are noise and bridge nothing.
-    let mut component: HashMap<[i32; 2], usize> = HashMap::new();
-    let mut sizes: Vec<usize> = Vec::new();
-    for (&start, &count) in &occupancy {
-        if count < 2 || component.contains_key(&start) {
-            continue;
-        }
-        let id = sizes.len();
-        sizes.push(0);
-        component.insert(start, id);
-        let mut queue = VecDeque::from([start]);
-        while let Some(c) = queue.pop_front() {
-            sizes[id] += occupancy[&c];
-            for dx in -2..=2 {
-                for dy in -2..=2 {
-                    let n = [c[0] + dx, c[1] + dy];
-                    if occupancy.get(&n).copied().unwrap_or(0) >= 2 && !component.contains_key(&n) {
-                        component.insert(n, id);
-                        queue.push_back(n);
-                    }
-                }
-            }
-        }
-    }
+    let CellComponents { label: component, sizes } = cell_components(&occupancy, 2, 2);
     // The object: the user aims at it, and it stands in front of any background. Among the
     // sizeable components (at least 5 % of the points above the plane) reaching within 15 degrees
     // of the optical axis, take the nearest one (median distance); failing that, the component
@@ -338,7 +270,7 @@ pub fn estimate_region(points: &[Vec3], config: &TurntableConfig) -> Option<Turn
 mod tests {
     use super::*;
     use crate::OnDeviceDepth;
-    use glam::Quat;
+    use glam::{Mat3, Quat};
     use scancraft_core::{DepthMap, PinholeIntrinsics, Transform};
     use scancraft_slam::{Tracker, TrackingState};
 

@@ -3,8 +3,11 @@
 //! `scancraft --mock` connects the built-in simulated scanner at start;
 //! `scancraft --connect <ip>` connects a network scanner at start.
 
+mod alignment;
 mod app;
 mod dev;
+mod imports;
+mod isolation;
 mod model;
 mod project;
 mod replay;
@@ -66,7 +69,7 @@ impl ScanCraft {
             if app.display_menu {
                 app.display_menu = false;
             } else {
-                app.tool = None;
+                app.close_tool();
             }
         }
     }
@@ -83,6 +86,11 @@ impl eframe::App for ScanCraft {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
+        // Scan files and project folders dropped on the window are added as passes.
+        let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
+        if !dropped.is_empty() {
+            self.app.queue_imports(dropped);
+        }
         self.app.poll_jobs();
         self.app.poll_device_events();
         self.app.poll_updates(&ctx);

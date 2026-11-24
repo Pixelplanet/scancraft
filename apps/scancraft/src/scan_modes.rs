@@ -223,8 +223,10 @@ mod tests {
         assert!(find(&o.lights, LightSource::ParallelLines).is_none(), "unsupported light hidden");
         assert!(find(&o.objects, ObjectType::Head).is_none(), "unsupported object hidden");
         assert!(find(&o.lights, LightSource::FullFieldHd).unwrap().enabled());
-        let hybrid = find(&o.lights, LightSource::HybridHd).unwrap();
-        assert!(hybrid.disabled.as_ref().unwrap().starts_with("Not available yet"));
+        // Hybrid HD works on firmware v5.3.99 (2026-11-10); the turntable is not built yet.
+        assert!(find(&o.lights, LightSource::HybridHd).unwrap().enabled());
+        let turntable = find(&o.lights, LightSource::Turntable).unwrap();
+        assert!(turntable.disabled.as_ref().unwrap().starts_with("Not available yet"), "{:?}", turntable.disabled);
         assert!(find(&o.objects, ObjectType::Dark).unwrap().enabled());
         assert!(find(&o.tracking, TrackingMode::Color).unwrap().enabled());
         assert!(find(&o.tracking, TrackingMode::Marker).unwrap().enabled());

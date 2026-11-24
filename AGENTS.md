@@ -221,3 +221,14 @@ laser model are not built.
   (`vcsel.md`, `hybrid.md`, `laser.md`, `modes.md` section 8, the first protocol write-ups). A
   statically linked Windows build of the app and the main check tools is attached to the GitHub
   release. No scanner tests in this session (scanner offline).
+- 2026-11-24 — Merging and AI plan (`docs/architecture/merge-and-ai.md`, user decisions in §1;
+  research in `docs/research/2026-11-24-*`). Licence files added. Alignment rebuilt and tested on
+  three Revo Scan scans of a thin shell part (one outside, two inside, which share only the rim
+  with the outside): exact k-d tree (kiddo mis-handles exact ties), table veto, wall-aware
+  ("shell") quality with piercing and slide checks, `align_robust`, `align_all` pose graph
+  (composes S1↔S2 through S3), `refine_shell`; object isolation `scancraft-fusion::segment_object`
+  used by default. App: Align All, Refine preview, stale cleaned/mesh fixes, Isolate Object, Import
+  Scan (PLY/OBJ/STL), Add Project. Checked against Revo's `marker_framework.mkf` marker positions:
+  0.2–0.27° / ≤0.6 mm. Real-data test: `crates/scancraft-align/tests/real_data.rs`
+  (`SCANCRAFT_ALIGN_DATA`). Solid-model meshing (watertight wall, holes, marker removal) in progress
+  in `scancraft-mesh`.
