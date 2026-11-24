@@ -13,3 +13,10 @@ rayon.workspace = true
 log.workspace = true
 thiserror.workspace = true
 kiddo = "4"
+
+[dev-dependencies]
+# examples/align_ply.rs: loads PLY scans, removes the table, renders PNG views of the result.
+scancraft-io.workspace = true
+scancraft-fusion.workspace = true
+image.workspace = true
+env_logger.workspace = true

@@ -65,4 +65,5 @@ Contributors and agents: read [AGENTS.md](AGENTS.md) and [docs/HANDOFF.md](docs/
 
 ## Licence
 
-MIT or Apache-2.0, at your option. Third-party notices: `apps/scancraft/ATTRIBUTION.md`.
+MIT or Apache-2.0, at your option ([LICENSE-MIT](LICENSE-MIT), [LICENSE-APACHE](LICENSE-APACHE)).
+Third-party notices: `apps/scancraft/ATTRIBUTION.md`.

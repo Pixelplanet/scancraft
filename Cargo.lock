@@ -6913,11 +6913,15 @@ dependencies = [
 name = "scancraft-align"
 version = "0.1.0"
 dependencies = [
+ "env_logger",
  "glam 0.29.3",
+ "image",
  "kiddo",
  "log",
  "rayon",
  "scancraft-core",
+ "scancraft-fusion",
+ "scancraft-io",
  "scancraft-slam",
  "thiserror 2.0.21",
 ]
