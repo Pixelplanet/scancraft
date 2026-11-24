@@ -17,3 +17,6 @@ target/
 
 # Editor settings
 .vscode/
+
+# Scan projects and test data (local only; see AGENTS.md "Test data stays out of the repository")
+Projects/
