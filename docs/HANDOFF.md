@@ -10,6 +10,13 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-24 late (original PC): start with [open-issues.md](open-issues.md).** The branch
+below is merged into `main`. A review found bugs in it, and the new mesher was compared with the
+old one on the Revo shell scans. It is smoother on plain areas but destroys small raised detail.
+The user also added requests: New Project in a new tab with a confirmation instead of silently
+discarding the project, consistent placement of confirm buttons, and an Undo/Redo timeline. All
+of that is written down there, with a suggested order. None of it is fixed yet.
+
 **Update 2026-11-24 evening (branch `feature/clean-per-pass-meshing`, second PC).** On top of the
 solid-model commit:
 - **File dialogs:** Import Scan, Add Project and Open Project open native Windows dialogs

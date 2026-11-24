@@ -242,3 +242,9 @@ laser model are not built.
   `crates/scancraft-mesh/examples/mesh_project.rs`. Not wired yet: `solid::build_solid` in the
   app. See `docs/HANDOFF.md` §1 (top update). Test data stays in an untracked `Scans/` folder
   (excluded locally via `.git/info/exclude`).
+- 2026-11-24 (late, original PC) — Branch merged into `main` (author e-mail rewritten to the
+  noreply address). Workspace tests: 303 passed, 7 ignored. Review plus adversarial
+  verification and an old-vs-new mesher comparison on the Revo shell scans; results and the
+  user's new requests (project tabs, button placement, history timeline) are in
+  `docs/open-issues.md`. Nothing fixed yet. Commit author must be the GitHub noreply address on
+  every machine.
