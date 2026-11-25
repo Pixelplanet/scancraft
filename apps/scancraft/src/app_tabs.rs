@@ -13,7 +13,7 @@ use std::collections::HashMap;
 
 use scancraft_render::{Camera, CameraPreset};
 
-use super::{AlignPreview, Highlight, PairPicking, PosesPreview, ScanCraftApp, Tone};
+use super::{AlignPreview, DatumPicking, Highlight, OrientPreview, PairPicking, PosesPreview, ScalePicking, ScanCraftApp, Tone};
 use crate::ai_segment::AiPicking;
 use crate::isolation::ObjectPicking;
 use crate::model::*;
@@ -31,7 +31,10 @@ pub struct ProjectTab {
     next_start: PassStart,
     align_preview: Option<AlignPreview>,
     poses_preview: Option<PosesPreview>,
+    orient_preview: Option<OrientPreview>,
     picking: Option<PairPicking>,
+    datum_picking: Option<DatumPicking>,
+    scale_picking: Option<ScalePicking>,
     object_picking: Option<ObjectPicking>,
     ai_picking: Option<AiPicking>,
     highlight: Option<Highlight>,
@@ -64,7 +67,10 @@ impl ProjectTab {
             next_start: PassStart::Moved,
             align_preview: None,
             poses_preview: None,
+            orient_preview: None,
             picking: None,
+            datum_picking: None,
+            scale_picking: None,
             object_picking: None,
             ai_picking: None,
             highlight: None,
@@ -111,7 +117,10 @@ impl ScanCraftApp {
         swap(&mut self.next_start, &mut tab.next_start);
         swap(&mut self.align_preview, &mut tab.align_preview);
         swap(&mut self.poses_preview, &mut tab.poses_preview);
+        swap(&mut self.orient_preview, &mut tab.orient_preview);
         swap(&mut self.picking, &mut tab.picking);
+        swap(&mut self.datum_picking, &mut tab.datum_picking);
+        swap(&mut self.scale_picking, &mut tab.scale_picking);
         swap(&mut self.object_picking, &mut tab.object_picking);
         swap(&mut self.ai_picking, &mut tab.ai_picking);
         swap(&mut self.highlight, &mut tab.highlight);

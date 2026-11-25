@@ -554,7 +554,7 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                 }
             }
             // A pending alignment decision gets the footer too (the Accept/Reject rule).
-            let decision = tool.is_none() && app.stage == Stage::Align && (app.poses_preview.is_some() || app.align_preview.is_some());
+            let decision = tool.is_none() && app.stage == Stage::Align && (app.poses_preview.is_some() || app.align_preview.is_some() || app.orient_preview.is_some());
             let footer_h = if tool.is_some() || decision { t.form_footer_height } else { 0.0 };
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height((max_h - t.form_header_height - footer_h - 2.0).max(40.0)).show(ui, |ui| {
                 egui::Frame::NONE.inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 10 }).show(ui, |ui| {
@@ -566,10 +566,17 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                 });
             });
             if tool.is_some() || decision {
+                let pairs_err = if matches!(tool, Some(Tool::PointPairs(_))) && app.picked_pairs().len() >= 3 {
+                    scancraft_align::fit_pairs(&app.picked_pairs()).err().map(|e| e.to_string())
+                } else {
+                    None
+                };
+                let datum_why = if tool == Some(Tool::Datums) { app.datum_apply_blocked() } else { None };
                 let actions = if let Some(tool) = tool {
                     let blocked = app.tool_blocked(tool);
                     let bad_ip = tool == Tool::ConnectIp && !app.ip_valid();
                     let few_pairs = matches!(tool, Tool::PointPairs(_)) && app.picked_pairs().len() < 3;
+                    let scale_why = if matches!(tool, Tool::Scale(_)) { app.scale_apply_blocked() } else { None };
                     let no_ai_object = tool == Tool::AiSegment && app.ai_picking.as_ref().is_none_or(|a| a.kept_count() == 0);
                     let label = match tool {
                         Tool::ConnectIp => "Connect",
@@ -580,10 +587,13 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                         _ => "Apply",
                     };
                     kit::Actions {
-                        primary: Some((label, blocked.is_none() && !bad_ip && !few_pairs && !no_ai_object)),
+                        primary: Some((label, blocked.is_none() && !bad_ip && !few_pairs && !no_ai_object && pairs_err.is_none() && datum_why.is_none() && scale_why.is_none())),
                         primary_tip: blocked
                             .or(bad_ip.then_some("Enter a valid address"))
                             .or(few_pairs.then_some("Pick at least 3 pairs"))
+                            .or(pairs_err.as_deref())
+                            .or(datum_why.as_deref())
+                            .or(scale_why)
                             .or(no_ai_object.then_some("Click a keyframe and run Propagate all first")),
                         cancel: Some("Cancel"),
                         ..Default::default()
@@ -600,6 +610,8 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                             app.close_tool();
                         } else if app.poses_preview.is_some() {
                             app.reject_poses();
+                        } else if app.orient_preview.is_some() {
+                            app.reject_orient();
                         } else {
                             app.discard_preview();
                         }
@@ -609,6 +621,8 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                             app.run_tool(tool);
                         } else if app.poses_preview.is_some() {
                             app.accept_poses();
+                        } else if app.orient_preview.is_some() {
+                            app.accept_orient();
                         } else {
                             app.accept_preview();
                         }
@@ -772,6 +786,8 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         }
         Tool::Export(_) => export_form(app, ui),
         Tool::PointPairs(id) => pairs_form(app, ui, id),
+        Tool::Datums => crate::ui_orient::datums_form(app, ui),
+        Tool::Scale(id) => crate::ui_orient::scale_form(app, ui, id),
         Tool::IsolateObject => isolate_form(app, ui),
         Tool::AiSegment => crate::ui_ai::ai_segment_form(app, ui),
         Tool::SaveProject => {
@@ -824,6 +840,18 @@ fn pairs_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
     let complete = app.picked_pairs().len();
     ui.add_space(t.space_4);
     kit::row(ui, "Pairs", |ui| kit::value_text(ui, &format!("{complete} complete (3 needed)"), complete < 3));
+    if complete >= 3 {
+        match scancraft_align::fit_pairs(&app.picked_pairs()) {
+            Ok(fit) => {
+                kit::row(ui, "Pick fit", |ui| kit::value_text(ui, &format!("{:.1} mm RMS", fit.rms_mm), false))
+                    .on_hover_text("How well the picked pairs agree before the surfaces are fitted. A few mm is normal.");
+                if fit.spread.nearly_collinear() {
+                    kit::status_line(ui, "The picked points are nearly on a line: add a pair well off that line", t.warning);
+                }
+            }
+            Err(e) => kit::status_line(ui, &e.to_string(), t.error),
+        }
+    }
 }
 
 /// The Isolate Object card: the result so far and the picks.
@@ -1181,6 +1209,11 @@ fn poses_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 };
                 kit::row(ui, &name, |ui| kit::status_line(ui, &text, colour));
             }
+            let unplaced: Vec<String> = o.placements.iter().filter(|p| !p.reference && p.pose.is_none()).map(|p| pass_name(app, p.id)).collect();
+            if !unplaced.is_empty() {
+                let it = if unplaced.len() == 1 { "it" } else { "them" };
+                kit::status_line(ui, &format!("{} could not be placed: after Accept, use Point Pairs for {it}.", unplaced.join(", ")), t.warning);
+            }
             kit::section(ui, "align_all_pairs", "Pairs", true, |ui| {
                 for e in &o.edges {
                     let pair = format!("{} ↔ {}", pass_name(app, e.from), pass_name(app, e.to));
@@ -1235,6 +1268,10 @@ fn poses_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
 
 fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
+    if app.orient_preview.is_some() {
+        crate::ui_orient::orient_preview_body(app, ui);
+        return;
+    }
     if app.poses_preview.is_some() {
         poses_preview_body(app, ui);
         return;
@@ -1387,6 +1424,7 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let mut weight_change = None;
     let mut include_change = None;
     let mut scale = None;
+    let mut scale_tool = None;
     let mut reset = None;
     kit::section(ui, "selection", title, true, |ui| match node {
         Node::Pass(id) => {
@@ -1410,6 +1448,10 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                         scale = Some(id);
                     }
                     ui.add_space(Tokens::get().space_4);
+                }
+                let why = app.scale_blocked(Some(id));
+                if kit::wide_button(ui, "Scale from Lengths…", Button::Normal, why.is_none()).on_hover_text(why.unwrap_or("Pick lengths on the pass, then type their true distances")).clicked() {
+                    scale_tool = Some(id);
                 }
             } else {
                 kit::row(ui, "Size", |ui| kit::value_text(ui, &size, false));
@@ -1479,6 +1521,9 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     });
     if let Some(id) = scale {
         app.scale_pass(id, 1000.0);
+    }
+    if let Some(id) = scale_tool {
+        app.open_tool(Tool::Scale(id));
     }
     if let Some(id) = reset {
         app.reset_cleaning_of(&[id]);

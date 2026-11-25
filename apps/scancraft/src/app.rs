@@ -24,10 +24,13 @@ use crate::project::{self, AlignMethod, AlignState, PassMeta, PassSource, PassSt
 use crate::scan_modes::{self, Choice};
 use crate::worker::{self, WorkerConfig};
 
+#[path = "app_orient.rs"]
+mod orient_ops;
 #[path = "app_project.rs"]
 mod project_ops;
 #[path = "app_tabs.rs"]
 mod tab_ops;
+pub use orient_ops::{DatumKind, DatumPicking, OrientPreview, ScalePicking};
 pub use tab_ops::{ClosePrompt, ProjectTab};
 
 /// Live capture state.
@@ -338,7 +341,13 @@ pub struct ScanCraftApp {
     pub align_preview: Option<AlignPreview>,
     /// Align All or Refine All waiting for Accept / Reject.
     pub poses_preview: Option<PosesPreview>,
+    /// Auto Orient's candidate project frame waiting for Accept / Reject.
+    pub orient_preview: Option<OrientPreview>,
     pub picking: Option<PairPicking>,
+    /// The Orient by Datums tool's picks and the frame they imply.
+    pub datum_picking: Option<DatumPicking>,
+    /// The Scale from Lengths tool's picked lengths on a pass.
+    pub scale_picking: Option<ScalePicking>,
     /// The Isolate Object tool's picks and result.
     pub object_picking: Option<ObjectPicking>,
     /// The AI Segment tool's interactive SAM 2.1 picking/propagation state.
@@ -480,7 +489,10 @@ impl ScanCraftApp {
             next_start: PassStart::Moved,
             align_preview: None,
             poses_preview: None,
+            orient_preview: None,
             picking: None,
+            datum_picking: None,
+            scale_picking: None,
             object_picking: None,
             ai_picking: None,
             ai_engine,
@@ -623,6 +635,7 @@ impl ScanCraftApp {
     pub fn clear_previews(&mut self) {
         self.align_preview = None;
         self.poses_preview = None;
+        self.orient_preview = None;
     }
 
     pub fn folded(&self, key: &str, default_open: bool) -> bool {
@@ -1356,7 +1369,9 @@ impl ScanCraftApp {
         self.picking = None;
         self.object_picking = None;
         self.ai_picking = None;
-        if matches!(self.tool, Some(Tool::IsolateObject | Tool::AiSegment)) {
+        self.datum_picking = None;
+        self.scale_picking = None;
+        if matches!(self.tool, Some(Tool::IsolateObject | Tool::AiSegment | Tool::Datums | Tool::Scale(_))) {
             self.tool = None;
         }
         let merged_visible = self.merged.as_ref().is_none_or(|m| m.layer.visible);
@@ -1679,6 +1694,8 @@ impl ScanCraftApp {
                 Some(_) => None,
             },
             Tool::PointPairs(id) => self.pairs_blocked(id),
+            Tool::Datums => self.datums_blocked(),
+            Tool::Scale(id) => self.scale_blocked(Some(id)),
             Tool::SaveProject => (!self.has_geometry()).then_some("Nothing to save yet"),
             Tool::Export(f) => {
                 if f.needs_mesh() {
@@ -1711,11 +1728,25 @@ impl ScanCraftApp {
         if tool == Tool::AiSegment && !self.start_ai_picking() {
             return;
         }
+        if tool == Tool::Datums && !self.start_datum_picking() {
+            return;
+        }
+        if let Tool::Scale(id) = tool {
+            if !self.start_scale_picking(id) {
+                return;
+            }
+        }
         if tool != Tool::IsolateObject && !tool.is_file() {
             self.object_picking = None;
         }
         if tool != Tool::AiSegment && !tool.is_file() {
             self.ai_picking = None;
+        }
+        if tool != Tool::Datums && !tool.is_file() {
+            self.datum_picking = None;
+        }
+        if !matches!(tool, Tool::Scale(_)) && !tool.is_file() {
+            self.scale_picking = None;
         }
         if tool == Tool::SaveProject {
             if let Some(path) = &self.project.path {
@@ -1738,6 +1769,8 @@ impl ScanCraftApp {
         self.picking = None;
         self.object_picking = None;
         self.ai_picking = None;
+        self.datum_picking = None;
+        self.scale_picking = None;
     }
 
     pub fn set_export_format(&mut self, format: ExportFormat) {
@@ -2340,6 +2373,14 @@ impl ScanCraftApp {
                 self.align_point_pairs(id);
                 return;
             }
+            Tool::Datums => {
+                self.apply_datums();
+                return;
+            }
+            Tool::Scale(id) => {
+                self.apply_scale(id);
+                return;
+            }
             Tool::SaveProject => {
                 let path = trim_quotes(&self.settings.project_path);
                 self.save_project(std::path::PathBuf::from(path));
@@ -2647,6 +2688,7 @@ impl ScanCraftApp {
                     self.say(Tone::Success, message);
                 }
                 JobResult::Aligned { pass, method, alignment, check, message } => self.show_preview(pass, method, alignment, check, message),
+                JobResult::Oriented(result, source) => self.show_orient(*result, source),
                 JobResult::AlignedAll(outcome) => self.show_align_all(*outcome),
                 JobResult::Refined(outcome) => self.show_refinement(*outcome),
                 JobResult::Isolated { segmentation, picks } => {
@@ -2768,6 +2810,7 @@ impl ScanCraftApp {
 mod tests {
     use super::*;
     use crate::alignment::{EdgeChange, RefineOutcome};
+    use glam::Vec3;
     use scancraft_align::{Alignment, Quality};
     use scancraft_core::{Mesh, Point3D};
 
@@ -3555,5 +3598,290 @@ mod tests {
         assert!(app.tool.is_none() && app.ai_picking.is_none());
         app.undo();
         assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
+    }
+
+    // ------------------------------------------------------------------ orientation
+
+    /// A rigid `Transform` from a rotation and a translation.
+    fn rt(rotation: glam::Quat, translation: Vec3) -> Transform {
+        Transform { rotation, translation, ..Transform::default() }
+    }
+
+    /// The two transforms agree up to f32 noise.
+    fn same_transform(a: Transform, b: Transform, eps: f32) -> bool {
+        (a.to_mat4() - b.to_mat4()).to_cols_array().iter().map(|v| v.abs()).fold(0.0, f32::max) < eps
+    }
+
+    /// Surface samples (`spacing` apart) of a box with `half` extents centred on the origin,
+    /// placed by `t`.
+    fn box_points(half: Vec3, spacing: f32, t: Transform) -> Vec<Point3D> {
+        let mut out = Vec::new();
+        for axis in 0..3 {
+            let (u, v) = ((axis + 1) % 3, (axis + 2) % 3);
+            let nu = ((half[u] * 2.0 / spacing) as usize).max(1) + 1;
+            let nv = ((half[v] * 2.0 / spacing) as usize).max(1) + 1;
+            for sign in [-1.0f32, 1.0] {
+                let mut n = Vec3::ZERO;
+                n[axis] = sign;
+                for i in 0..nu {
+                    for j in 0..nv {
+                        let mut p = Vec3::ZERO;
+                        p[axis] = sign * half[axis];
+                        p[u] = -half[u] + i as f32 * (2.0 * half[u] / (nu - 1) as f32);
+                        p[v] = -half[v] + j as f32 * (2.0 * half[v] / (nv - 1) as f32);
+                        out.push(Point3D { position: t.transform_point3(p).to_array(), normal: t.transform_vector3(n).to_array(), ..Point3D::new([0.0; 3]) });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The lateral surface of a cylinder of radius `r` running `z0..z1` on +Z, placed by `t`.
+    fn cylinder_points(r: f32, z0: f32, z1: f32, spacing: f32, t: Transform) -> Vec<Point3D> {
+        let mut out = Vec::new();
+        let na = ((std::f32::consts::TAU * r / spacing) as usize).max(12);
+        let nz = (((z1 - z0) / spacing) as usize).max(2);
+        for i in 0..na {
+            let a = i as f32 * std::f32::consts::TAU / na as f32;
+            let n = Vec3::new(a.cos(), a.sin(), 0.0);
+            for j in 0..=nz {
+                let p = Vec3::new(r * a.cos(), r * a.sin(), z0 + (z1 - z0) * j as f32 / nz as f32);
+                out.push(Point3D { position: t.transform_point3(p).to_array(), normal: t.transform_vector3(n).to_array(), ..Point3D::new([0.0; 3]) });
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn moving_the_project_frame_moves_everything_placed_and_undoes() {
+        let mut app = app();
+        add_pass(&mut app, 1, AlignState::Reference);
+        add_pass(&mut app, 2, AlignState::Aligned { method: AlignMethod::Auto, quality: None });
+        add_pass(&mut app, 3, AlignState::Unaligned);
+        // Pass 2 has a non-identity transform; its layer is placed by it as alignments leave it.
+        let t2 = rt(glam::Quat::from_rotation_y(0.4), Vec3::new(1.0, 2.0, 3.0));
+        app.passes[1].meta.transform = t2;
+        let placed2 = PointCloud::from_points(crate::project::place(app.passes[1].layer.cloud.points.clone(), &t2));
+        let g = app.generation();
+        app.passes[1].layer = CloudLayer::new(placed2, g);
+        // The unaligned pass keeps its own frame even when its transform is not identity.
+        let t3 = rt(glam::Quat::IDENTITY, Vec3::new(9.0, 9.0, 9.0));
+        app.passes[2].meta.transform = t3;
+        let g = app.generation();
+        app.merged = Some(MergedLayer::new(PointCloud::from_points(vec![Point3D::new([1.0, 1.0, 1.0])]), g, vec![1, 2], "test".into()));
+        let mut mesh = Mesh::default();
+        mesh.vertices = vec![Point3D::new([2.0, 2.0, 2.0]), Point3D::new([4.0, 2.0, 2.0]), Point3D::new([2.0, 4.0, 2.0])];
+        let analysis = Mesher::analyze(&mesh);
+        app.mesh = Some(MeshLayer::new(mesh, analysis, app.generation()));
+
+        let t = rt(glam::Quat::from_rotation_z(0.6), Vec3::new(5.0, -3.0, 2.0));
+        let p0 = app.passes[0].layer.cloud.points[0].position;
+        let p2 = app.passes[1].layer.cloud.points[0].position;
+        let p3 = app.passes[2].layer.cloud.points[0].position;
+        let old: Vec<Transform> = app.passes.iter().map(|p| p.meta.transform).collect();
+        // The pass-to-pass transform before the move.
+        let rel_before = scancraft_align::compose(&old[1].inverse(), &old[0]);
+        app.move_project_frame(t, "orient the project");
+
+        let want0 = scancraft_align::compose(&t, &old[0]);
+        let want1 = scancraft_align::compose(&t, &old[1]);
+        assert_eq!(app.passes[0].meta.transform, want0);
+        assert_eq!(app.passes[1].meta.transform, want1);
+        assert!(same_transform(scancraft_align::compose(&want1.inverse(), &want0), rel_before, 1e-4), "the relative transform changed");
+        assert_eq!(app.passes[2].meta.transform, t3, "the unaligned pass moved");
+        let moved0 = Vec3::from(app.passes[0].layer.cloud.points[0].position);
+        let moved2 = Vec3::from(app.passes[1].layer.cloud.points[0].position);
+        assert!((moved0 - t.transform_point3(Vec3::from(p0))).length() < 1e-4);
+        assert!((moved2 - t.transform_point3(Vec3::from(p2))).length() < 1e-4);
+        assert_eq!(app.passes[2].layer.cloud.points[0].position, p3, "the unaligned pass's layer moved");
+        let merged = app.merged.as_ref().expect("the merged model is kept");
+        assert!((Vec3::from(merged.layer.cloud.points[0].position) - t.transform_point3(Vec3::new(1.0, 1.0, 1.0))).length() < 1e-4);
+        let mesh = app.mesh.as_ref().expect("the mesh is kept");
+        assert!((Vec3::from(mesh.mesh.vertices[0].position) - t.transform_point3(Vec3::new(2.0, 2.0, 2.0))).length() < 1e-4);
+
+        app.undo();
+        assert_eq!(app.passes[0].meta.transform, old[0]);
+        assert_eq!(app.passes[1].meta.transform, old[1]);
+        assert_eq!(app.passes[0].layer.cloud.points[0].position, p0);
+        assert_eq!(app.passes[2].layer.cloud.points[0].position, p3);
+        assert_eq!(app.merged.as_ref().unwrap().layer.cloud.points[0].position, [1.0, 1.0, 1.0]);
+        assert_eq!(app.mesh.as_ref().unwrap().mesh.vertices[0].position, [2.0, 2.0, 2.0]);
+        app.redo();
+        assert_eq!(app.passes[0].meta.transform, want0);
+        assert_eq!(app.passes[1].meta.transform, want1);
+    }
+
+    /// The app with one reference pass showing a tilted box with a cylinder standing on it.
+    fn box_and_cylinder_app() -> (ScanCraftApp, Transform) {
+        let mut app = app();
+        add_pass(&mut app, 1, AlignState::Reference);
+        let tilt = rt(glam::Quat::from_rotation_y(0.5) * glam::Quat::from_rotation_x(0.35), Vec3::new(3.0, -2.0, 7.0));
+        let mut points = box_points(Vec3::new(30.0, 30.0, 15.0), 1.0, tilt);
+        points.extend(cylinder_points(8.0, 15.0, 40.0, 0.9, tilt));
+        let g = app.generation();
+        app.passes[0].layer = CloudLayer::new(PointCloud::from_points(points), g);
+        (app, tilt)
+    }
+
+    #[test]
+    fn auto_orient_is_blocked_without_points_and_with_an_open_proposal() {
+        let mut app = app();
+        assert_eq!(app.orient_blocked(), Some("No points to orient: scan or import first"));
+        add_pass(&mut app, 1, AlignState::Reference);
+        assert_eq!(app.orient_blocked(), None);
+        let g = app.generation();
+        app.align_preview = Some(AlignPreview {
+            pass: 1,
+            method: AlignMethod::Auto,
+            alignment: Alignment { transform: Transform::default(), quality: Quality::NONE },
+            check: None,
+            layer: CloudLayer::new(PointCloud::new(), g),
+        });
+        assert_eq!(app.orient_blocked(), Some("Accept or reject the proposed alignment first"));
+    }
+
+    #[test]
+    fn auto_orient_proposes_reject_keeps_and_accept_squares_the_box() {
+        let mut app = app();
+        add_pass(&mut app, 1, AlignState::Reference);
+        let tilt = rt(glam::Quat::from_rotation_y(0.6) * glam::Quat::from_rotation_x(0.35), Vec3::new(3.0, -2.0, 7.0));
+        let g = app.generation();
+        app.passes[0].layer = CloudLayer::new(PointCloud::from_points(box_points(Vec3::new(40.0, 25.0, 15.0), 1.2, tilt)), g);
+
+        app.auto_orient();
+        finish_job(&mut app);
+        let preview = app.orient_preview.as_ref().expect("Auto Orient proposes an orientation");
+        assert!(preview.result.turned_deg > 1.0, "the tilted box needs a real turn");
+        assert_eq!(app.passes[0].meta.transform, Transform::default(), "the proposal moves nothing");
+        let p0 = app.passes[0].layer.cloud.points[0].position;
+
+        app.reject_orient();
+        assert!(app.orient_preview.is_none());
+        assert_eq!(app.passes[0].layer.cloud.points[0].position, p0, "reject left the model as it was");
+
+        app.auto_orient();
+        finish_job(&mut app);
+        assert!(app.orient_preview.is_some());
+        app.accept_orient();
+        assert!(app.orient_preview.is_none());
+        let mut min_z = f32::INFINITY;
+        let cos_1_5_deg = 1.5f32.to_radians().cos();
+        for p in &app.passes[0].layer.cloud.points {
+            min_z = min_z.min(p.position[2]);
+            let n = Vec3::from(p.normal).normalize();
+            assert!(n.abs().max_element() > cos_1_5_deg, "face normal {n} is not on a world axis");
+        }
+        assert!(min_z.abs() < 0.3, "the base sits on the grid, min z {min_z}");
+        assert_eq!(app.history.undo_label(), Some("orient the project"));
+        app.undo();
+        assert_eq!(app.passes[0].meta.transform, Transform::default());
+        assert_eq!(app.passes[0].layer.cloud.points[0].position, p0);
+    }
+
+    #[test]
+    fn datums_square_the_project_to_a_picked_plane_and_axis() {
+        let (mut app, tilt) = box_and_cylinder_app();
+        app.open_tool(Tool::Datums);
+        assert!(app.datum_picking.is_some(), "the tool built its surface");
+        // Click the box's bottom face (the whole model is on its other side) and the
+        // cylinder's wall (axis).
+        let base = tilt.transform_point3(Vec3::new(0.0, 0.0, -15.0));
+        let wall = tilt.transform_point3(Vec3::new(8.0, 0.0, 27.0));
+        app.datum_pick(base);
+        app.set_datum_kind(DatumKind::Axis);
+        app.datum_pick(wall);
+        let d = app.datum_picking.as_ref().unwrap();
+        assert!(d.plane.is_some() && d.axis.is_some(), "both datums fitted");
+        let frame = d.frame.as_ref().expect("two datums give a frame").as_ref().expect("the choices do not conflict");
+        // The cylinder's axis goes onto Z.
+        let axis_dir = match d.axis.as_ref().unwrap().1.primitive {
+            scancraft_align::Primitive::Cylinder { axis, .. } => axis,
+            _ => panic!("the axis datum is a cylinder"),
+        };
+        let moved = frame.transform.transform_vector3(axis_dir).normalize();
+        assert!(moved.dot(Vec3::Z).abs() > 0.5f32.to_radians().cos(), "axis {moved} not within 0.5 deg of Z");
+        assert!(app.datum_apply_blocked().is_none());
+
+        app.apply_datums();
+        // The picked face lies on the floor and the whole model sits above it.
+        let mut min_z = f32::INFINITY;
+        for p in &app.passes[0].layer.cloud.points {
+            min_z = min_z.min(p.position[2]);
+            assert!(p.position[2] > -0.5, "a point went below the floor");
+        }
+        assert!(min_z.abs() < 0.3, "the picked face sits on z = 0, min z {min_z}");
+        assert!(app.datum_picking.is_none() && app.tool.is_none(), "Apply closed the tool");
+    }
+
+    #[test]
+    fn a_conflicting_datum_choice_cannot_be_applied() {
+        let (mut app, tilt) = box_and_cylinder_app();
+        app.open_tool(Tool::Datums);
+        app.datum_pick(tilt.transform_point3(Vec3::new(0.0, 0.0, -15.0)));
+        app.set_datum_kind(DatumKind::Axis);
+        app.datum_pick(tilt.transform_point3(Vec3::new(8.0, 0.0, 27.0)));
+        // The axis is parallel to the plane's normal: it cannot lie in the plane.
+        app.set_axis_onto(scancraft_align::WorldAxis::X);
+        let d = app.datum_picking.as_ref().unwrap();
+        assert!(matches!(d.frame, Some(Err(scancraft_align::DatumError::Conflict))), "{:?}", d.frame.as_ref().map(|r| r.as_ref().map(|_| ())));
+        assert!(app.datum_apply_blocked().is_some());
+        let before = app.passes[0].meta.transform;
+        app.apply_datums();
+        assert_eq!(app.passes[0].meta.transform, before, "a conflicting frame still applied");
+    }
+
+    /// An imported pass (a stored surface, unaligned) with a few landmark points.
+    fn add_imported(app: &mut ScanCraftApp, id: u32, points: Vec<Point3D>) {
+        add_pass(app, id, AlignState::Unaligned);
+        let g = app.generation();
+        let p = app.passes.iter_mut().find(|p| p.id == id).unwrap();
+        p.meta = crate::project::PassMeta::imported("part.ply".into());
+        p.surface = Some(Arc::new(PointCloud::from_points(points.clone())));
+        p.layer = CloudLayer::new(PointCloud::from_points(points), g);
+    }
+
+    #[test]
+    fn scale_from_lengths_doubles_the_imported_surface() {
+        let mut app = app();
+        let points = vec![Point3D::new([0.0, 0.0, 0.0]), Point3D::new([10.0, 0.0, 0.0]), Point3D::new([0.0, 12.0, 0.0]), Point3D::new([10.0, 12.0, 0.0])];
+        add_imported(&mut app, 1, points);
+        add_pass(&mut app, 2, AlignState::Unaligned);
+        assert_eq!(app.scale_blocked(Some(2)), Some("Only an imported pass can be scaled: a captured pass has its true size"));
+        assert_eq!(app.scale_blocked(Some(1)), None);
+        assert_eq!(app.scale_target(), Some(1));
+
+        app.open_tool(Tool::Scale(1));
+        assert_eq!(app.scale_apply_blocked(), Some("Pick two points first"));
+        app.scale_pick(Vec3::new(0.0, 0.0, 0.0));
+        app.scale_pick(Vec3::new(10.0, 0.0, 0.0));
+        app.set_scale_true(0, 20.0);
+        app.scale_pick(Vec3::new(0.0, 0.0, 0.0));
+        app.scale_pick(Vec3::new(0.0, 12.0, 0.0));
+        app.set_scale_true(1, 24.0);
+        let estimate = app.scale_estimate().expect("two lengths give a factor");
+        assert!((estimate.factor - 2.0).abs() < 1e-3, "factor {}", estimate.factor);
+        assert_eq!(app.scale_apply_blocked(), None);
+
+        app.apply_scale(1);
+        let surface = app.passes[0].surface.as_ref().expect("the imported surface is kept");
+        let size = surface.bbox.max - surface.bbox.min;
+        assert!((size.x - 20.0).abs() < 1e-3 && (size.y - 24.0).abs() < 1e-3, "bbox {size:?}");
+        assert!(app.scale_picking.is_none() && app.tool.is_none());
+    }
+
+    #[test]
+    fn point_pairs_report_nearly_collinear_and_degenerate_picks() {
+        let t = rt(glam::Quat::from_rotation_z(0.5), Vec3::new(10.0, 0.0, 0.0));
+        let place = |src: &[Vec3]| src.iter().map(|&p| (p, t.transform_point3(p))).collect::<Vec<_>>();
+        // Nearly on a line (90 mm long, 3.3 mm off it): fits, but the card warns.
+        let warn = place(&[Vec3::new(0.0, 0.0, 0.0), Vec3::new(30.0, 5.0, 0.0), Vec3::new(60.0, 0.0, 0.0), Vec3::new(90.0, 5.0, 0.0)]);
+        let fit = scancraft_align::fit_pairs(&warn).expect("nearly collinear points still fit");
+        assert!(!fit.spread.degenerate());
+        assert!(fit.spread.nearly_collinear());
+        // Exactly on a line: no fit at all.
+        let line = place(&(0..4).map(|i| Vec3::new(i as f32 * 30.0, 0.0, 0.0)).collect::<Vec<_>>());
+        assert_eq!(scancraft_align::fit_pairs(&line).unwrap_err(), scancraft_align::AlignError::Degenerate);
+        assert_eq!(scancraft_align::fit_pairs(&warn[..2]).unwrap_err(), scancraft_align::AlignError::TooFewPairs);
     }
 }

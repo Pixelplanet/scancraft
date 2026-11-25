@@ -62,7 +62,25 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         let isolating = app.tool == Some(crate::model::Tool::IsolateObject) && app.object_picking.is_some();
         let ai_picking = app.tool == Some(crate::model::Tool::AiSegment) && app.ai_picking.is_some();
         let ai_has_preview = ai_picking && app.ai_picking.as_ref().is_some_and(|a| a.preview.is_some());
-        if isolating {
+        // The orientation tools show only what they work on: the proposed orientation, the
+        // datum preview, or the pass being scaled (plus the grid and their pick markers).
+        let datuming = app.tool == Some(crate::model::Tool::Datums) && app.datum_picking.is_some();
+        let scaling = matches!(app.tool, Some(crate::model::Tool::Scale(_))) && app.scale_picking.is_some();
+        let exclusive = app.orient_preview.is_some() || datuming || scaling;
+        if let Some(o) = &app.orient_preview {
+            frame.point_shading = PointShading::Vertex;
+            frame.points.push(PointLayer { generation: o.layer.generation, points: Arc::clone(&o.layer.gpu), overlay: false });
+        } else if datuming {
+            frame.point_shading = PointShading::Vertex;
+            if let Some(d) = &app.datum_picking {
+                frame.points.push(PointLayer { generation: d.layer.generation, points: Arc::clone(&d.layer.gpu), overlay: false });
+            }
+        } else if scaling {
+            let target = app.scale_picking.as_ref().map(|s| s.pass);
+            if let Some(p) = app.passes.iter().find(|p| Some(p.id) == target) {
+                frame.points.push(PointLayer { generation: p.layer.generation, points: Arc::clone(&p.layer.gpu), overlay: false });
+            }
+        } else if isolating {
             frame.point_shading = PointShading::Vertex;
             if let Some(o) = &app.object_picking {
                 frame.points.push(PointLayer { generation: o.generation | 1 << 60, points: Arc::clone(&o.layer), overlay: false });
@@ -92,7 +110,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
                 frame.points.push(PointLayer { generation: p.layer.generation, points: Arc::clone(&p.layer.gpu), overlay: false });
             }
         }
-        if !isolating && !ai_has_preview {
+        if !isolating && !ai_has_preview && !exclusive {
             if let Some(a) = &app.align_preview {
                 frame.points.push(PointLayer { generation: a.layer.generation, points: Arc::clone(&a.layer.gpu), overlay: false });
             }
@@ -120,7 +138,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if let Some((generation, points)) = marker_map_layer(app, &t) {
             frame.points.push(PointLayer { generation, points, overlay: true });
         }
-        if let Some(m) = app.mesh.as_ref().filter(|m| m.visible && !isolating) {
+        if let Some(m) = app.mesh.as_ref().filter(|m| m.visible && !isolating && !exclusive) {
             frame.mesh = Some(GpuMeshLayer { generation: m.generation, mesh: Arc::clone(&m.gpu), faces: true, edges: app.show_edges });
         }
         if app.show_grid {
@@ -153,6 +171,12 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
             camera_input(app, ui, &response, view);
             if isolating {
                 object_picks(app, ui, &response, view);
+            }
+            if datuming {
+                datum_picks(app, ui, &response, view);
+            }
+            if scaling {
+                scale_picks(app, ui, &response, view);
             }
         }
 
@@ -377,6 +401,78 @@ fn object_picks(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response
             let colour = if *keep { t.agent_ok } else { t.error };
             ui.painter().circle(s, 7.0, colour, egui::Stroke::new(1.5, egui::Color32::WHITE));
             ui.painter().text(s, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+}
+
+/// Orient by Datums in the main view: a click fits the datum kind selected in the card. The
+/// picks are drawn in the frame the preview transform puts them (old frame when it is off).
+fn datum_picks(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response, view: Rect) {
+    let t = Tokens::get();
+    let vp = app.camera.view_projection();
+    let preview_t = app.datum_picking.as_ref().and_then(|d| d.applied_transform());
+    if response.clicked() && app.busy.is_none() {
+        if let (Some(pos), Some(d)) = (response.interact_pointer_pos(), app.datum_picking.as_ref()) {
+            let targets = Arc::clone(&d.targets);
+            let place = move |p: glam::Vec3| preview_t.map(|t| t.transform_point3(p)).unwrap_or(p);
+            let hit = pick_point(targets.iter().filter_map(|&p| project(&vp, view, place(p)).map(|(s, dep)| (s, dep, p))), pos);
+            if let Some(p) = hit {
+                app.datum_pick(p);
+            }
+        }
+    }
+    let Some(d) = app.datum_picking.as_ref() else { return };
+    let place = |p: glam::Vec3| preview_t.map(|t| t.transform_point3(p)).unwrap_or(p);
+    if let Some(origin) = d.origin {
+        if let Some((s, _)) = project(&vp, view, place(origin)) {
+            ui.painter().circle(s, 7.0, t.accent, egui::Stroke::new(1.5, egui::Color32::WHITE));
+        }
+    }
+    if let Some((_, fit, _, _)) = &d.axis {
+        if let scancraft_align::Primitive::Cylinder { point, axis, length, .. } = fit.primitive {
+            let a = project(&vp, view, place(point - axis * length * 0.5));
+            let b = project(&vp, view, place(point + axis * length * 0.5));
+            if let (Some((a, _)), Some((b, _))) = (a, b) {
+                ui.painter().line_segment([a, b], egui::Stroke::new(2.0, t.warning));
+            }
+        }
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
+    }
+}
+
+/// Scale from Lengths in the main view: clicks pick the ends of each length; completed pairs
+/// are drawn as numbered rings joined by a line with the measured length.
+fn scale_picks(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response, view: Rect) {
+    let t = Tokens::get();
+    let vp = app.camera.view_projection();
+    if response.clicked() && app.busy.is_none() {
+        if let (Some(pos), Some(s)) = (response.interact_pointer_pos(), app.scale_picking.as_ref()) {
+            let targets = Arc::clone(&s.targets);
+            let hit = pick_point(targets.iter().filter_map(|&p| project(&vp, view, p).map(|(s, d)| (s, d, p))), pos);
+            if let Some(p) = hit {
+                app.scale_pick(p);
+            }
+        }
+    }
+    let Some(s) = app.scale_picking.as_ref() else { return };
+    for (i, pair) in s.pairs.iter().enumerate() {
+        for p in [pair.a].into_iter().chain(pair.b) {
+            if let Some((pt, _)) = project(&vp, view, p) {
+                ui.painter().circle(pt, 7.0, t.accent, egui::Stroke::new(1.5, egui::Color32::WHITE));
+                ui.painter().text(pt, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+            }
+        }
+        if let Some(b) = pair.b {
+            if let (Some((a, _)), Some((bb, _))) = (project(&vp, view, pair.a), project(&vp, view, b)) {
+                ui.painter().line_segment([a, bb], egui::Stroke::new(1.5, t.accent));
+                let mid = egui::pos2((a.x + bb.x) * 0.5, (a.y + bb.y) * 0.5 - 9.0);
+                ui.painter().text(mid, egui::Align2::CENTER_BOTTOM, format!("{:.1} mm", (b - pair.a).length()), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+            }
         }
     }
     if response.hovered() {

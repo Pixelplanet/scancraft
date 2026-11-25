@@ -69,6 +69,10 @@ pub enum Tool {
     Export(ExportFormat),
     /// Split view for picking corresponding points on a pass and the project model.
     PointPairs(u32),
+    /// Click a plane, an axis or a point on the model to make them world datums.
+    Datums,
+    /// Give an imported pass its true size from lengths picked and typed on it.
+    Scale(u32),
     SaveProject,
 }
 
@@ -95,6 +99,8 @@ impl Tool {
             Tool::FillHoles => "Fill Holes",
             Tool::MakeSolid => "Make Solid",
             Tool::Export(_) => "Export",
+            Tool::Datums => "Orient by Datums",
+            Tool::Scale(_) => "Scale from Lengths",
         }
     }
 
@@ -114,6 +120,8 @@ impl Tool {
             Tool::MakeSolid => "body",
             Tool::Export(_) => "export",
             Tool::PointPairs(_) => "point",
+            Tool::Datums => "measure",
+            Tool::Scale(_) => "scale",
             Tool::SaveProject => "save",
         }
     }
@@ -121,7 +129,7 @@ impl Tool {
     pub fn stage(self) -> Stage {
         match self {
             Tool::ConnectIp | Tool::SaveProject => Stage::Connect,
-            Tool::PointPairs(_) => Stage::Align,
+            Tool::PointPairs(_) | Tool::Datums | Tool::Scale(_) => Stage::Align,
             Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject | Tool::AiSegment => Stage::Clean,
             Tool::Reconstruct | Tool::Smooth | Tool::Decimate | Tool::FillHoles | Tool::MakeSolid => Stage::Mesh,
             Tool::Export(_) => Stage::Export,
@@ -515,6 +523,8 @@ pub enum JobResult {
     Rebuilt { pass: u32, points: Vec<Point3D>, keyframes: Vec<KeyframeInfo>, message: String },
     /// A candidate alignment for a pass, to preview before accepting.
     Aligned { pass: u32, method: AlignMethod, alignment: scancraft_align::Alignment, check: Option<AlignCheck>, message: String },
+    /// A candidate orientation for the whole project, and what it was found on.
+    Oriented(Box<scancraft_align::AutoOrient>, &'static str),
     /// Placements for all passes (Align All), to preview before accepting.
     AlignedAll(Box<AlignAllOutcome>),
     /// Refined project <- pass transforms with before / after measures, to preview.

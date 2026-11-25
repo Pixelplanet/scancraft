@@ -520,6 +520,7 @@ fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
             let target = app.align_target();
             let blocked = app.align_blocked(target);
             let picking = matches!(app.tool, Some(Tool::PointPairs(_)));
+            let scaling = matches!(app.tool, Some(Tool::Scale(_)));
             let proposed = app.align_preview.is_some() || app.poses_preview.is_some();
             let all_blocked = app.align_all_blocked();
             vec![
@@ -558,6 +559,14 @@ fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
                     buttons: vec![
                         rb("refine", "update", "Refine All", app.refine_blocked(), false, "Fine-tune all aligned passes together so errors do not add up"),
                         rb("merge", "combine", "Merge", app.merge_blocked(), false, "Fuse the included aligned passes into one model; the passes stay unchanged"),
+                    ],
+                },
+                RibbonGroup {
+                    label: "Orient",
+                    buttons: vec![
+                        rb("auto_orient", "box", "Auto Orient", app.orient_blocked(), false, "Turn the whole project square to the world axes from its own faces, base on the grid; shown as a proposal"),
+                        rb("datums", "measure", "Datums", app.tool_blocked(Tool::Datums).filter(|_| !pressed(Tool::Datums)), pressed(Tool::Datums), "Orient the project from a plane, an axis or a point you click on the model"),
+                        rb("scale", "scale", "Scale", app.scale_blocked(app.scale_target()).filter(|_| !scaling), scaling, "Give an imported pass its true size from lengths you measured"),
                     ],
                 },
                 RibbonGroup {
@@ -708,6 +717,21 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         }
         "refine" => app.refine_all(),
         "merge" => app.merge_passes(),
+        "auto_orient" => app.auto_orient(),
+        "datums" => {
+            if app.tool == Some(Tool::Datums) {
+                app.close_tool();
+            } else {
+                app.open_tool(Tool::Datums);
+            }
+        }
+        "scale" => {
+            if matches!(app.tool, Some(Tool::Scale(_))) {
+                app.close_tool();
+            } else if let Some(id) = app.scale_target() {
+                app.open_tool(Tool::Scale(id));
+            }
+        }
         "colour_passes" => app.colour_passes = !app.colour_passes,
         "isolate" => {
             if app.tool == Some(Tool::IsolateObject) {

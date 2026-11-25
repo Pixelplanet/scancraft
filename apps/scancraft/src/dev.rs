@@ -5,12 +5,15 @@
 //! - `--open <dir>` opens a project at start;
 //! - `--auto <steps>` runs comma-separated steps once the app is idle: `stage:<name>`,
 //!   `select:<pass>`, `selectnode:<merged|mesh|device>`, `start`, `stop`, `same`, `moved`,
-//!   `align`, `alignall`, `accept` (the open proposal: one pass, Align All or Refine All),
-//!   `pairs`, `refine`, `isolate`, `keep`, `merge`, `save:<dir>`, `import:<scan file>`,
+//!   `align`, `alignall`, `accept` (the open proposal: one pass, Align All, Refine All or
+//!   Auto Orient), `pairs`, `refine`, `isolate`, `keep`, `merge`, `save:<dir>`,
+//!   `import:<scan file>`, `autoorient`, `rejectorient`, `datumkind:<plane|axis|point>`,
+//!   `datumonto:<plane|axis>:<xy|yz|zx|x|y|z>`, `datumflip:<plane|axis>` (toggles),
+//!   `scaletrue:<pair index>:<mm>`,
 //!   `addproject:<dir>`, `metres` (the toast's metres-to-mm conversion),
 //!   `wholescene:<on|off>`, `fit`, `wait:<frames>`, `tool:<name>` (connectip, plane, outliers,
 //!   crop, downsample, isolate, reconstruct, smooth, decimate, fillholes, makesolid, save,
-//!   export, pairs), `closetool`, `size:<w>,<h>` (window inner size in points),
+//!   export, pairs, datums, scale), `closetool`, `size:<w>,<h>` (window inner size in points),
 //!   `rename:<project name>`, `askquit` (the unsaved-changes quit question),
 //!   `drag:<x>,<y>,<dx>,<dy>` (a left-button drag in points, injected as egui input so it works
 //!   without window focus), `rclick:<x>,<y>` (a right-button click, for context menus),
@@ -249,6 +252,8 @@ impl Script {
                     "save" => Some(Tool::SaveProject),
                     "export" => Some(Tool::Export(app.settings.export_format)),
                     "pairs" => app.align_target().map(Tool::PointPairs),
+                    "datums" => Some(Tool::Datums),
+                    "scale" => app.scale_target().map(Tool::Scale),
                     _ => None,
                 };
                 match tool {
@@ -281,8 +286,71 @@ impl Script {
             "accept" => {
                 if app.poses_preview.is_some() {
                     app.accept_poses();
+                } else if app.orient_preview.is_some() {
+                    app.accept_orient();
                 } else {
                     app.accept_preview();
+                }
+            }
+            "autoorient" => app.auto_orient(),
+            "rejectorient" => app.reject_orient(),
+            "datumkind" => {
+                let kind = match arg {
+                    "plane" => Some(crate::app::DatumKind::Plane),
+                    "axis" => Some(crate::app::DatumKind::Axis),
+                    "point" => Some(crate::app::DatumKind::Point),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    app.set_datum_kind(kind);
+                }
+            }
+            "datumonto" => {
+                if let Some((which, onto)) = arg.split_once(':') {
+                    match which {
+                        "plane" => {
+                            let w = match onto {
+                                "xy" => Some(scancraft_align::WorldPlane::XY),
+                                "yz" => Some(scancraft_align::WorldPlane::YZ),
+                                "zx" => Some(scancraft_align::WorldPlane::ZX),
+                                _ => None,
+                            };
+                            if let Some(w) = w {
+                                app.set_plane_onto(w);
+                            }
+                        }
+                        "axis" => {
+                            let w = match onto {
+                                "x" => Some(scancraft_align::WorldAxis::X),
+                                "y" => Some(scancraft_align::WorldAxis::Y),
+                                "z" => Some(scancraft_align::WorldAxis::Z),
+                                _ => None,
+                            };
+                            if let Some(w) = w {
+                                app.set_axis_onto(w);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "datumflip" => {
+                let flip = app.datum_picking.as_ref().and_then(|d| match arg {
+                    "plane" => d.plane.as_ref().map(|(.., f)| !f),
+                    "axis" => d.axis.as_ref().map(|(.., f)| !f),
+                    _ => None,
+                });
+                match (arg, flip) {
+                    ("plane", Some(f)) => app.set_plane_flip(f),
+                    ("axis", Some(f)) => app.set_axis_flip(f),
+                    _ => {}
+                }
+            }
+            "scaletrue" => {
+                if let Some((i, mm)) = arg.split_once(':') {
+                    if let (Ok(i), Ok(mm)) = (i.parse::<usize>(), mm.parse::<f32>()) {
+                        app.set_scale_true(i, mm);
+                    }
                 }
             }
             "isolate" => {

@@ -286,7 +286,7 @@ impl ScanCraftApp {
     // ------------------------------------------------------------------ placing passes
 
     /// Moves a pass to a new project <- pass transform (its layer follows).
-    fn place_pass(&mut self, id: u32, transform: Transform, alignment: AlignState) {
+    pub(super) fn place_pass(&mut self, id: u32, transform: Transform, alignment: AlignState) {
         let g = self.generation();
         let Some(p) = self.passes.iter_mut().find(|p| p.id == id) else { return };
         let delta = scancraft_align::compose(&transform, &p.meta.transform.inverse());
