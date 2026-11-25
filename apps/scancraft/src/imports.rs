@@ -68,7 +68,34 @@ pub fn read_scan(path: &Path) -> Result<ImportedScan, String> {
     let mask = isolation::new_cache();
     // The object is worked out now, as it would be for a captured pass when first needed.
     isolation::mask_for(&mask, &project::fixed_cloud(&surface).points);
-    Ok(ImportedScan { name: file.clone(), meta: PassMeta::imported(file), surface: Arc::new(surface), mask, likely_metres, normals: scan.normal_source })
+    Ok(ImportedScan { name: pass_name_for(path), meta: PassMeta::imported(file), surface: Arc::new(surface), mask, likely_metres, normals: scan.normal_source })
+}
+
+/// File names scanning programs give every export, which say nothing about the scan. Revo Scan
+/// writes `raw_preview.ply` into each project folder, so three imported Revo scans used to
+/// become "raw_preview.ply", "raw_preview.ply 2", "raw_preview.ply 3".
+const GENERIC_NAMES: &[&str] = &[
+    "raw_preview", "preview", "scan", "scans", "mesh", "model", "cloud", "pointcloud", "point_cloud", "points", "fused", "merged",
+    "export", "output", "result", "untitled", "data",
+];
+
+/// The pass name for an imported file: its name without the extension, or, when that is a
+/// generic export name, the name of the folder it is in (the scanning program's project).
+pub fn pass_name_for(path: &Path) -> String {
+    let stem = path.file_stem().map(|s| s.to_string_lossy().trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Scan".into());
+    // "raw_preview1", "scan_2", "Mesh 3": a generic name with a counter is still generic.
+    let generic = |s: &str| {
+        let key = s.to_ascii_lowercase().replace([' ', '-'], "_");
+        GENERIC_NAMES.contains(&key.trim_end_matches(|c: char| c.is_ascii_digit() || c == '_'))
+    };
+    if !generic(&stem) {
+        return stem;
+    }
+    path.parent()
+        .and_then(|d| d.file_name())
+        .map(|n| n.to_string_lossy().trim().to_string())
+        .filter(|n| !n.is_empty() && !generic(n))
+        .unwrap_or(stem)
 }
 
 /// Passes of another project, prepared to be appended: each in its own frame (identity
@@ -76,29 +103,35 @@ pub fn read_scan(path: &Path) -> Result<ImportedScan, String> {
 pub fn read_project(dir: &Path) -> Result<(String, Vec<LoadedPass>), String> {
     let stored = project::load(dir).map_err(|e| format!("Could not add the project: {e}"))?;
     let name = stored.name.clone();
-    let passes: Vec<project::StoredPass> = stored
-        .passes
+    Ok((name.clone(), prepare_added(&name, stored.passes)))
+}
+
+/// Passes of project `name` made ready to append (see [`read_project`]): own frame, unaligned,
+/// shown, marked as added from `name`, trackers rebuilt from their keyframes (so the two
+/// projects never share one).
+pub fn prepare_added(name: &str, passes: Vec<project::StoredPass>) -> Vec<LoadedPass> {
+    let passes: Vec<project::StoredPass> = passes
         .into_iter()
         .map(|mut p| {
             p.meta.transform = Transform::default();
             p.meta.alignment = AlignState::Unaligned;
             if !matches!(p.meta.origin, PassOrigin::File { .. }) {
-                p.meta.origin = PassOrigin::Project { source: name.clone() };
+                p.meta.origin = PassOrigin::Project { source: name.to_string() };
             }
             p.visible = true;
             p
         })
         .collect();
     use rayon::prelude::*;
-    Ok((name, passes.into_par_iter().map(project::rebuild).collect()))
+    passes.into_par_iter().map(project::rebuild).collect()
 }
 
-/// `name` if no pass has it yet, else `name 2`, `name 3`, ...
+/// `name` if no pass has it yet, else `name (2)`, `name (3)`, ...
 pub fn unique_name(name: &str, taken: &[String]) -> String {
     let mut candidate = name.to_string();
     let mut k = 2;
     while taken.contains(&candidate) {
-        candidate = format!("{name} {k}");
+        candidate = format!("{name} ({k})");
         k += 1;
     }
     candidate
@@ -126,7 +159,7 @@ mod tests {
     use scancraft_driver::ScanConfig;
 
     fn loaded(id: u32, name: &str) -> LoadedPass {
-        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new() };
+        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None };
         project::rebuild(stored)
     }
 
@@ -139,9 +172,21 @@ mod tests {
         assert_eq!(ids, vec![5, 6, 7]);
         let names: Vec<&str> = passes.iter().map(|p| p.stored.name.as_str()).collect();
         assert_eq!(names, vec!["Pass 1 (Other)", "Flipped", "Pass 1 (Other) (Other)"]);
-        let taken = vec!["scan.ply".to_string(), "scan.ply 2".to_string()];
-        assert_eq!(unique_name("scan.ply", &taken), "scan.ply 3");
-        assert_eq!(unique_name("other.ply", &taken), "other.ply");
+        let taken = vec!["Bracket".to_string(), "Bracket (2)".to_string()];
+        assert_eq!(unique_name("Bracket", &taken), "Bracket (3)");
+        assert_eq!(unique_name("Shell", &taken), "Shell");
+    }
+
+    #[test]
+    fn imported_passes_are_named_after_the_file_or_its_folder() {
+        assert_eq!(pass_name_for(Path::new("C:/scans/bracket top.ply")), "bracket top");
+        // Revo Scan's generic export name: the project folder says what the scan is.
+        assert_eq!(pass_name_for(Path::new("C:/Revo/Shell inside 2/raw_preview.ply")), "Shell inside 2");
+        assert_eq!(pass_name_for(Path::new("C:/Revo/Shell/Mesh.STL")), "Shell");
+        assert_eq!(pass_name_for(Path::new("C:/Revo/Shell outside/raw_preview1.ply")), "Shell outside");
+        // A generic folder too: keep the file's name.
+        assert_eq!(pass_name_for(Path::new("C:/data/raw_preview.ply")), "raw_preview");
+        assert_eq!(pass_name_for(Path::new("raw_preview.ply")), "raw_preview");
     }
 
     #[test]
@@ -152,7 +197,7 @@ mod tests {
         let path = dir.join("part.ply");
         scancraft_io::save_ply_binary(&PointCloud::from_points(points), &path).unwrap();
         let scan = read_scan(&path).unwrap();
-        assert_eq!(scan.name, "part.ply");
+        assert_eq!(scan.name, "part");
         assert_eq!(scan.surface.len(), 400);
         assert_eq!(scan.meta.origin, PassOrigin::File { source: "part.ply".into() });
         assert_eq!(scan.meta.alignment, AlignState::Unaligned);

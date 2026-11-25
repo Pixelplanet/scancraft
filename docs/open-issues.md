@@ -275,8 +275,9 @@ History is per tab. New Project opens a new tab; Open Project opens into a new t
 current one is empty. Closing a tab with unsaved changes asks Save / Discard changes / Cancel
 (Save without a folder opens Save Project and closes after it worked; a failed save keeps the
 tab); quitting with unsaved tabs asks Quit without saving / Cancel. Previews, highlights and
-outlines no longer mark a project as changed (`preview_generation`). Not done: Add Project from
-another open tab, Save All on quit. Tests: `new_project_opens_a_tab_and_keeps_the_open_one`,
+outlines no longer mark a project as changed (`preview_generation`). Add Project from another open tab:
+done 2026-11-25 (right-click the other tab → Add Passes to …; its passes are rebuilt from their
+keyframes, so the two projects never share a tracker). Not done: Save All on quit. Tests: `new_project_opens_a_tab_and_keeps_the_open_one`,
 `closing_a_tab_with_unsaved_changes_asks_first`, `save_and_close_closes_only_after_saving`,
 `tabs_cannot_switch_while_a_job_runs`, `previews_do_not_mark_the_project_changed`.
 

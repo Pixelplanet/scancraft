@@ -73,7 +73,7 @@ fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
         keyframes: lp.keyframes,
         meta: lp.stored.meta,
         tinted: None,
-        mask: isolation::new_cache(),
+        mask: isolation::cache_with(lp.stored.mask),
         surface: lp.stored.surface,
         edit: lp.stored.edit,
         rgb_keyframes: lp.stored.rgb_keyframes,
@@ -252,7 +252,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(id);
-        self.record(self.snapshot(&format!("make {name} the reference")));
+        self.record(self.snapshot(&format!("Make {name} the Reference")));
         self.clear_previews();
         self.rebase_project(id);
         self.say(Tone::Normal, format!("{name} is the reference; the project frame is now its frame"));
@@ -264,7 +264,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(id);
-        self.record(self.snapshot(&format!("reset alignment of {name}")));
+        self.record(self.snapshot(&format!("Reset Alignment of {name}")));
         self.clear_previews();
         self.place_pass(id, Transform::default(), AlignState::Unaligned);
         self.merged = None;
@@ -425,11 +425,11 @@ impl ScanCraftApp {
         }
         let (label, placements): (&str, Vec<(u32, Transform, AlignState)>) = match &preview.proposal {
             Proposal::AlignAll(o) => (
-                "align all passes",
+                "Align All",
                 o.moved().filter_map(|p| p.pose.map(|t| (p.id, t, AlignState::Aligned { method: AlignMethod::AllPasses, quality: p.quality }))).collect(),
             ),
             Proposal::Refine(r) => (
-                "refine alignments",
+                "Refine All",
                 r.poses
                     .iter()
                     .map(|(id, t)| {
@@ -551,7 +551,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(preview.pass);
-        self.record(self.snapshot(&format!("align {name}")));
+        self.record(self.snapshot(&format!("Align {name}")));
         self.place_pass(preview.pass, preview.alignment.transform, AlignState::Aligned { method: preview.method, quality: Some(preview.alignment.quality) });
         self.merged = None;
         self.invalidate_derived(&format!("{name} was aligned"));
@@ -659,7 +659,7 @@ impl ScanCraftApp {
         let config = MergeConfig { pitch_mm: pitch, outliers: self.settings.merge_outliers.then_some((12, self.settings.merge_sigma)), ..MergeConfig::default() };
         let whole_scene = self.settings.whole_scene;
         self.clear_previews();
-        self.spawn_undoable("Merging passes", "merge", move || {
+        self.spawn_undoable("Merging passes", "Merge", move || {
             let t0 = std::time::Instant::now();
             let mut merge_inputs = Vec::new();
             let mut left_out = 0;
@@ -708,7 +708,7 @@ impl ScanCraftApp {
         if !self.can_edit() || self.merged.is_none() {
             return;
         }
-        self.record(self.snapshot("Delete merged model"));
+        self.record(self.snapshot("Delete Merged Model"));
         self.merged = None;
         for p in &mut self.passes {
             p.layer.visible = true;
@@ -730,7 +730,7 @@ impl ScanCraftApp {
         let passes: Vec<_> = self
             .passes
             .iter()
-            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone()))
+            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask)))
             .collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
@@ -745,9 +745,9 @@ impl ScanCraftApp {
         });
         self.spawn_job("Saving the project", move || {
             let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes) in passes {
+            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask) in passes {
                 let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes });
+                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask });
             }
             let n = stored.len();
             let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
@@ -888,7 +888,7 @@ impl ScanCraftApp {
             return;
         }
         let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        self.spawn_undoable(&format!("Importing {file}"), &format!("import {file}"), move || match crate::imports::read_scan(&path) {
+        self.spawn_undoable(&format!("Importing {file}"), &format!("Import {file}"), move || match crate::imports::read_scan(&path) {
             Ok(scan) => JobResult::Imported(Box::new(scan)),
             Err(e) => JobResult::Failed(e),
         });
@@ -904,7 +904,7 @@ impl ScanCraftApp {
             return;
         }
         let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
-        self.spawn_undoable(&format!("Adding {label}"), &format!("add project {label}"), move || match crate::imports::read_project(&dir) {
+        self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || match crate::imports::read_project(&dir) {
             Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
             Ok((name, passes)) => JobResult::AddedProject { name, passes },
             Err(e) => JobResult::Failed(e),
@@ -997,7 +997,7 @@ impl ScanCraftApp {
         }
         let Some(surface) = self.passes.iter().find(|p| p.id == id).and_then(|p| p.surface.clone()) else { return };
         let name = self.pass_name(id);
-        self.record(self.snapshot(&format!("scale {name}")));
+        self.record(self.snapshot(&format!("Scale {name}")));
         self.clear_previews();
         let surface = Arc::new(crate::imports::scaled(&surface, factor));
         let g = self.generation();

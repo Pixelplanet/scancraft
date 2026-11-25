@@ -204,7 +204,15 @@ re-implement from the ideas, never copy its code.
 | STEP export of fitted primitives (analytic AP214, own writer or `truck-stepio`) | export | M |
 | Scan-to-CAD in SolidCraft: ScanCraft hands over the watertight mesh plus fitted primitives | SolidCraft | L |
 
-Known gaps: per-pass object labels and the new quality fields are not saved in the project (the
-format still has version 1); `save_ply_binary` writes no normals; `scancraft_slam::point_to_plane`
-still linearises about the frame origin (slow convergence far from it); imported passes are all
-named after their file (`raw_preview.ply`, `raw_preview.ply 2`, …).
+Known gaps: `scancraft_slam::point_to_plane` still linearises about the frame origin (slow
+convergence far from it).
+
+Closed 2026-11-25: per-pass object labels (`pass-<id>/object.bin`, with the fingerprint that
+decides whether they still fit) and every alignment quality field (inliers, table violation,
+slide, wall pairs / offset / IQR / piercing) are saved. The project format stays version 1:
+every addition is optional, older projects open as before and older versions of the app ignore
+the new parts. `save_ply_binary` writes normals (when the cloud has them) and the observation
+count as `quality`, and the PLY reader takes `quality` / `confidence` back. Imported passes are
+named after the file without its extension, or after their folder when the file has a generic
+export name (`raw_preview`, `scan`, `mesh`, … with or without a counter); duplicates get
+"(2)", "(3)".

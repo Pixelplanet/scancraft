@@ -363,6 +363,9 @@ pub struct StoredPass {
     pub edit: Option<Arc<PointCloud>>,
     /// Calibrated RGB keyframes recorded during this pass.
     pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
+    /// Which surfels are the object (`crate::isolation`), if it was computed. Saved so an opened
+    /// project does not segment every pass again; its fingerprint decides whether it still fits.
+    pub mask: Option<Arc<crate::isolation::ObjectMask>>,
 }
 
 /// What a project folder holds.
@@ -409,12 +412,21 @@ fn from_record(r: KeyframeRecord) -> KeyframeData {
 }
 
 fn alignment_record(a: AlignState) -> AlignmentRecord {
-    let q = |q: Option<Quality>| (q.map(|q| q.overlap), q.map(|q| q.rmse_mm).filter(|r| r.is_finite()), q.map(|q| q.visibility_conflict));
     match a {
         AlignState::Reference => AlignmentRecord { status: "reference".into(), method: Some("reference".into()), ..Default::default() },
         AlignState::Aligned { method, quality } => {
-            let (overlap, rmse_mm, visibility_conflict) = q(quality);
-            AlignmentRecord { status: "aligned".into(), method: Some(method.key().into()), overlap, rmse_mm, visibility_conflict }
+            let finite = |v: f32| v.is_finite().then_some(v);
+            let mut r = AlignmentRecord { status: "aligned".into(), method: Some(method.key().into()), ..Default::default() };
+            if let Some(q) = quality {
+                r.overlap = Some(q.overlap);
+                r.rmse_mm = finite(q.rmse_mm);
+                r.visibility_conflict = Some(q.visibility_conflict);
+                r.inliers = Some(q.inliers as u64);
+                r.below_support = Some(q.below_support);
+                r.slide_mm = finite(q.slide_mm);
+                r.shell = q.shell.map(|s| files::ShellRecord { pairs: s.pairs as u64, fraction: s.fraction, offset_mm: s.offset_mm, iqr_mm: s.iqr_mm, piercing: s.piercing });
+            }
+            r
         }
         AlignState::Unaligned | AlignState::Locating => AlignmentRecord { status: "unaligned".into(), ..Default::default() },
     }
@@ -424,14 +436,16 @@ fn alignment_state(r: &AlignmentRecord) -> AlignState {
     match r.status.as_str() {
         "reference" => AlignState::Reference,
         "aligned" => {
-            // Only overlap, RMS and see-through are stored; the rest reads as not measured
-            // (no wall, no table violation, slide 0 = not judged).
+            // Projects saved before 2026-11-25 store only overlap, RMS and see-through; what is
+            // missing reads as not measured (no wall, no table violation, slide 0 = not judged).
             let quality = r.overlap.map(|overlap| Quality {
                 overlap,
                 rmse_mm: r.rmse_mm.unwrap_or(f32::INFINITY),
                 visibility_conflict: r.visibility_conflict.unwrap_or(0.0),
-                inliers: 1000,
-                ..Quality::NONE
+                inliers: r.inliers.map_or(1000, |n| n as usize),
+                below_support: r.below_support.unwrap_or(0.0),
+                slide_mm: r.slide_mm.unwrap_or(if r.inliers.is_some() { f32::INFINITY } else { 0.0 }),
+                shell: r.shell.map(|s| scancraft_align::quality::Shell { pairs: s.pairs as usize, fraction: s.fraction, offset_mm: s.offset_mm, iqr_mm: s.iqr_mm, piercing: s.piercing }),
             });
             AlignState::Aligned { method: AlignMethod::from_key(r.method.as_deref().unwrap_or("auto")), quality }
         }
@@ -448,6 +462,11 @@ pub fn surface_path(id: u32) -> String {
 /// little-endian u32 per point, in order), relative to the project folder.
 pub fn cleaned_path(id: u32) -> String {
     format!("{}/cleaned.ply", files::pass_dir(id))
+}
+
+/// A pass's saved object labels, relative to the project folder.
+pub fn mask_path(id: u32) -> String {
+    format!("{}/object.bin", files::pass_dir(id))
 }
 
 pub fn cleaned_counts_path(id: u32) -> String {
@@ -645,6 +664,18 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
             }
         }
         write_rgb_keyframes(dir, p.id, &p.rgb_keyframes)?;
+        match &p.mask {
+            Some(mask) => {
+                let path = dir.join(mask_path(p.id));
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(path, mask.to_bytes()).map_err(|e| e.to_string())?;
+            }
+            None => {
+                let _ = std::fs::remove_file(dir.join(mask_path(p.id)));
+            }
+        }
     }
     let mut outputs = Vec::new();
     std::fs::create_dir_all(dir.join("outputs")).map_err(|e| e.to_string())?;
@@ -721,6 +752,8 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             surface,
             edit,
             rgb_keyframes,
+            // Optional: a missing or unreadable file only means it is computed again.
+            mask: std::fs::read(dir.join(mask_path(record.id))).ok().and_then(|b| crate::isolation::ObjectMask::from_bytes(&b)).map(Arc::new),
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
@@ -796,8 +829,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
-                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
+                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
             ],
             merged: Some((merged, vec![1])),
             cleaned: None,
@@ -880,8 +913,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
-                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None, rgb_keyframes: Vec::new() },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
+                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None, rgb_keyframes: Vec::new(), mask: None },
             ],
             merged: None,
             cleaned: None,
@@ -931,7 +964,7 @@ mod tests {
             name: "Cleaned".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)), rgb_keyframes: Vec::new() }],
+            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)), rgb_keyframes: Vec::new(), mask: None }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -954,6 +987,74 @@ mod tests {
     }
 
     #[test]
+    fn alignment_quality_and_object_labels_round_trip() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-quality-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut reference = PassMeta::imported("a.ply".into());
+        reference.alignment = AlignState::Reference;
+        let quality = Quality {
+            overlap: 0.42,
+            rmse_mm: 0.13,
+            visibility_conflict: 0.02,
+            inliers: 5321,
+            shell: Some(scancraft_align::quality::Shell { pairs: 900, fraction: 0.3, offset_mm: -3.05, iqr_mm: 0.2, piercing: 0.001 }),
+            below_support: 0.004,
+            slide_mm: 1.7,
+        };
+        let mut aligned = PassMeta::imported("b.ply".into());
+        aligned.alignment = AlignState::Aligned { method: AlignMethod::AllPasses, quality: Some(quality) };
+        let s = surface();
+        let object: Vec<bool> = (0..s.len()).map(|i| i % 3 != 0).collect();
+        let kept = object.iter().filter(|o| **o).count();
+        let mask = crate::isolation::ObjectMask { key: 0xDEAD_BEEF_1234, object, support: Some(scancraft_align::Plane::through(Vec3::new(0.0, 0.0, -1.0), Vec3::Z)), kept, fallback: false };
+        let pass = |id: u32, meta: PassMeta, mask: Option<Arc<crate::isolation::ObjectMask>>| StoredPass {
+            id,
+            name: format!("p{id}"),
+            frames: 0,
+            visible: true,
+            meta,
+            keyframes: Vec::new(),
+            surface: Some(Arc::clone(&s)),
+            edit: None,
+            rgb_keyframes: Vec::new(),
+            mask,
+        };
+        let project = StoredProject {
+            name: "Quality".into(),
+            reference: Some(1),
+            next_pass_id: 3,
+            passes: vec![pass(1, reference, None), pass(2, aligned, Some(Arc::new(mask.clone())))],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        let loaded = load(&dir).unwrap();
+        match loaded.passes[1].meta.alignment {
+            AlignState::Aligned { quality: Some(q), .. } => assert_eq!(q, quality, "every quality field comes back"),
+            other => panic!("{other:?}"),
+        }
+        assert!(loaded.passes[0].mask.is_none());
+        assert_eq!(loaded.passes[1].mask.as_deref(), Some(&mask), "the object labels come back");
+        // A damaged labels file is ignored (computed again), not an error.
+        std::fs::write(dir.join(mask_path(2)), b"junk").unwrap();
+        assert!(load(&dir).unwrap().passes[1].mask.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_alignment_record_reads_as_partly_measured() {
+        let r = AlignmentRecord { status: "aligned".into(), method: Some("auto".into()), overlap: Some(0.5), rmse_mm: Some(0.2), visibility_conflict: Some(0.01), ..Default::default() };
+        let AlignState::Aligned { quality: Some(q), .. } = alignment_state(&r) else { panic!() };
+        assert_eq!((q.overlap, q.rmse_mm, q.inliers, q.slide_mm), (0.5, 0.2, 1000, 0.0), "missing fields read as not measured");
+        assert!(q.shell.is_none());
+        // And the new fields are not written for a pass without quality.
+        let json = serde_json::to_string(&alignment_record(AlignState::Aligned { method: AlignMethod::Auto, quality: None })).unwrap();
+        assert!(!json.contains("shell") && !json.contains("inliers"), "{json}");
+    }
+
+    #[test]
     fn a_project_without_origins_loads_as_captured_passes() {
         let dir = std::env::temp_dir().join(format!("scancraft-app-old-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -963,7 +1064,7 @@ mod tests {
             name: "Old".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new() }],
+            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -1014,6 +1115,7 @@ mod tests {
                 surface: None,
                 edit: None,
                 rgb_keyframes: vec![kf],
+                mask: None,
             }],
             merged: None,
             cleaned: None,

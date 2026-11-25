@@ -98,6 +98,9 @@ pub struct ImportedScan {
     pub normal_source: NormalSource,
     /// RGBA colours, when the file has them.
     pub colors: Option<Vec<[u8; 4]>>,
+    /// Per-point confidence (ScanCraft: observation count), when the file has a `quality` or
+    /// `confidence` property.
+    pub confidence: Option<Vec<f32>>,
     /// Triangles (polygons fan-triangulated), when the file is a mesh.
     pub faces: Option<Vec<[u32; 3]>>,
     pub units: UnitsHint,
@@ -114,6 +117,7 @@ impl ImportedScan {
             normals: None,
             normal_source: NormalSource::None,
             colors: None,
+            confidence: None,
             faces: None,
             units: UnitsHint::Unknown,
         }
@@ -180,7 +184,8 @@ impl ImportedScan {
             let [r, g, b, a] = c[i];
             ColorRgba::new(r, g, b, a)
         });
-        Point3D { position: self.points[i], normal, color, confidence: 1.0 }
+        let confidence = self.confidence.as_ref().map_or(1.0, |c| c[i]);
+        Point3D { position: self.points[i], normal, color, confidence }
     }
 }
 
@@ -285,6 +290,9 @@ fn drop_non_finite(scan: &mut ImportedScan) {
         retain(n, &keep);
     }
     if let Some(c) = &mut scan.colors {
+        retain(c, &keep);
+    }
+    if let Some(c) = &mut scan.confidence {
         retain(c, &keep);
     }
 }

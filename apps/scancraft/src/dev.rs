@@ -107,8 +107,8 @@ pub fn write_demo_project(dir: &Path) -> Result<(), String> {
         reference: Some(1),
         next_pass_id: 3,
         passes: vec![
-            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&upright, &a_views) },
-            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&flipped, &b_views) },
+            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&upright, &a_views), mask: None },
+            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&flipped, &b_views), mask: None },
         ],
         merged: None,
         cleaned: None,

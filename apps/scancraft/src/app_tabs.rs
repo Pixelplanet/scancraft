@@ -265,6 +265,45 @@ impl ScanCraftApp {
         }
     }
 
+    /// Copies the passes of open tab `i` into the active project, unaligned and with fresh ids,
+    /// as Add Project does with a project folder (undoable). The other tab is not changed: its
+    /// passes are rebuilt from their keyframes, so the two projects never share a tracker.
+    pub fn add_tab_passes(&mut self, i: usize) {
+        if i == self.active_tab || i >= self.tabs.len() || self.import_blocked().is_some() {
+            return;
+        }
+        let tab = &self.tabs[i];
+        let name = tab.project.name.clone();
+        if tab.passes.is_empty() {
+            self.say(Tone::Warning, format!("{name} has no passes to add"));
+            return;
+        }
+        let mut stored = Vec::with_capacity(tab.passes.len());
+        for p in &tab.passes {
+            let Ok(t) = p.tracker.lock() else {
+                self.say(Tone::Error, "A pass's tracker is unavailable");
+                return;
+            };
+            stored.push(crate::project::StoredPass {
+                id: p.id,
+                name: p.name.clone(),
+                frames: p.frames,
+                visible: true,
+                meta: p.meta.clone(),
+                keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(),
+                surface: p.surface.clone(),
+                edit: p.edit.clone(),
+                rgb_keyframes: p.rgb_keyframes.clone(),
+                mask: crate::isolation::cached(&p.mask),
+            });
+        }
+        let label = name.clone();
+        self.spawn_undoable(&format!("Adding the passes of {label}"), &format!("Add Passes of {label}"), move || {
+            let passes = crate::imports::prepare_added(&name, stored);
+            JobResult::AddedProject { name, passes }
+        });
+    }
+
     /// Whether any open project has unsaved changes.
     pub fn any_dirty(&self) -> bool {
         self.tab_labels().iter().any(|t| t.dirty)

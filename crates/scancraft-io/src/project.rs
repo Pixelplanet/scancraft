@@ -86,6 +86,27 @@ pub struct AlignmentRecord {
     pub rmse_mm: Option<f32>,
     #[serde(default)]
     pub visibility_conflict: Option<f32>,
+    /// The rest of the alignment's quality (all optional: older projects lack them and older
+    /// versions of the app ignore them).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inliers: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub below_support: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slide_mm: Option<f32>,
+    /// The two faces of a wall found by the alignment, when it found them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<ShellRecord>,
+}
+
+/// Facing-apart surfaces measured by an alignment (`scancraft_align::quality::Shell`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ShellRecord {
+    pub pairs: u64,
+    pub fraction: f32,
+    pub offset_mm: f32,
+    pub iqr_mm: f32,
+    pub piercing: f32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -281,7 +302,7 @@ mod tests {
             device: serde_json::json!({ "model": "POP 4" }),
             frames: 321,
             transform: Transform { translation: Vec3::new(10.0, -3.0, 2.0), rotation: Quat::from_rotation_x(3.0), scale: Vec3::ONE },
-            alignment: AlignmentRecord { status: status.into(), method: Some("auto".into()), overlap: Some(0.4), rmse_mm: Some(0.2), visibility_conflict: Some(0.01) },
+            alignment: AlignmentRecord { status: status.into(), method: Some("auto".into()), overlap: Some(0.4), rmse_mm: Some(0.2), visibility_conflict: Some(0.01), ..Default::default() },
             weight: 2.0,
             included: id != 3,
             visible: true,

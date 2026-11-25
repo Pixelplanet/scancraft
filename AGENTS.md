@@ -323,3 +323,9 @@ laser model are not built.
   masking. Rebased on `main` (`2de56c0`); verified with unit tests across all touched crates,
   `#[ignore]` live SAM 2.1 app workflow test on Radeon 890M, and `--demo-project`/`--auto` GUI
   screenshot checks.
+- 2026-11-25 (second PC, branch `agent/data-fidelity`) — Saving and exports: point PLY with
+  normals and observation counts (`quality`), read back; project keeps every alignment quality
+  field and the per-pass object labels (`pass-<id>/object.bin`), still format version 1 (all
+  additions optional); imported passes named after the file stem or, for generic export names,
+  their folder; Add Passes from another open tab (tab context menu); history entries in Title
+  Case. merge-and-ai.md "Known gaps" updated.

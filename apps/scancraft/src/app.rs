@@ -1474,7 +1474,7 @@ impl ScanCraftApp {
         }
         let Some(tracker) = self.passes.iter().find(|p| p.id == pass).map(|p| p.tracker.clone()) else { return };
         let verb = if discarded { "Discarded" } else { "Restored" };
-        self.record(self.snapshot(&format!("{} frame {frame}", if discarded { "discard" } else { "restore" })));
+        self.record(self.snapshot(&format!("{} Frame {frame}", if discarded { "Discard" } else { "Restore" })));
         self.spawn_tracker_job(if discarded { "Discarding frame" } else { "Restoring frame" }, pass, tracker, move |t| {
             if t.set_discarded(frame, discarded) {
                 format!("{verb} frame {frame}")
@@ -1496,7 +1496,7 @@ impl ScanCraftApp {
         }
         let tracker = p.tracker.clone();
         let n = p.keyframes.iter().filter(|k| k.id >= frame && !k.discarded).count();
-        self.record(self.snapshot(&format!("discard frames from {frame}")));
+        self.record(self.snapshot(&format!("Discard Frames from {frame}")));
         self.spawn_tracker_job("Discarding frames", pass, tracker, move |t| {
             t.discard_from(frame);
             format!("Discarded {n} frame{} from frame {frame} on", if n == 1 { "" } else { "s" })
@@ -1603,7 +1603,7 @@ impl ScanCraftApp {
         if !self.can_edit() || self.mesh.is_none() {
             return;
         }
-        self.record(self.snapshot("Delete mesh"));
+        self.record(self.snapshot("Delete Mesh"));
         self.mesh = None;
         if self.selection == Some(Node::Mesh) {
             self.selection = None;
@@ -1615,7 +1615,7 @@ impl ScanCraftApp {
         if !self.can_edit() || !self.has_geometry() {
             return;
         }
-        self.record(self.snapshot("Clear session"));
+        self.record(self.snapshot("Clear Session"));
         self.passes.clear();
         self.clear_previews();
         self.picking = None;
@@ -1936,7 +1936,7 @@ impl ScanCraftApp {
         if !self.can_edit() || !self.passes.iter().any(|p| ids.contains(&p.id) && p.is_cleaned()) {
             return;
         }
-        self.record(self.snapshot("Reset cleaning"));
+        self.record(self.snapshot("Reset Cleaning"));
         let mut names = Vec::new();
         for i in 0..self.passes.len() {
             if !(ids.contains(&self.passes[i].id) && self.passes[i].is_cleaned()) {
@@ -2301,7 +2301,7 @@ impl ScanCraftApp {
             return;
         };
         let Some((before, target)) = self.object_picking.as_ref().map(|o| (o.input.len(), o.target)) else { return };
-        self.record(self.snapshot("Isolate object"));
+        self.record(self.snapshot("Isolate Object"));
         let message = format!("{}: kept the object, {} of {} points", self.target_name(target), thousands(object.len()), thousands(before));
         match target {
             CleanTarget::Pass(id) => {
@@ -2346,14 +2346,14 @@ impl ScanCraftApp {
             }
             Tool::RemovePlane => {
                 let tolerance = s.plane_tolerance_mm;
-                self.spawn_clean("Removing the dominant plane", "Remove plane", "plane", move |c| {
+                self.spawn_clean("Removing the dominant plane", "Remove Plane", "plane", move |c| {
                     let (cleaned, plane) = RansacPlaneFilter::new(tolerance, 150, PlaneFilterMode::ClipBelow).filter(c);
                     plane.map(|_| cleaned)
                 });
             }
             Tool::Outliers => {
                 let (k, sd) = (s.sor_neighbors, s.sor_std_dev);
-                self.spawn_clean("Removing outliers", "Remove outliers", "outlier", move |c| Some(StatisticalOutlierFilter::new(k, sd).filter(c)));
+                self.spawn_clean("Removing outliers", "Remove Outliers", "outlier", move |c| Some(StatisticalOutlierFilter::new(k, sd).filter(c)));
             }
             Tool::Downsample => {
                 let voxel = s.voxel_mm;
@@ -2367,7 +2367,7 @@ impl ScanCraftApp {
                 let input = self.working_cloud();
                 let config = scancraft_mesh::SurfaceConfig { cell_mm: s.mc_cell_mm, detail: s.mesh_smoothness, ..Default::default() };
                 let smoother = (s.mesh_auto_smooth > 0).then(|| smoother(s.mesh_auto_smooth, s.smooth_keep_edges));
-                self.spawn_undoable("Reconstructing the surface", "Reconstruct surface", move || {
+                self.spawn_undoable("Reconstructing the surface", "Reconstruct Surface", move || {
                     let (mut mesh, stats) = Mesher::reconstruct_with_stats(&input, &config);
                     if mesh.triangles.is_empty() {
                         return JobResult::Failed("Reconstruction produced no surface; try a larger cell size or more smoothness".into());
@@ -2400,7 +2400,7 @@ impl ScanCraftApp {
             Tool::FillHoles => {
                 let Some(mut mesh) = self.mesh.as_ref().map(|m| (*m.mesh).clone()) else { return };
                 let filler = scancraft_mesh::HoleFiller::new(s.fill_max_mm, s.fill_keep_largest);
-                self.spawn_undoable("Filling holes", "Fill holes", move || {
+                self.spawn_undoable("Filling holes", "Fill Holes", move || {
                     let report = filler.fill(&mut mesh);
                     if report.filled == 0 {
                         return JobResult::NoChange("No hole small enough to fill: raise the maximum size".into());
@@ -2425,7 +2425,7 @@ impl ScanCraftApp {
             Tool::MakeSolid => {
                 let input = self.working_cloud();
                 let config = scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() };
-                self.spawn_undoable("Making the solid", "Make solid", move || {
+                self.spawn_undoable("Making the solid", "Make Solid", move || {
                     let points: Vec<scancraft_mesh::SolidPoint> = input
                         .points
                         .iter()
@@ -2966,7 +2966,7 @@ mod tests {
         // The first pass of the project defines its frame.
         assert_eq!(app.passes[0].meta.alignment, AlignState::Reference);
         assert!(crate::isolation::cached(&app.passes[0].mask).is_some());
-        assert_eq!(app.history.undo_label(), Some("import part.ply"));
+        assert_eq!(app.history.undo_label(), Some("Import part.ply"));
         // 0.2 units across: offered as metres.
         assert_eq!(app.toast_action, Some(ToastAction::MetresToMm(id)));
         app.run_toast_action();
@@ -3019,7 +3019,7 @@ mod tests {
         // The project's own reference is unchanged; the next new pass gets the next id.
         assert_eq!(app.reference_pass(), Some(1));
         assert_eq!(app.next_pass_id, 5);
-        assert_eq!(app.history.undo_label(), Some("add project Demo"));
+        assert_eq!(app.history.undo_label(), Some("Add Project Demo"));
         app.undo();
         assert_eq!(app.passes.iter().map(|p| p.id).collect::<Vec<_>>(), vec![1, 2]);
         // Into an empty project, the first added pass becomes the reference.
@@ -3335,6 +3335,27 @@ mod tests {
         assert!(app.pending_open.is_none());
         assert_eq!(app.passes.len(), 1, "opened after the operation finished");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn passes_of_another_open_tab_can_be_added_without_changing_it() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.project.name = "Bracket".into();
+        app.new_tab();
+        app.add_tab_passes(0);
+        finish_job(&mut app);
+        assert_eq!(app.passes.len(), 1, "the pass was copied in");
+        let p = &app.passes[0];
+        assert_eq!(p.meta.origin, crate::project::PassOrigin::File { source: "scan1.ply".into() }, "an imported pass keeps its file origin");
+        assert_eq!(p.layer.len(), table_and_block().len());
+        assert_eq!(app.history.undo_label(), Some("Add Passes of Bracket"));
+        // The other tab still has its pass, untouched.
+        app.switch_tab(0);
+        assert_eq!(app.passes.len(), 1);
+        app.switch_tab(1);
+        app.undo();
+        assert!(app.passes.is_empty());
     }
 
     #[test]

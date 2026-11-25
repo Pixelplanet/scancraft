@@ -54,6 +54,79 @@ impl ObjectMask {
     }
 }
 
+/// Saved object labels: "SCOB", format version, then the mask (see [`ObjectMask::to_bytes`]).
+const MASK_MAGIC: &[u8; 4] = b"SCOB";
+const MASK_VERSION: u32 = 1;
+
+impl ObjectMask {
+    /// The mask as stored in a project (`pass-<id>/object.bin`): magic, version, fingerprint,
+    /// point count, fallback flag, table plane (flag, normal, d), then one bit per surfel.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(48 + self.object.len() / 8);
+        b.extend_from_slice(MASK_MAGIC);
+        b.extend_from_slice(&MASK_VERSION.to_le_bytes());
+        b.extend_from_slice(&self.key.to_le_bytes());
+        b.extend_from_slice(&(self.object.len() as u64).to_le_bytes());
+        b.push(self.fallback as u8);
+        match &self.support {
+            Some(p) => {
+                b.push(1);
+                for v in p.normal.to_array().into_iter().chain([p.d]) {
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+            }
+            None => {
+                b.push(0);
+                b.extend_from_slice(&[0u8; 16]);
+            }
+        }
+        let mut byte = 0u8;
+        for (i, o) in self.object.iter().enumerate() {
+            if *o {
+                byte |= 1 << (i % 8);
+            }
+            if i % 8 == 7 {
+                b.push(byte);
+                byte = 0;
+            }
+        }
+        if self.object.len() % 8 != 0 {
+            b.push(byte);
+        }
+        b
+    }
+
+    /// Reads [`to_bytes`](Self::to_bytes); `None` for anything else (an older or damaged file
+    /// is simply computed again).
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        let u32_at = |i: usize| b.get(i..i + 4).map(|s| u32::from_le_bytes(s.try_into().unwrap()));
+        let u64_at = |i: usize| b.get(i..i + 8).map(|s| u64::from_le_bytes(s.try_into().unwrap()));
+        let f32_at = |i: usize| b.get(i..i + 4).map(|s| f32::from_le_bytes(s.try_into().unwrap()));
+        if b.get(0..4)? != MASK_MAGIC || u32_at(4)? != MASK_VERSION {
+            return None;
+        }
+        let key = u64_at(8)?;
+        let len = usize::try_from(u64_at(16)?).ok()?;
+        let fallback = *b.get(24)? != 0;
+        let support = match *b.get(25)? {
+            0 => None,
+            _ => Some(Plane { normal: Vec3::new(f32_at(26)?, f32_at(30)?, f32_at(34)?), d: f32_at(38)? }),
+        };
+        let bits = b.get(42..)?;
+        if bits.len() != len.div_ceil(8) {
+            return None;
+        }
+        let object: Vec<bool> = (0..len).map(|i| bits[i / 8] & (1 << (i % 8)) != 0).collect();
+        let kept = object.iter().filter(|o| **o).count();
+        Some(ObjectMask { key, object, support, kept, fallback })
+    }
+}
+
+/// A cache holding `mask` (a pass opened with its saved object labels).
+pub fn cache_with(mask: Option<Arc<ObjectMask>>) -> MaskCache {
+    Arc::new(Mutex::new(mask))
+}
+
 /// One pass's cached isolation, shared with the background jobs that need it.
 pub type MaskCache = Arc<Mutex<Option<Arc<ObjectMask>>>>;
 

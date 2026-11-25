@@ -7,9 +7,19 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 /// Export point cloud to binary little-endian PLY file
+///
+/// Each point is written with its position, normal, colour and confidence. The confidence goes
+/// into a `quality` property (the name MeshLab and CloudCompare read as a per-point scalar);
+/// ScanCraft stores the observation count there. Older versions wrote no normals, so a merged
+/// model saved with them had to have its normals estimated again on reopening.
+///
+/// Normals are left out when the cloud has none: every point still carries `Point3D`'s default
+/// `[0, 0, 1]` (or a zero vector). Writing those would claim normals the points do not have, and a
+/// reader would not estimate real ones.
 pub fn save_ply_binary<P: AsRef<Path>>(cloud: &PointCloud, path: P) -> Result<(), IoError> {
     let file = File::create(path)?;
     let mut w = BufWriter::new(file);
+    let has_normals = cloud.points.iter().any(|p| p.normal != [0.0, 0.0, 1.0] && p.normal != [0.0; 3]);
 
     writeln!(w, "ply")?;
     writeln!(w, "format binary_little_endian 1.0")?;
@@ -18,20 +28,32 @@ pub fn save_ply_binary<P: AsRef<Path>>(cloud: &PointCloud, path: P) -> Result<()
     writeln!(w, "property float x")?;
     writeln!(w, "property float y")?;
     writeln!(w, "property float z")?;
+    if has_normals {
+        writeln!(w, "property float nx")?;
+        writeln!(w, "property float ny")?;
+        writeln!(w, "property float nz")?;
+    }
     writeln!(w, "property uchar red")?;
     writeln!(w, "property uchar green")?;
     writeln!(w, "property uchar blue")?;
     writeln!(w, "property uchar alpha")?;
+    writeln!(w, "property float quality")?;
     writeln!(w, "end_header")?;
 
     for p in &cloud.points {
-        w.write_f32::<LittleEndian>(p.position[0])?;
-        w.write_f32::<LittleEndian>(p.position[1])?;
-        w.write_f32::<LittleEndian>(p.position[2])?;
+        for c in &p.position {
+            w.write_f32::<LittleEndian>(*c)?;
+        }
+        if has_normals {
+            for c in &p.normal {
+                w.write_f32::<LittleEndian>(*c)?;
+            }
+        }
         w.write_u8(p.color.r)?;
         w.write_u8(p.color.g)?;
         w.write_u8(p.color.b)?;
         w.write_u8(p.color.a)?;
+        w.write_f32::<LittleEndian>(p.confidence)?;
     }
 
     w.flush()?;
@@ -460,10 +482,12 @@ fn read_vertices<S: Source>(el: &Element, src: &mut S, scan: &mut ImportedScan) 
         _ => None,
     };
     let alpha = el.prop(&["alpha", "diffuse_alpha", "a"]);
+    let quality = el.prop(&["quality", "confidence", "scalar_quality"]);
 
     scan.points.reserve_exact(el.count);
     let mut normals = normal.map(|_| Vec::with_capacity(el.count));
     let mut colors = color.map(|_| Vec::with_capacity(el.count));
+    let mut confidence = quality.map(|_| Vec::with_capacity(el.count));
     let mut values = vec![0.0f64; el.props.len()];
     let mut items = Vec::new();
     for _ in 0..el.count {
@@ -477,7 +501,12 @@ fn read_vertices<S: Source>(el: &Element, src: &mut S, scan: &mut ImportedScan) 
             let a = alpha.map_or(255, |i| el.scalar_type(i).to_channel(values[i]));
             out.push([r, g, b, a]);
         }
+        if let (Some(i), Some(out)) = (quality, confidence.as_mut()) {
+            let v = values[i] as f32;
+            out.push(if v.is_finite() { v } else { 1.0 });
+        }
     }
+    scan.confidence = confidence;
     if normals.is_some() {
         scan.normal_source = NormalSource::File;
     }

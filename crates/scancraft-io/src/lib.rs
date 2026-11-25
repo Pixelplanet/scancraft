@@ -51,7 +51,7 @@ mod tests {
             position: [4.0, 5.0, 6.0],
             normal: [0.0, 1.0, 0.0],
             color: ColorRgba::new(0, 255, 0, 255),
-            confidence: 1.0,
+            confidence: 7.0,
         });
 
         save_ply_binary(&cloud, &ply_path).expect("Failed to save PLY");
@@ -60,6 +60,10 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert!((loaded.points[0].position[0] - 1.0).abs() < 1e-5);
         assert!((loaded.points[1].position[2] - 6.0).abs() < 1e-5);
+        // Normals, colours and confidence (observation count) come back as written.
+        assert_eq!(loaded.points[1].normal, [0.0, 1.0, 0.0]);
+        assert_eq!(loaded.points[0].color, ColorRgba::new(255, 0, 0, 255));
+        assert_eq!((loaded.points[0].confidence, loaded.points[1].confidence), (1.0, 7.0));
 
         let _ = fs::remove_file(ply_path);
     }

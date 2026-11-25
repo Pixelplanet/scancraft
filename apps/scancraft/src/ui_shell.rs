@@ -160,6 +160,8 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
     let mut x = left;
     let mut switch_to = None;
     let mut close = None;
+    let mut add_from = None;
+    let active_name = labels.iter().find(|l| l.active).map(|l| l.name.clone()).unwrap_or_default();
     for (i, l) in labels.iter().enumerate().take(last).skip(first) {
         let w = widths[i].min(tabs_right - x);
         if w < 40.0 {
@@ -201,9 +203,18 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
             Some(why) if !l.active => format!("{}\n{state}\n{why}", l.name),
             _ => format!("{}\n{state}", l.name),
         };
+        let resp = resp.on_hover_text(tip);
+        if !l.active {
+            resp.context_menu(|ui| {
+                let why = app.import_blocked().unwrap_or("");
+                if kit::menu_item(ui, &format!("Add Passes to {}", active_name), kit::Button::Normal, why.is_empty(), why) {
+                    add_from = Some(i);
+                }
+            });
+        }
         if close_resp.on_hover_text(if l.dirty { "Close (asks to save first)" } else { "Close" }).clicked() {
             close = Some(i);
-        } else if resp.on_hover_text(tip).clicked() {
+        } else if resp.clicked() {
             switch_to = Some(i);
         }
     }
@@ -236,7 +247,9 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
             switch_to = Some(i);
         }
     }
-    if let Some(i) = close {
+    if let Some(i) = add_from {
+        app.add_tab_passes(i);
+    } else if let Some(i) = close {
         app.request_close_tab(i);
     } else if let Some(i) = switch_to {
         app.switch_tab(i);
@@ -484,7 +497,7 @@ fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
                 label: "Add Passes",
                 buttons: vec![
                     rb("import_scan", "import", "Import Scan", app.import_blocked(), false, "Add PLY, OBJ or STL scans (yours or from other scan software) as new passes to align with the others"),
-                    rb("add_project", "folder", "Add Project", app.import_blocked(), false, "Append the passes of other ScanCraft projects, unaligned"),
+                    rb("add_project", "folder", "Add Project", app.import_blocked(), false, "Append the passes of other ScanCraft projects, unaligned (or right-click another open tab)"),
                 ],
             },
             RibbonGroup {
