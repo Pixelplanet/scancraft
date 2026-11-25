@@ -215,49 +215,53 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
             if let Some(resp) = r.response {
                 resp.context_menu(|ui| {
-                    let why = if p.is_fixed() {
-                        "An imported scan cannot be continued"
-                    } else if p.is_cleaned() {
-                        "A cleaned pass cannot be continued: reset its cleaning first"
+                    let continue_why = if p.is_fixed() {
+                        "An imported pass cannot be continued"
+                    } else if app.connection.is_none() {
+                        "Connect a scanner first"
+                    } else if app.capture != Capture::Idle {
+                        "Stop the capture first"
+                    } else if app.busy.is_some() {
+                        "Another operation is running"
                     } else {
-                        "Connect a scanner and stop the current capture"
+                        "A cleaned pass cannot be continued: reset its cleaning first"
                     };
-                    if ui.add_enabled(can_continue && !p.is_fixed() && !p.is_cleaned(), egui::Button::new("Continue pass")).on_disabled_hover_text(why).clicked() {
+                    if kit::menu_item(ui, "Continue Pass", Button::Normal, can_continue && !p.is_fixed() && !p.is_cleaned(), continue_why) {
                         actions.push(BrowserAction::Continue(p.id));
-                        ui.close();
                     }
-                    if ui.add_enabled(app.can_edit() && p.is_cleaned(), egui::Button::new("Reset cleaning")).on_disabled_hover_text("Not cleaned").clicked() {
+                    let reset_why = if !p.is_cleaned() { "Not cleaned" } else { app.edit_blocked().unwrap_or("") };
+                    if kit::menu_item(ui, "Reset Cleaning", Button::Normal, app.can_edit() && p.is_cleaned(), reset_why) {
                         actions.push(BrowserAction::ResetCleaning(p.id));
-                        ui.close();
                     }
                     ui.separator();
-                    let align_ok = app.align_blocked(Some(p.id)).is_none() && app.align_preview.is_none();
-                    if ui.add_enabled(align_ok, egui::Button::new("Align automatically")).clicked() {
+                    let align_why = app
+                        .align_blocked(Some(p.id))
+                        .or(app.align_preview.is_some().then_some("Accept or reject the proposed alignment first"))
+                        .unwrap_or("");
+                    let align_ok = align_why.is_empty();
+                    if kit::menu_item(ui, "Align Pass", Button::Normal, align_ok, align_why) {
                         actions.push(BrowserAction::AlignAuto(p.id));
-                        ui.close();
                     }
-                    if ui.add_enabled(align_ok, egui::Button::new("Align by point pairs")).clicked() {
+                    if kit::menu_item(ui, "Point Pairs…", Button::Normal, align_ok, align_why) {
                         actions.push(BrowserAction::AlignPairs(p.id));
-                        ui.close();
                     }
-                    let can_ref = app.can_edit() && matches!(p.meta.alignment, AlignState::Aligned { .. });
-                    if ui.add_enabled(can_ref, egui::Button::new("Make reference")).on_disabled_hover_text("Only an aligned pass can define the project frame").clicked() {
+                    let aligned = matches!(p.meta.alignment, AlignState::Aligned { .. });
+                    let ref_why = if !aligned { "Only an aligned pass can define the project frame" } else { app.edit_blocked().unwrap_or("") };
+                    let reset_why = if !aligned { "Not aligned" } else { app.edit_blocked().unwrap_or("") };
+                    if kit::menu_item(ui, "Make Reference", Button::Normal, app.can_edit() && aligned, ref_why) {
                         actions.push(BrowserAction::Reference(p.id));
-                        ui.close();
                     }
-                    if ui.add_enabled(can_ref, egui::Button::new("Reset alignment")).clicked() {
+                    if kit::menu_item(ui, "Reset Alignment", Button::Normal, app.can_edit() && aligned, reset_why) {
                         actions.push(BrowserAction::ResetAlign(p.id));
-                        ui.close();
                     }
-                    let include = if p.meta.included { "Leave out of Merge" } else { "Include in Merge" };
-                    if ui.button(include).clicked() {
+                    let include = if p.meta.included { "Leave Out of Merge" } else { "Include in Merge" };
+                    if kit::menu_item(ui, include, Button::Normal, true, "") {
                         actions.push(BrowserAction::Include(p.id, !p.meta.included));
-                        ui.close();
                     }
                     ui.separator();
-                    if ui.add_enabled(app.can_edit() && !recording, egui::Button::new("Delete pass")).clicked() {
+                    let delete_why = if recording { "Stop the capture first" } else { app.edit_blocked().unwrap_or("") };
+                    if kit::menu_item(ui, "Delete Pass", Button::Danger, app.can_edit() && !recording, delete_why) {
                         actions.push(BrowserAction::DeletePass(p.id));
-                        ui.close();
                     }
                 });
             }
@@ -340,14 +344,13 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 }
                 if let Some(resp) = r.response {
                     resp.context_menu(|ui| {
-                        let label = if k.discarded { "Restore frame" } else { "Discard frame" };
-                        if ui.add_enabled(can_frames, egui::Button::new(label)).on_disabled_hover_text("Pause or stop the capture first").clicked() {
+                        let frames_why = if app.busy.is_some() { "Another operation is running" } else { "Pause or stop the capture first" };
+                        let label = if k.discarded { "Restore Frame" } else { "Discard Frame" };
+                        if kit::menu_item(ui, label, Button::Normal, can_frames, if can_frames { "" } else { frames_why }) {
                             actions.push(BrowserAction::Discard(p.id, k.id, !k.discarded));
-                            ui.close();
                         }
-                        if ui.add_enabled(can_frames, egui::Button::new("Discard this and all later frames")).on_disabled_hover_text("Pause or stop the capture first").clicked() {
+                        if kit::menu_item(ui, "Discard This and Later Frames", Button::Normal, can_frames, if can_frames { "" } else { frames_why }) {
                             actions.push(BrowserAction::DiscardFrom(p.id, k.id));
-                            ui.close();
                         }
                     });
                 }
@@ -437,9 +440,8 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             let mut discard = false;
             if let Some(resp) = r.response {
                 resp.context_menu(|ui| {
-                    if ui.add_enabled(app.can_edit(), egui::Button::new("Discard merged model")).clicked() {
+                    if kit::menu_item(ui, "Delete Merged Model", Button::Danger, app.can_edit(), app.edit_blocked().unwrap_or("")) {
                         discard = true;
-                        ui.close();
                     }
                 });
             }
@@ -471,6 +473,17 @@ fn tree(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 if let Some(m) = &mut app.mesh {
                     m.visible = !m.visible;
                 }
+            }
+            let mut discard = false;
+            if let Some(resp) = r.response {
+                resp.context_menu(|ui| {
+                    if kit::menu_item(ui, "Delete Mesh", Button::Danger, app.can_edit(), app.edit_blocked().unwrap_or("")) {
+                        discard = true;
+                    }
+                });
+            }
+            if discard {
+                app.discard_mesh();
             }
         }
     }
@@ -540,7 +553,9 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     app.selection = Some(Node::Pass(pass));
                 }
             }
-            let footer_h = if tool.is_some() { t.form_footer_height } else { 0.0 };
+            // A pending alignment decision gets the footer too (the Accept/Reject rule).
+            let decision = tool.is_none() && app.stage == Stage::Align && (app.poses_preview.is_some() || app.align_preview.is_some());
+            let footer_h = if tool.is_some() || decision { t.form_footer_height } else { 0.0 };
             egui::ScrollArea::vertical().auto_shrink([false, true]).max_height((max_h - t.form_header_height - footer_h - 2.0).max(40.0)).show(ui, |ui| {
                 egui::Frame::NONE.inner_margin(Margin { left: 12, right: 12, top: 8, bottom: 10 }).show(ui, |ui| {
                     kit::scope(ui, |ui| match (tool, frame) {
@@ -550,27 +565,50 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     });
                 });
             });
-            if let Some(tool) = tool {
+            if tool.is_some() || decision {
+                let actions = if let Some(tool) = tool {
+                    let blocked = app.tool_blocked(tool);
+                    let bad_ip = tool == Tool::ConnectIp && !app.ip_valid();
+                    let few_pairs = matches!(tool, Tool::PointPairs(_)) && app.picked_pairs().len() < 3;
+                    let label = match tool {
+                        Tool::ConnectIp => "Connect",
+                        Tool::Export(_) => "Export",
+                        Tool::PointPairs(_) => "Align",
+                        Tool::SaveProject => "Save",
+                        _ => "Apply",
+                    };
+                    kit::Actions {
+                        primary: Some((label, blocked.is_none() && !bad_ip && !few_pairs)),
+                        primary_tip: blocked.or(bad_ip.then_some("Enter a valid address")).or(few_pairs.then_some("Pick at least 3 pairs")),
+                        cancel: Some("Cancel"),
+                        ..Default::default()
+                    }
+                } else {
+                    kit::Actions { primary: Some(("Accept", app.can_edit())), primary_tip: app.edit_blocked(), cancel: Some("Reject"), ..Default::default() }
+                };
                 let rule = ui.cursor().top();
                 t.secondary_hline(ui.painter(), ui.max_rect().x_range(), rule, t.dialog_rule);
-                let blocked = app.tool_blocked(tool);
-                let ok = match tool {
-                    Tool::ConnectIp => "Connect",
-                    Tool::Export(_) => "Export",
-                    Tool::PointPairs(_) => "Align",
-                    Tool::SaveProject => "Save",
-                    Tool::IsolateObject => "Keep object",
-                    Tool::FillHoles => "Fill",
-                    Tool::MakeSolid => "Make solid",
-                    _ => "OK",
-                };
-                let ok_enabled = blocked.is_none() && (tool != Tool::ConnectIp || app.ip_valid()) && (!matches!(tool, Tool::PointPairs(_)) || app.picked_pairs().len() >= 3);
-                let (cancel, accept) = egui::Frame::NONE.fill(t.dialog_footer).corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: t.radius_xl, se: t.radius_xl }).show(ui, |ui| kit::dialog_footer(ui, ok, ok_enabled, Some("Cancel"))).inner;
-                if cancel {
-                    app.close_tool();
-                }
-                if accept {
-                    app.run_tool(tool);
+                let r = egui::Frame::NONE.fill(t.dialog_footer).corner_radius(egui::CornerRadius { nw: 0, ne: 0, sw: t.radius_xl, se: t.radius_xl }).show(ui, |ui| kit::dialog_footer(ui, &actions)).inner;
+                match r.choice {
+                    Some(kit::Choice::Cancel) => {
+                        if tool.is_some() {
+                            app.close_tool();
+                        } else if app.poses_preview.is_some() {
+                            app.reject_poses();
+                        } else {
+                            app.discard_preview();
+                        }
+                    }
+                    Some(kit::Choice::Primary) => {
+                        if let Some(tool) = tool {
+                            app.run_tool(tool);
+                        } else if app.poses_preview.is_some() {
+                            app.accept_poses();
+                        } else {
+                            app.accept_preview();
+                        }
+                    }
+                    _ => {}
                 }
             }
         });
@@ -605,21 +643,22 @@ fn frame_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, pass: u32, id: u64) {
     kit::row(ui, "Points", |ui| kit::value_text(ui, &thousands(k.points), false));
     kit::row(ui, "New points", |ui| kit::value_text(ui, &thousands(k.new_points), false));
     ui.add_space(t.space_6);
-    kit::note(ui, "Its points are highlighted in the view. Discard a frame that landed in the wrong place; the pass is rebuilt from the frames that are kept.");
+    kit::note_with_tip(ui, "Its points are highlighted in the view.", "Discard a frame that landed in the wrong place; the pass is rebuilt from the frames that are kept.");
     ui.add_space(t.space_8);
     let can = app.can_edit_frames();
-    let main = if k.discarded { "Restore frame" } else { "Discard frame" };
-    if kit::wide_button(ui, main, if k.discarded { Button::Primary } else { Button::Normal }, can).clicked() {
+    let why = if can { "" } else if app.busy.is_some() { "Another operation is running" } else { "Pause or stop the capture first" };
+    let main = if k.discarded { "Restore Frame" } else { "Discard Frame" };
+    if kit::wide_button(ui, main, if k.discarded { Button::Primary } else { Button::Normal }, can).on_hover_text(if can { "" } else { why }).clicked() {
         app.set_frame_discarded(pass, id, !k.discarded);
     }
     ui.add_space(t.space_4);
-    let from = if later > 0 { format!("Discard this and {later} later frame{}", if later == 1 { "" } else { "s" }) } else { "Discard this and all later frames".to_string() };
-    if kit::wide_button(ui, &from, Button::Normal, can && (!k.discarded || later > 0)).clicked() {
+    let from = if later > 0 { format!("Discard This and {later} Later Frame{}", if later == 1 { "" } else { "s" }) } else { "Discard This and All Later Frames".to_string() };
+    if kit::wide_button(ui, &from, Button::Normal, can && (!k.discarded || later > 0)).on_hover_text(if can { "" } else { why }).clicked() {
         app.discard_frames_from(pass, id);
     }
     if !can {
         ui.add_space(t.space_4);
-        kit::note(ui, if app.busy.is_some() { "Wait for the current operation to finish." } else { "Pause or stop the capture to change frames." });
+        kit::note(ui, if app.busy.is_some() { "Another operation is running." } else { "Pause or stop the capture first." });
     }
 }
 
@@ -672,26 +711,32 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         }
         Tool::Reconstruct => {
             kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {input} points"), true));
-            kit::slider_row(ui, "Triangle size", &mut s.mc_cell_mm, 0.3..=3.0, 1, "mm");
-            kit::slider_row(ui, "Smoothness", &mut s.mesh_smoothness, 2.0..=6.0, 1, "");
-            kit::slider_row(ui, "Then smooth", &mut s.mesh_auto_smooth, 0..=10, 0, "");
-            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "");
-            kit::note(ui, "Triangle size: smaller keeps finer detail, takes longer and makes a bigger file. Smoothness: how far the surface averages over neighbouring points (in point spacings); more hides noise and small misalignment between passes, less keeps fine detail. Then smooth: edge-preserving smoothing right after (0 = off). Open areas stay open: Fill Holes closes them.");
+            kit::slider_row(ui, "Triangle size", &mut s.mc_cell_mm, 0.3..=3.0, 1, "mm").on_hover_text("Smaller keeps finer detail, takes longer and makes a bigger file.");
+            kit::slider_row(ui, "Smoothness", &mut s.mesh_smoothness, 2.0..=6.0, 1, "").on_hover_text(
+                "How far the surface averages over neighbouring points, in point spacings. More hides noise and small misalignment between passes; less keeps fine detail.",
+            );
+            kit::slider_row(ui, "Then smooth", &mut s.mesh_auto_smooth, 0..=10, 0, "").on_hover_text("Edge-preserving smoothing steps right after reconstruction (0 = off).");
+            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "").on_hover_text("High keeps edges and ribs sharp; low rounds everything like a plain smoothing filter.");
+            kit::note(ui, "Open areas stay open; Fill Holes closes them.");
         }
         Tool::Smooth => {
-            kit::slider_row(ui, "Strength", &mut s.smooth_iterations, 1..=15, 0, "");
-            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "");
-            kit::note(ui, "Smooths flat and curved areas while keeping edges and ribs (Keep edges high), or rounds everything like a plain smoothing filter (Keep edges low). Folded spots from bad scan data are relaxed first.");
+            kit::slider_row(ui, "Strength", &mut s.smooth_iterations, 1..=15, 0, "").on_hover_text("Number of smoothing steps.");
+            kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "").on_hover_text("High keeps edges and ribs sharp; low rounds everything like a plain smoothing filter.");
+            kit::note(ui, "Folded spots from bad scan data are relaxed first.");
         }
         Tool::FillHoles => fill_holes_form(app, ui),
         Tool::MakeSolid => {
             let points = app.working_len();
             let source = app.working_source();
             let s = &mut app.settings;
-            kit::row(ui, "Source", |ui| kit::value_field(ui, &format!("{source} · {} points", thousands(points)), true));
-            kit::slider_row(ui, "Cell size", &mut s.solid_cell_mm, 0.25..=1.5, 2, "mm");
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {} points", thousands(points)), true));
+            kit::slider_row(ui, "Cell size", &mut s.solid_cell_mm, 0.25..=1.5, 2, "mm").on_hover_text("The wall should be at least 6 cells thick. Smaller cells keep finer detail and take longer.");
             kit::checkbox(ui, "Find and remove marker stickers", &mut s.solid_remove_markers);
-            kit::note(ui, "Builds a closed, watertight solid of a thin-walled part from the points, for printing or CAD: both faces of the wall, the rim between them, enclosed holes filled and the unscanned side of the wall completed at the measured thickness. The wall should be at least 6 cells thick. It replaces the mesh (undoable) and takes longer than Reconstruct.");
+            kit::note_with_tip(
+                ui,
+                "Builds a closed, watertight solid of a thin-walled part and replaces the mesh. Takes longer than Reconstruct.",
+                "Both faces of the wall, the rim between them, enclosed holes filled and the unscanned side of the wall completed at the measured thickness. For printing or CAD.",
+            );
         }
         Tool::Decimate => {
             let tris = app.mesh.as_ref().map(|m| m.analysis.triangle_count);
@@ -721,7 +766,11 @@ fn pairs_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
     kit::row(ui, "Moving", |ui| kit::value_text(ui, &name, false));
     kit::row(ui, "Onto", |ui| kit::value_text(ui, "Project model", false));
     ui.add_space(t.space_4);
-    kit::note(ui, "Click a spot on the model (left), then the same spot on the pass (right). Three or more pairs, spread over the object, then Align. Picks need only be close: the surfaces are fitted afterwards.");
+    kit::note_with_tip(
+        ui,
+        "Click a spot on the model (left), then the same spot on the pass (right). Three or more pairs, spread over the object.",
+        "Picks need only be close: the surfaces are fitted afterwards.",
+    );
     ui.add_space(t.space_6);
     let mut remove = None;
     if let Some(p) = &app.picking {
@@ -738,7 +787,7 @@ fn pairs_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
             ui.horizontal(|ui| {
                 kit::value_text(ui, &format!("{}  {state}", i + 1), a.is_none() || b.is_none());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("✕").on_hover_text("Remove this pair").clicked() {
+                    if kit::close_button(ui, "Remove this pair").clicked() {
                         remove = Some(i);
                     }
                 });
@@ -779,7 +828,7 @@ fn isolate_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             kit::value_text(ui, &format!("{}  {}", i + 1, if *keep { "keep this cluster" } else { "leave this cluster out" }), false);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.small_button("✕").on_hover_text("Remove this pick").clicked() {
+                if kit::close_button(ui, "Remove this pick").clicked() {
                     remove = Some(i);
                 }
             });
@@ -790,7 +839,7 @@ fn isolate_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         app.remove_object_pick(i);
     }
     ui.add_space(t.space_4);
-    if kit::wide_button(ui, "Undo last pick", Button::Normal, can_undo).clicked() {
+    if kit::wide_button(ui, "Undo Last Pick", Button::Normal, can_undo).clicked() {
         app.undo_object_pick();
     }
 }
@@ -816,16 +865,21 @@ fn fill_holes_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     app.refresh_holes();
     let s = &mut app.settings;
     // Slider in boundary length; the holes are listed by it.
-    kit::slider_row(ui, "Up to", &mut s.fill_max_mm, 5.0..=1000.0, 0, "mm around");
-    kit::checkbox(ui, "Leave the largest opening (open scan border)", &mut s.fill_keep_largest);
+    kit::slider_row(ui, "Max. size", &mut s.fill_max_mm, 5.0..=1000.0, 0, "mm").on_hover_text("Largest hole to fill, measured around its rim (boundary length).");
+    kit::checkbox(ui, "Keep the largest opening", &mut s.fill_keep_largest).on_hover_text("The largest opening is usually the open border of the scan, not a hole.");
     let Some(h) = &app.holes else { return };
     let (fill, skip) = h.split(app.settings.fill_max_mm, app.settings.fill_keep_largest);
-    kit::row(ui, "Holes", |ui| kit::value_text(ui, &format!("{} · {fill} to fill, {skip} left open", h.holes.len()), false));
+    kit::row(ui, "To fill", |ui| kit::value_text(ui, &format!("{fill} of {} holes", h.holes.len()), false));
+    kit::row(ui, "Left open", |ui| kit::value_text(ui, &format!("{skip}"), false));
     if let Some(big) = h.holes.first() {
-        kit::row(ui, "Largest", |ui| kit::value_text(ui, &format!("{:.0} mm around, {:.0} mm across", big.perimeter_mm, big.diameter_mm), false));
+        kit::row(ui, "Largest", |ui| kit::value_text(ui, &format!("{:.0} mm rim · {:.0} mm across", big.perimeter_mm, big.diameter_mm), false));
     }
     ui.add_space(t.space_4);
-    kit::note(ui, "Holes to fill are outlined in the view (accent), those left open in grey. Each hole is closed with triangles of the surrounding size and shaped to continue the surface around it. Undoable.");
+    kit::note_with_tip(
+        ui,
+        "Holes to fill are outlined in the view; those left open are grey.",
+        "Each hole is closed with triangles of the surrounding size and shaped to continue the surface around it.",
+    );
 }
 
 fn export_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -864,7 +918,7 @@ fn stage_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             ui.add_space(Tokens::get().space_8);
             let format = app.settings.export_format;
             let blocked = app.tool_blocked(Tool::Export(format));
-            if kit::wide_button(ui, "Export", Button::Primary, blocked.is_none()).clicked() {
+            if kit::wide_button(ui, "Export", Button::Primary, blocked.is_none()).on_hover_text(blocked.unwrap_or("Export as the chosen format")).clicked() {
                 app.run_tool(Tool::Export(format));
             }
             if let Some(reason) = blocked {
@@ -927,14 +981,22 @@ fn connect_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         }
     }
     ui.add_space(t.space_8);
-    ui.horizontal(|ui| {
-        if kit::button(ui, if app.discovering { "Searching…" } else { "Find Scanners" }, Button::Normal, !app.discovering).clicked() {
-            app.discover();
-        }
-        if kit::button(ui, "Connect", Button::Primary, !app.discovered.is_empty() && !app.connecting).clicked() {
-            app.connect_discovered();
-        }
-    });
+    let tip = if app.connecting { "Connecting…" } else if app.discovered.is_empty() { "Find scanners first" } else { "Connect to the selected scanner" };
+    let r = kit::action_row(
+        ui,
+        &kit::Actions {
+            primary: Some(("Connect", !app.discovered.is_empty() && !app.connecting)),
+            primary_tip: Some(tip),
+            cancel: Some(if app.discovering { "Searching…" } else { "Find Scanners" }),
+            cancel_enabled: !app.discovering,
+            ..Default::default()
+        },
+    );
+    match r.choice {
+        Some(kit::Choice::Primary) => app.connect_discovered(),
+        Some(kit::Choice::Cancel) => app.discover(),
+        _ => {}
+    }
 }
 
 fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -946,7 +1008,7 @@ fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let choice = app.mode_choice();
     let opts = scan_modes::options(app.modes(), choice);
     let mut next = choice;
-    let live_reason = live.then_some("Stop the capture to change this");
+    let live_reason = live.then_some("Stop the capture first");
     mode_row(ui, "Scan mode", "scan_mode", &opts.lights, choice.light, live_reason, &mut next.light, scan_modes::light_help(choice.light));
     mode_row(ui, "Tracking", "tracking_mode", &opts.tracking, choice.tracking, live_reason, &mut next.tracking, scan_modes::tracking_help(choice.tracking));
     mode_row(ui, "Object", "object_type", &opts.objects, choice.object, live_reason, &mut next.object, scan_modes::object_help(choice.object));
@@ -986,7 +1048,7 @@ fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         kit::row(ui, "Depth", |ui| kit::value_text(ui, &format!("{:.0}–{:.0} mm", app.settings.min_mm, app.settings.max_mm), true));
         let note = if app.connection.is_some() { "Set these in the camera view at the bottom left." } else { "Set these in the camera view once a scanner is connected." };
         kit::note(ui, note);
-        if app.connection.is_some() && !app.show_inset && kit::wide_button(ui, "Show camera view", Button::Normal, true).clicked() {
+        if app.connection.is_some() && !app.show_inset && kit::wide_button(ui, "Show Camera View", Button::Normal, true).clicked() {
             app.show_inset = true;
         }
     });
@@ -1019,7 +1081,9 @@ fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
     match app.capture {
         Capture::Idle => {
-            if kit::wide_button(ui, "Start capture", Button::Primary, connected).clicked() {
+            let r = kit::wide_button(ui, "Start Capture", Button::Primary, connected);
+            let r = if connected { r } else { r.on_hover_text("Connect a scanner first") };
+            if r.clicked() {
                 app.start_scan();
             }
             if !connected {
@@ -1027,7 +1091,7 @@ fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
         }
         Capture::Running | Capture::Paused | Capture::Starting => {
-            if kit::wide_button(ui, "Stop capture", Button::Normal, true).clicked() {
+            if kit::wide_button(ui, "Stop Capture", Button::Normal, true).clicked() {
                 app.stop_scan();
             }
         }
@@ -1142,15 +1206,8 @@ fn poses_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             });
         }
     }
-    ui.add_space(t.space_8);
-    ui.horizontal(|ui| {
-        if kit::button(ui, "Accept", Button::Primary, app.can_edit()).clicked() {
-            app.accept_poses();
-        }
-        if kit::button(ui, "Reject", Button::Normal, true).clicked() {
-            app.reject_poses();
-        }
-    });
+    ui.add_space(t.space_4);
+    kit::note(ui, "Accept or reject it in the card on the right.");
 }
 
 fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -1186,21 +1243,26 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             }
         }
         ui.add_space(t.space_4);
-        let note = match verdict {
-            scancraft_align::Verdict::Good => "The pass is shown in its colour where it would go. It fits closely and hides nothing that was measured.",
-            scancraft_align::Verdict::Fair => "Check the fit in the view before accepting: the overlap is small, the surfaces do not agree everywhere, or aligning the other way round gives another result.",
-            scancraft_align::Verdict::Poor => "This looks wrong: little overlap, it puts surface where the scanner saw through, below the table or through the other surface. Try point pairs instead.",
-        };
-        kit::note(ui, note);
-        ui.add_space(t.space_8);
-        ui.horizontal(|ui| {
-            if kit::button(ui, "Accept", Button::Primary, app.can_edit()).clicked() {
-                app.accept_preview();
+        match verdict {
+            scancraft_align::Verdict::Good => {
+                kit::note(ui, "The pass is shown in its colour where it would go. It fits closely and hides nothing that was measured.");
             }
-            if kit::button(ui, "Discard", Button::Normal, true).clicked() {
-                app.discard_preview();
+            scancraft_align::Verdict::Fair => {
+                kit::note_with_tip(
+                    ui,
+                    "Check the fit in the view before accepting.",
+                    "The overlap is small, the surfaces do not agree everywhere, or aligning the other way round gives another result.",
+                );
             }
-        });
+            scancraft_align::Verdict::Poor => {
+                kit::note_with_tip(
+                    ui,
+                    "This looks wrong; try Point Pairs instead.",
+                    "Little overlap, it puts surface where the scanner saw through, below the table or through the other surface.",
+                );
+            }
+        }
+        kit::note(ui, "Accept or reject it in the card on the right.");
         return;
     }
     let placed = app.passes.iter().filter(|p| p.meta.alignment.is_placed()).count();
@@ -1212,14 +1274,17 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         kit::row(ui, "To align", |ui| kit::value_text(ui, &unaligned.join(", "), false));
     }
     ui.add_space(t.space_4);
-    let hint = if app.passes.len() < 2 {
-        "Capture another pass (flip the object, or keep it in place and choose Same position) to align it here."
+    if app.passes.len() < 2 {
+        kit::note(ui, "Capture another pass (flip the object, or keep it in place and choose Same position) to align it here.");
     } else if !unaligned.is_empty() {
-        "Align All places every pass at once, also inside and outside scans of a shell. Align Pass places the selected pass; Point Pairs when the automatic result is wrong. Each result is previewed before it is accepted."
+        kit::note_with_tip(
+            ui,
+            "Align All places every pass at once. Each result is previewed before it is accepted.",
+            "Also works for inside and outside scans of a shell. Align Pass places the selected pass; use Point Pairs when the automatic result is wrong.",
+        );
     } else {
-        "All passes are aligned. Refine All spreads the remaining errors; Merge fuses the included passes into one model."
-    };
-    kit::note(ui, hint);
+        kit::note(ui, "All passes are aligned. Refine All spreads the remaining errors; Merge fuses the included passes into one model.");
+    }
     ui.add_space(t.space_6);
     let blocked = app.align_all_blocked();
     if kit::wide_button(ui, "Align All", if unaligned.is_empty() { Button::Normal } else { Button::Primary }, blocked.is_none()).on_hover_text(blocked.unwrap_or("Align every pass against every other and place them all from the reference")).clicked() {
@@ -1227,13 +1292,13 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
     kit::section(ui, "isolation_settings", "Object", true, |ui| {
         let mut whole = app.settings.whole_scene;
-        if kit::checkbox(ui, "Use whole scene", &mut whole).changed() {
+        if kit::checkbox(ui, "Use whole scene", &mut whole).on_hover_text("Turn on if the object itself is cut off. When off, no fit may push one pass below another's table.").changed() {
             app.settings.whole_scene = whole;
         }
         let note = if whole {
-            "Alignment and Merge use everything the passes saw, the table and loose fragments included."
+            "Alignment and Merge use everything the passes saw, the table included."
         } else {
-            "Alignment and Merge use the object only: the table it stood on and loose fragments are left out, and no fit may push one pass below another's table. Turn on Use whole scene if the object itself is cut off."
+            "Alignment and Merge use the object only, without the table and loose fragments."
         };
         kit::note(ui, note);
     });
@@ -1242,7 +1307,11 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         ui.add_enabled_ui(app.settings.merge_outliers, |ui| {
             kit::slider_row(ui, "Threshold", &mut app.settings.merge_sigma, 1.0..=5.0, 1, "σ");
         });
-        kit::note(ui, "Where passes overlap, the more accurate one wins (laser > Full-field HD > VCSEL); set a pass's weight below. Single observations without surface around them are dropped.");
+        kit::note_with_tip(
+            ui,
+            "Where passes overlap, the more accurate one wins.",
+            "Laser > Full-field HD > VCSEL; set a pass's Merge weight in its properties. Single observations without surface around them are dropped.",
+        );
     });
     if let Some(s) = app.tracking.as_ref().filter(|_| app.capture != Capture::Idle) {
         kit::section(ui, "live_tracking", "Live tracking", false, |ui| {
@@ -1261,7 +1330,11 @@ fn clean_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     let cleaned = app.passes.iter().filter(|p| p.is_cleaned()).count();
     kit::row(ui, "Cleaned", |ui| kit::value_text(ui, &format!("{cleaned} of {} passes", app.passes.len()), false));
     ui.add_space(t.space_6);
-    kit::note(ui, "Each tool works on every shown scan separately; hidden scans are left alone. Hide the others (eye in the browser) to work on one scan. Isolate Object works on one shown scan at a time and keeps the object, dropping the table, marker blocks and loose fragments. Clean each scan, then align them. All steps can be undone.");
+    kit::note_with_tip(
+        ui,
+        "Tools work on each shown pass separately; hidden passes are left alone.",
+        "Hide the others (eye in the browser) to work on one pass. Isolate Object needs exactly one shown pass and keeps the object, dropping the table, marker blocks and loose fragments. Clean each pass, then align them.",
+    );
 }
 
 fn mesh_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -1310,7 +1383,8 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 kit::row(ui, "Size", |ui| kit::value_text(ui, if tiny { &precise } else { &size }, false));
                 if tiny {
                     kit::status_line(ui, "Under 2 units across: probably in metres", Tokens::get().warning);
-                    if kit::wide_button(ui, "Convert metres to mm", Button::Primary, app.can_edit()).on_hover_text("Multiply the coordinates by 1000 (undoable)").clicked() {
+                    let why = app.edit_blocked();
+                    if kit::wide_button(ui, "Convert Metres to mm", Button::Primary, why.is_none()).on_hover_text(why.unwrap_or("Multiply the coordinates by 1000")).clicked() {
                         scale = Some(id);
                     }
                     ui.add_space(Tokens::get().space_4);
@@ -1337,7 +1411,8 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 kit::row(ui, "Object", |ui| kit::value_text(ui, &text, true));
             }
             kit::row(ui, "Cleaning", |ui| kit::value_text(ui, if p.is_cleaned() { "Cleaned" } else { "As scanned" }, !p.is_cleaned()));
-            if p.is_cleaned() && kit::wide_button(ui, "Reset cleaning", Button::Normal, app.can_edit()).on_hover_text("Go back to the pass as scanned or imported (undoable)").clicked() {
+            let why = app.edit_blocked();
+            if p.is_cleaned() && kit::wide_button(ui, "Reset Cleaning", Button::Normal, why.is_none()).on_hover_text(why.unwrap_or("Take the pass back to how it was scanned or imported")).clicked() {
                 reset = Some(id);
             }
             let (mut weight, mut included) = (p.meta.weight, p.meta.included);
@@ -1350,13 +1425,24 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             ui.add_space(Tokens::get().space_4);
             if !p.is_fixed() {
                 let can_continue = app.connection.is_some() && app.capture == Capture::Idle && app.busy.is_none() && !p.is_cleaned();
-                let tip = if p.is_cleaned() { "A cleaned pass cannot be continued: reset its cleaning first" } else { "Capture more into this pass, carrying on from its last kept frame" };
-                if kit::wide_button(ui, "Continue pass", Button::Normal, can_continue).on_hover_text(tip).clicked() {
+                let why = if app.connection.is_none() {
+                    Some("Connect a scanner first")
+                } else if app.capture != Capture::Idle {
+                    Some("Stop the capture first")
+                } else if app.busy.is_some() {
+                    Some("Another operation is running")
+                } else if p.is_cleaned() {
+                    Some("A cleaned pass cannot be continued: reset its cleaning first")
+                } else {
+                    None
+                };
+                if kit::wide_button(ui, "Continue Pass", Button::Normal, can_continue).on_hover_text(why.unwrap_or("Capture more into this pass, carrying on from its last kept frame")).clicked() {
                     continue_pass = Some(id);
                 }
             }
-            ui.add_space(Tokens::get().space_4);
-            if kit::wide_button(ui, "Delete pass", Button::Normal, !recording && app.can_edit()).clicked() {
+            ui.add_space(Tokens::get().space_8);
+            let why = if recording { Some("Stop the capture first") } else { app.edit_blocked() };
+            if kit::wide_button(ui, "Delete Pass", Button::Danger, why.is_none()).on_hover_text(why.unwrap_or("")).clicked() {
                 delete = Some(id);
             }
         }

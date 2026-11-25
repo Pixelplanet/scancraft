@@ -563,7 +563,7 @@ impl ScanCraftApp {
 
     pub fn discard_preview(&mut self) {
         if self.align_preview.take().is_some() {
-            self.say(Tone::Normal, "Discarded the proposed alignment");
+            self.say(Tone::Normal, "Rejected the proposed alignment; the pass is unchanged");
         }
     }
 
@@ -707,7 +707,7 @@ impl ScanCraftApp {
         if !self.can_edit() || self.merged.is_none() {
             return;
         }
-        self.history.push(self.snapshot("Discard merged model"));
+        self.history.push(self.snapshot("Delete merged model"));
         self.merged = None;
         for p in &mut self.passes {
             p.layer.visible = true;
@@ -715,7 +715,7 @@ impl ScanCraftApp {
         if self.selection == Some(Node::Merged) {
             self.selection = None;
         }
-        self.say(Tone::Normal, "Discarded the merged model; the passes are unchanged");
+        self.say(Tone::Normal, "Deleted the merged model; the passes are unchanged");
     }
 
     // ------------------------------------------------------------------ project files

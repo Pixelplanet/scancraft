@@ -39,21 +39,22 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         // Project files.
         x += 22.0;
         let new = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, new, "new", "New project (in a new tab)", app.tabs_blocked().is_none()).clicked() {
+        if kit::app_bar_button(ui, new, "new", app.tabs_blocked().unwrap_or("New Project (in a new tab)"), app.tabs_blocked().is_none()).clicked() {
             app.new_tab();
         }
         x += 32.0;
         let open = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, open, "open", "Open project…", app.can_edit()).clicked() {
+        if kit::app_bar_button(ui, open, "open", app.edit_blocked().unwrap_or("Open Project…"), app.can_edit()).clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::OpenProject);
         }
         x += 32.0;
         let save = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
         let save_tip = match &app.project.path {
-            Some(p) => format!("Save project ({})", p.display()),
-            None => "Save project…".to_string(),
+            Some(p) => format!("Save Project ({})", p.display()),
+            None => "Save Project…".to_string(),
         };
-        if kit::app_bar_button(ui, save, "save", &save_tip, app.tool_blocked(Tool::SaveProject).is_none()).clicked() {
+        let save_why = app.tool_blocked(Tool::SaveProject);
+        if kit::app_bar_button(ui, save, "save", save_why.unwrap_or(&save_tip), save_why.is_none()).clicked() {
             app.open_tool(Tool::SaveProject);
         }
         x += 26.0;
@@ -61,12 +62,12 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         // Passes from outside the project.
         x += 22.0;
         let import = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, import, "import", "Import scan… (PLY, OBJ, STL as a new pass)", app.import_blocked().is_none()).clicked() {
+        if kit::app_bar_button(ui, import, "import", app.import_blocked().unwrap_or("Import Scan… (PLY, OBJ, STL as a new pass)"), app.import_blocked().is_none()).clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::ImportScans);
         }
         x += 32.0;
         let add = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, add, "folder", "Add project… (append another project's passes)", app.import_blocked().is_none()).clicked() {
+        if kit::app_bar_button(ui, add, "folder", app.import_blocked().unwrap_or("Add Project… (append another project's passes)"), app.import_blocked().is_none()).clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::AddProjects);
         }
         x += 26.0;
@@ -93,22 +94,54 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
 }
 
 /// The tab strip between `left` and `right`: click a tab to switch to it, × to close it (asks
-/// first if it has unsaved changes). Tabs share the width evenly when it runs out.
+/// first if it has unsaved changes). A tab keeps its own width (96–220 pt, the name ellipsised);
+/// when they do not all fit, the run of whole tabs around the active one shows and a chevron at
+/// the right end opens the full list.
 fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32, right: f32) {
     let t = Tokens::get();
     let labels = app.tab_labels();
     let blocked = app.tabs_blocked();
     let (gap, close_w, dot_w, pad) = (4.0, 18.0, 12.0, 12.0);
+    let (min_w, max_w, overflow_w) = (96.0, 220.0, 28.0);
     let font = fonts::semibold(t.font_label);
-    let natural: Vec<f32> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.name.clone(), font.clone(), t.app_bar_text).size().x + pad + dot_w + close_w + 6.0).collect();
-    let room = (right - left).max(80.0);
-    let total: f32 = natural.iter().sum::<f32>() + gap * labels.len().saturating_sub(1) as f32;
-    let cap = if total > room { (room - gap * labels.len().saturating_sub(1) as f32) / labels.len().max(1) as f32 } else { f32::MAX };
+    let widths: Vec<f32> = labels
+        .iter()
+        .map(|l| (ui.painter().layout_no_wrap(l.name.clone(), font.clone(), t.app_bar_text).size().x + pad + dot_w + close_w + 6.0).clamp(min_w, max_w))
+        .collect();
+    let room = (right - left).max(0.0);
+    let fits = widths.iter().sum::<f32>() + gap * labels.len().saturating_sub(1) as f32 <= room;
+    // When they do not all fit the last `overflow_w` points hold the list button; the tabs must
+    // stay inside [left, tabs_right].
+    let tabs_right = if fits { right } else { right - overflow_w - gap };
+    let active = labels.iter().position(|l| l.active).unwrap_or(0);
+    let (mut first, mut last) = (0usize, labels.len());
+    if !fits {
+        // The window of consecutive tabs containing the active one, as many whole tabs as fit.
+        let avail = (tabs_right - left).max(0.0);
+        let mut used = 0.0f32;
+        first = active;
+        last = active + 1;
+        used += widths[active];
+        loop {
+            if last < labels.len() && used + gap + widths[last] <= avail {
+                used += gap + widths[last];
+                last += 1;
+            } else if first > 0 && used + gap + widths[first - 1] <= avail {
+                used += gap + widths[first - 1];
+                first -= 1;
+            } else {
+                break;
+            }
+        }
+    }
     let mut x = left;
     let mut switch_to = None;
     let mut close = None;
-    for (i, (l, w)) in labels.iter().zip(&natural).enumerate() {
-        let w = w.min(cap).max(close_w + pad + 24.0);
+    for (i, l) in labels.iter().enumerate().take(last).skip(first) {
+        let w = widths[i].min(tabs_right - x);
+        if w < 40.0 {
+            break;
+        }
         let tab = Rect::from_min_size(pos2(x, bar.center().y - 13.0), vec2(w, 26.0));
         x += w + gap;
         let resp = ui.interact(tab, ui.id().with(("project_tab", i)), egui::Sense::click());
@@ -121,10 +154,8 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
         };
         ui.painter().rect_filled(tab, t.radius_sm, fill);
         let ink = if l.active { t.app_bar_text } else { t.app_bar_text.gamma_multiply(0.7) };
-        let text_room = (w - pad - dot_w - close_w - 6.0).max(10.0);
-        let galley = ui.painter().layout(l.name.clone(), font.clone(), ink, text_room);
-        let clip = Rect::from_min_size(pos2(tab.left() + pad, tab.top()), vec2(text_room, tab.height()));
-        ui.painter().with_clip_rect(clip).galley(pos2(tab.left() + pad, tab.center().y - galley.size().y.min(16.0) / 2.0), galley, ink);
+        let text_rect = Rect::from_min_max(pos2(tab.left() + pad, tab.top()), pos2(tab.right() - dot_w - close_w - 4.0, tab.bottom()));
+        kit::paint_text(ui.painter(), text_rect, &l.name, font.clone(), ink);
         if l.dirty {
             ui.painter().circle_filled(pos2(tab.right() - close_w - dot_w / 2.0 - 2.0, tab.center().y), 3.0, ink);
         }
@@ -153,6 +184,35 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
             switch_to = Some(i);
         }
     }
+    if !fits {
+        // The "all tabs" chevron; its menu lists every tab so hidden ones stay reachable.
+        let more = Rect::from_min_max(pos2(tabs_right + gap, bar.center().y - 13.0), pos2(right, bar.center().y + 13.0));
+        let more_resp = ui.interact(more, ui.id().with("project_tabs_more"), egui::Sense::click());
+        if more_resp.hovered() {
+            ui.painter().rect_filled(more, t.radius_sm, t.app_bar_hover_button);
+        }
+        kit::dropdown_indicator(ui.painter(), Rect::from_center_size(more.center(), vec2(16.0, 16.0)), t.app_bar_text);
+        let mut from_menu = None;
+        egui::Popup::menu(&more_resp.on_hover_text("All open tabs")).close_behavior(egui::PopupCloseBehavior::CloseOnClick).show(|ui| {
+            ui.set_min_width(200.0);
+            for (i, l) in labels.iter().enumerate() {
+                let text = format!("{}{}", if l.dirty { "• " } else { "" }, l.name);
+                let enabled = l.active || blocked.is_none();
+                let r = ui.add_enabled_ui(enabled, |ui| ui.selectable_label(l.active, text)).inner;
+                let r = match (l.active, blocked) {
+                    (false, Some(why)) => r.on_disabled_hover_text(why),
+                    _ => r,
+                };
+                if r.clicked() {
+                    from_menu = Some(i);
+                    ui.close();
+                }
+            }
+        });
+        if let Some(i) = from_menu {
+            switch_to = Some(i);
+        }
+    }
     if let Some(i) = close {
         app.request_close_tab(i);
     } else if let Some(i) = switch_to {
@@ -160,70 +220,40 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
     }
 }
 
-/// The Save / Discard / Cancel question for closing a tab or quitting with unsaved changes.
-/// Button order as everywhere: the primary action at the bottom right, Cancel to its left, the
-/// destructive one apart at the left.
+/// The close dialog for a dirty project, or for quitting with dirty projects (`kit::confirm_modal`):
+/// the header's ×, a click outside and Esc all answer `Choice::Cancel`.
 pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
     let Some(prompt) = app.close_prompt else { return };
-    let t = Tokens::get();
-    let (title, message, primary) = match prompt {
+    let warning = if scancraft_ui::icons::exists("warning") {
+        "warning"
+    } else if scancraft_ui::icons::exists("alert") {
+        "alert"
+    } else {
+        "save"
+    };
+    let (icon, title, message, primary, destructive) = match prompt {
         ClosePrompt::Tab => (
-            "Close project",
+            "save",
+            "Close Project",
             format!("{} has unsaved changes. Save them before closing?", app.project.name),
             Some(if app.project.path.is_some() { "Save" } else { "Save…" }),
+            "Discard Changes",
         ),
-        ClosePrompt::Quit => {
-            let names = app.dirty_names();
-            (
-                "Quit ScanCraft",
-                format!("Unsaved changes in {}. Quit anyway? Save each project from its tab first to keep them.", names.join(", ")),
-                None,
-            )
-        }
+        ClosePrompt::Quit => (
+            warning,
+            "Quit ScanCraft",
+            format!("Unsaved changes in {}. Quit anyway? Save each project from its tab first to keep them.", app.dirty_names().join(", ")),
+            None,
+            "Quit Without Saving",
+        ),
     };
-    let discard = match prompt {
-        ClosePrompt::Tab => "Discard changes",
-        ClosePrompt::Quit => "Quit without saving",
-    };
-    let mut choice = None;
-    let modal = egui::Modal::new(egui::Id::new("close_prompt")).frame(egui::Frame::NONE.fill(t.dialog_footer).corner_radius(t.radius_xl)).show(ctx, |ui| {
-        ui.set_width(420.0);
-        egui::Frame::NONE.fill(t.dialog_bg).corner_radius(egui::CornerRadius { nw: t.radius_xl, ne: t.radius_xl, sw: 0, se: 0 }).show(ui, |ui| {
-            if kit::dialog_header(ui, "", title, true) {
-                choice = Some("cancel");
-            }
-            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(t.space_12 as i8, t.space_10 as i8)).show(ui, |ui| {
-                kit::note(ui, &message);
-            });
-        });
-        ui.horizontal(|ui| {
-            ui.add_space(t.space_12);
-            if kit::button(ui, discard, kit::Button::Normal, true).clicked() {
-                choice = Some("discard");
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(t.space_12);
-                if let Some(p) = primary {
-                    if kit::button(ui, p, kit::Button::Primary, true).clicked() {
-                        choice = Some("save");
-                    }
-                    ui.add_space(t.space_6);
-                }
-                if kit::button(ui, "Cancel", kit::Button::Normal, true).clicked() {
-                    choice = Some("cancel");
-                }
-            });
-        });
-        ui.add_space(t.space_10);
-    });
-    if modal.should_close() && choice.is_none() {
-        choice = Some("cancel");
-    }
+    let actions = kit::Actions { primary: primary.map(|label| (label, true)), cancel: Some("Cancel"), destructive: Some((destructive, true)), ..Default::default() };
+    let choice = kit::confirm_modal(ctx, egui::Id::new("close_prompt"), icon, title, &message, &actions);
     match (prompt, choice) {
-        (_, Some("cancel")) => app.close_prompt = None,
-        (ClosePrompt::Tab, Some("save")) => app.save_then_close(),
-        (ClosePrompt::Tab, Some("discard")) => app.close_active_tab(),
-        (ClosePrompt::Quit, Some("discard")) => {
+        (_, Some(kit::Choice::Cancel)) => app.close_prompt = None,
+        (ClosePrompt::Tab, Some(kit::Choice::Primary)) => app.save_then_close(),
+        (ClosePrompt::Tab, Some(kit::Choice::Destructive)) => app.close_active_tab(),
+        (ClosePrompt::Quit, Some(kit::Choice::Destructive)) => {
             app.close_prompt = None;
             app.quit_confirmed = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -309,130 +339,141 @@ pub fn workspace_card(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
     }
 }
 
-fn reason(blocked: Option<&'static str>, tip: &'static str) -> &'static str {
-    blocked.unwrap_or(tip)
+/// A ribbon command: `blocked` is why it cannot run right now (None = it can); a disabled
+/// button's tooltip is that reason, so a disabled button can never be left unexplained.
+fn rb(id: &'static str, icon: &'static str, label: &'static str, blocked: Option<&'static str>, pressed: bool, tip: &'static str) -> RibbonButton<'static> {
+    RibbonButton { id, icon, label, enabled: blocked.is_none(), pressed, tip: blocked.unwrap_or(tip) }
 }
 
-/// The ribbon card for the current stage; runs the clicked command.
-pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
-    let tabs: Vec<&str> = Stage::ALL.iter().map(|s| s.label()).collect();
-    let mut active = app.stage.index();
+/// The button groups of the current stage's ribbon, split out of [`ribbon`] so the disabled-tip
+/// rule stays structural (`rb`): enabled == `blocked.is_none()` and the tip is the reason.
+fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
     let connected = app.connection.is_some();
     let idle = app.capture == Capture::Idle;
     let tool = app.tool;
     let pressed = |t: Tool| tool == Some(t);
-    let groups: Vec<RibbonGroup> = match app.stage {
+    let edit = app.edit_blocked();
+    match app.stage {
         Stage::Connect => vec![
             RibbonGroup {
                 label: "Device",
                 buttons: vec![
-                    RibbonButton {
-                        id: "discover",
-                        icon: "web",
-                        label: "Find Scanners",
-                        enabled: !app.discovering && !connected,
-                        pressed: app.discovering,
-                        tip: if connected { "Disconnect first" } else { "Search USB and the local network for scanners" },
-                    },
-                    RibbonButton {
-                        id: "connect",
-                        icon: "drive",
-                        label: "Connect",
-                        enabled: !connected && !app.connecting && !app.discovered.is_empty(),
-                        pressed: app.connecting,
-                        tip: if connected { "Already connected" } else if app.discovered.is_empty() { "Find scanners first, then pick one" } else { "Connect to the scanner picked in the panel" },
-                    },
-                    RibbonButton { id: "ip", icon: "open", label: "Connect by IP", enabled: !connected && !app.connecting, pressed: pressed(Tool::ConnectIp), tip: "Connect to a scanner at a known network address" },
-                    RibbonButton { id: "disconnect", icon: "cut", label: "Disconnect", enabled: connected, pressed: false, tip: if connected { "Stop streaming and release the scanner" } else { "Not connected" } },
+                    rb(
+                        "discover",
+                        "web",
+                        "Find Scanners",
+                        if connected { Some("Disconnect first") } else if app.discovering { Some("Searching…") } else { None },
+                        app.discovering,
+                        "Search USB and the local network for scanners",
+                    ),
+                    rb(
+                        "connect",
+                        "drive",
+                        "Connect",
+                        if connected {
+                            Some("Disconnect first")
+                        } else if app.connecting {
+                            Some("Connecting…")
+                        } else if app.discovered.is_empty() {
+                            Some("Find scanners first")
+                        } else {
+                            None
+                        },
+                        app.connecting,
+                        "Connect to the scanner picked in the panel",
+                    ),
+                    rb(
+                        "ip",
+                        "open",
+                        "Connect by IP",
+                        if connected { Some("Disconnect first") } else if app.connecting { Some("Connecting…") } else { None },
+                        pressed(Tool::ConnectIp),
+                        "Connect to a scanner at a known network address",
+                    ),
+                    rb("disconnect", "cut", "Disconnect", (!connected).then_some("Connect a scanner first"), false, "Stop streaming and release the scanner"),
                 ],
             },
             RibbonGroup {
                 label: "Simulator",
-                buttons: vec![RibbonButton {
-                    id: "mock",
-                    icon: "box",
-                    label: "Simulated Scanner",
-                    enabled: !connected && !app.connecting,
-                    pressed: false,
-                    tip: "Connect the built-in simulator: synthetic depth and IR frames for trying the workflow",
-                }],
+                buttons: vec![rb(
+                    "mock",
+                    "box",
+                    "Simulated Scanner",
+                    if connected { Some("Disconnect first") } else if app.connecting { Some("Connecting…") } else { None },
+                    false,
+                    "Connect the built-in simulator: synthetic depth and IR frames for trying the workflow",
+                )],
             },
         ],
         Stage::Scan => vec![
             RibbonGroup {
                 label: "Capture",
                 buttons: vec![
-                    RibbonButton {
-                        id: "start",
-                        icon: "play",
-                        label: "Start",
-                        enabled: connected && idle,
-                        pressed: matches!(app.capture, Capture::Running | Capture::Starting),
-                        tip: if !connected { "Connect a scanner first" } else if !idle { "Capturing" } else { "Start a new scan pass (Space)" },
-                    },
-                    RibbonButton {
-                        id: "pause",
-                        icon: "pause",
-                        label: if app.capture == Capture::Paused { "Resume" } else { "Pause" },
-                        enabled: matches!(app.capture, Capture::Running | Capture::Paused),
-                        pressed: app.capture == Capture::Paused,
-                        tip: "Pause or resume adding points to this pass",
-                    },
-                    RibbonButton {
-                        id: "stop",
-                        icon: "stop_capture",
-                        label: "Stop",
-                        enabled: matches!(app.capture, Capture::Running | Capture::Paused | Capture::Starting),
-                        pressed: false,
-                        tip: "Stop capturing and switch the projector off (Space)",
-                    },
+                    rb(
+                        "start",
+                        "play",
+                        "Start",
+                        if !connected { Some("Connect a scanner first") } else if !idle { Some("Stop the capture first") } else { None },
+                        matches!(app.capture, Capture::Running | Capture::Starting),
+                        "Start a new pass (Space)",
+                    ),
+                    rb(
+                        "pause",
+                        "pause",
+                        if app.capture == Capture::Paused { "Resume" } else { "Pause" },
+                        (!matches!(app.capture, Capture::Running | Capture::Paused)).then_some("No capture is running"),
+                        app.capture == Capture::Paused,
+                        "Pause or resume adding points to this pass",
+                    ),
+                    rb(
+                        "stop",
+                        "stop_capture",
+                        "Stop",
+                        (!matches!(app.capture, Capture::Running | Capture::Paused | Capture::Starting)).then_some("No capture is running"),
+                        false,
+                        "Stop capturing and switch the projector off (Space)",
+                    ),
                 ],
             },
             RibbonGroup {
                 label: "Aim",
                 buttons: vec![
-                    RibbonButton {
-                        id: "preview",
-                        icon: "camera",
-                        label: "Live Preview",
-                        enabled: connected && idle && !app.preview_starting,
-                        pressed: app.previewing,
-                        tip: if !connected { "Connect a scanner first" } else if !idle { "The capture shows its own preview" } else { "Show the camera image without capturing" },
-                    },
-                    RibbonButton { id: "inset", icon: "inspect", label: "Camera Inset", enabled: true, pressed: app.show_inset, tip: "Show the camera image over the view while live" },
+                    rb(
+                        "preview",
+                        "camera",
+                        "Live Preview",
+                        if !connected {
+                            Some("Connect a scanner first")
+                        } else if !idle {
+                            Some("The capture shows its own preview")
+                        } else if app.preview_starting {
+                            Some("Starting the preview…")
+                        } else {
+                            None
+                        },
+                        app.previewing,
+                        "Show the camera image without capturing",
+                    ),
+                    rb("inset", "inspect", "Camera Inset", None, app.show_inset, "Show the camera image over the view while live"),
                 ],
             },
             RibbonGroup {
                 label: "Add Passes",
                 buttons: vec![
-                    RibbonButton {
-                        id: "import_scan",
-                        icon: "import",
-                        label: "Import Scan",
-                        enabled: app.import_blocked().is_none(),
-                        pressed: false,
-                        tip: reason(app.import_blocked(), "Add PLY, OBJ or STL scans (yours or from other scan software) as new passes to align with the others"),
-                    },
-                    RibbonButton {
-                        id: "add_project",
-                        icon: "folder",
-                        label: "Add Project",
-                        enabled: app.import_blocked().is_none(),
-                        pressed: false,
-                        tip: reason(app.import_blocked(), "Append the passes of other ScanCraft projects, unaligned"),
-                    },
+                    rb("import_scan", "import", "Import Scan", app.import_blocked(), false, "Add PLY, OBJ or STL scans (yours or from other scan software) as new passes to align with the others"),
+                    rb("add_project", "folder", "Add Project", app.import_blocked(), false, "Append the passes of other ScanCraft projects, unaligned"),
                 ],
             },
             RibbonGroup {
                 label: "Session",
-                buttons: vec![RibbonButton {
-                    id: "clear",
-                    icon: "delete",
-                    label: "Clear All",
-                    enabled: app.can_edit() && app.has_geometry(),
-                    pressed: false,
-                    tip: if app.has_geometry() { "Remove every pass and result (undoable)" } else { "Nothing to clear" },
-                }],
+                buttons: vec![rb(
+                    "clear",
+                    "delete",
+                    "Clear All",
+                    edit.or((!app.has_geometry()).then_some("Nothing to clear")),
+                    false,
+                    "Remove every pass and result",
+                )],
             },
         ],
         Stage::Align => {
@@ -445,45 +486,45 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                 RibbonGroup {
                     label: "Register",
                     buttons: vec![
-                        RibbonButton {
-                            id: "align_all",
-                            icon: "align",
-                            label: "Align All",
-                            enabled: all_blocked.is_none(),
-                            pressed: app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning all")),
-                            tip: reason(all_blocked, "Align every pass against every other and place them all from the reference (also inside and outside scans of one part)"),
-                        },
-                        RibbonButton {
-                            id: "align_auto",
-                            icon: "checkpoint",
-                            label: "Align Pass",
-                            enabled: blocked.is_none() && !proposed,
-                            pressed: app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning") && !b.starts_with("Aligning all")),
-                            tip: if proposed { "Accept or reject the proposed alignment first" } else { reason(blocked, "Find the selected (or next unaligned) pass's place in the project automatically") },
-                        },
-                        RibbonButton {
-                            id: "align_pick",
-                            icon: "point",
-                            label: "Point Pairs",
-                            enabled: blocked.is_none() || picking,
-                            pressed: picking,
-                            tip: reason(blocked.filter(|_| !picking), "Click three or more matching points on the model and the pass, side by side"),
-                        },
-                        RibbonButton { id: "align_markers", icon: "snap", label: "Markers", enabled: false, pressed: false, tip: "No markers on the object were recorded in these passes" },
+                        rb(
+                            "align_all",
+                            "align",
+                            "Align All",
+                            all_blocked,
+                            app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning all")),
+                            "Align every pass against every other and place them all from the reference (also inside and outside scans of one part)",
+                        ),
+                        rb(
+                            "align_auto",
+                            "checkpoint",
+                            "Align Pass",
+                            if proposed { Some("Accept or reject the proposed alignment first") } else { blocked },
+                            app.busy.as_deref().is_some_and(|b| b.starts_with("Aligning") && !b.starts_with("Aligning all")),
+                            "Find the selected (or next unaligned) pass's place in the project automatically",
+                        ),
+                        rb(
+                            "align_pick",
+                            "point",
+                            "Point Pairs",
+                            blocked.filter(|_| !picking),
+                            picking,
+                            "Click three or more matching points on the model and the pass, side by side",
+                        ),
+                        rb("align_markers", "snap", "Markers", Some("No markers on the object were recorded in these passes"), false, ""),
                     ],
                 },
                 RibbonGroup {
                     label: "Project",
                     buttons: vec![
-                        RibbonButton { id: "refine", icon: "update", label: "Refine All", enabled: app.refine_blocked().is_none(), pressed: false, tip: reason(app.refine_blocked(), "Fine-tune all aligned passes together so errors do not add up") },
-                        RibbonButton { id: "merge", icon: "combine", label: "Merge", enabled: app.merge_blocked().is_none(), pressed: false, tip: reason(app.merge_blocked(), "Fuse the included aligned passes into one model; the passes stay unchanged") },
+                        rb("refine", "update", "Refine All", app.refine_blocked(), false, "Fine-tune all aligned passes together so errors do not add up"),
+                        rb("merge", "combine", "Merge", app.merge_blocked(), false, "Fuse the included aligned passes into one model; the passes stay unchanged"),
                     ],
                 },
                 RibbonGroup {
                     label: "Inspect",
                     buttons: vec![
-                        RibbonButton { id: "colour_passes", icon: "inspect", label: "Pass Colours", enabled: true, pressed: app.colour_passes, tip: "Show each pass in its own colour on this tab" },
-                        RibbonButton { id: "deviation", icon: "zebra", label: "Deviation", enabled: false, pressed: false, tip: "Not available yet: pass-to-pass deviation map" },
+                        rb("colour_passes", "inspect", "Pass Colours", None, app.colour_passes, "Show each pass in its own colour on this tab"),
+                        rb("deviation", "zebra", "Deviation", Some("Not available yet: pass-to-pass deviation map"), false, ""),
                     ],
                 },
             ]
@@ -492,75 +533,89 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
             RibbonGroup {
                 label: "Filter",
                 buttons: vec![
-                    RibbonButton {
-                        id: "isolate",
-                        icon: "body",
-                        label: "Isolate Object",
-                        enabled: app.tool_blocked(Tool::IsolateObject).is_none() || pressed(Tool::IsolateObject),
-                        pressed: pressed(Tool::IsolateObject),
-                        tip: reason(app.tool_blocked(Tool::IsolateObject).filter(|_| !pressed(Tool::IsolateObject)), "Keep the object: the table, marker blocks and loose fragments go. Click a cluster to keep it, Shift+click to leave one out"),
-                    },
-                    RibbonButton { id: "plane", icon: "plane", label: "Remove Plane", enabled: app.tool_blocked(Tool::RemovePlane).is_none(), pressed: pressed(Tool::RemovePlane), tip: reason(app.tool_blocked(Tool::RemovePlane), "Remove the turntable or table plane (RANSAC)") },
-                    RibbonButton { id: "outliers", icon: "filter", label: "Outliers", enabled: app.tool_blocked(Tool::Outliers).is_none(), pressed: pressed(Tool::Outliers), tip: reason(app.tool_blocked(Tool::Outliers), "Remove isolated points (statistical outlier removal)") },
-                    RibbonButton { id: "crop", icon: "box", label: "Crop Box", enabled: app.tool_blocked(Tool::Crop).is_none(), pressed: pressed(Tool::Crop), tip: reason(app.tool_blocked(Tool::Crop), "Keep only the points inside a box") },
-                    RibbonButton { id: "downsample", icon: "snap", label: "Downsample", enabled: app.tool_blocked(Tool::Downsample).is_none(), pressed: pressed(Tool::Downsample), tip: reason(app.tool_blocked(Tool::Downsample), "Merge points into a voxel grid") },
+                    rb(
+                        "isolate",
+                        "body",
+                        "Isolate Object",
+                        app.tool_blocked(Tool::IsolateObject).filter(|_| !pressed(Tool::IsolateObject)),
+                        pressed(Tool::IsolateObject),
+                        "Keep the object: the table, marker blocks and loose fragments go. Click a cluster to keep it, Shift+click to leave one out",
+                    ),
+                    rb("plane", "plane", "Remove Plane", app.tool_blocked(Tool::RemovePlane), pressed(Tool::RemovePlane), "Remove the turntable or table plane (RANSAC)"),
+                    rb("outliers", "filter", "Outliers", app.tool_blocked(Tool::Outliers), pressed(Tool::Outliers), "Remove isolated points (statistical outlier removal)"),
+                    rb("crop", "box", "Crop Box", app.tool_blocked(Tool::Crop), pressed(Tool::Crop), "Keep only the points inside a box"),
+                    rb("downsample", "snap", "Downsample", app.tool_blocked(Tool::Downsample), pressed(Tool::Downsample), "Merge points into a voxel grid"),
                 ],
             },
             RibbonGroup {
                 label: "Reset",
-                buttons: vec![RibbonButton {
-                    id: "revert",
-                    icon: "revert",
-                    label: "Reset Cleaning",
-                    enabled: app.can_reset_cleaning() && app.can_edit(),
-                    pressed: false,
-                    tip: if app.can_reset_cleaning() { "Take the shown scans back to how they were scanned or imported (undoable)" } else { "No shown scan is cleaned" },
-                }],
+                buttons: vec![rb(
+                    "revert",
+                    "revert",
+                    "Reset Cleaning",
+                    edit.or((!app.can_reset_cleaning()).then_some("No shown pass is cleaned")),
+                    false,
+                    "Take the shown passes back to how they were scanned or imported",
+                )],
             },
         ],
         Stage::Mesh => vec![
             RibbonGroup {
                 label: "Create",
                 buttons: vec![
-                    RibbonButton { id: "reconstruct", icon: "mesh_body", label: "Reconstruct", enabled: app.tool_blocked(Tool::Reconstruct).is_none(), pressed: pressed(Tool::Reconstruct), tip: reason(app.tool_blocked(Tool::Reconstruct), "Build a smooth surface from the points") },
-                    RibbonButton { id: "make_solid", icon: "body", label: "Make Solid", enabled: app.tool_blocked(Tool::MakeSolid).is_none(), pressed: pressed(Tool::MakeSolid), tip: reason(app.tool_blocked(Tool::MakeSolid), "Build a closed, watertight solid of a thin-walled part") },
+                    rb("reconstruct", "mesh_body", "Reconstruct", app.tool_blocked(Tool::Reconstruct), pressed(Tool::Reconstruct), "Build a smooth surface from the points"),
+                    rb("make_solid", "body", "Make Solid", app.tool_blocked(Tool::MakeSolid), pressed(Tool::MakeSolid), "Build a closed, watertight solid of a thin-walled part"),
                 ],
             },
             RibbonGroup {
                 label: "Refine",
                 buttons: vec![
-                    RibbonButton { id: "smooth", icon: "surface", label: "Smooth", enabled: app.tool_blocked(Tool::Smooth).is_none(), pressed: pressed(Tool::Smooth), tip: reason(app.tool_blocked(Tool::Smooth), "Smooth the surface while keeping edges") },
-                    RibbonButton { id: "decimate", icon: "reach", label: "Decimate", enabled: app.tool_blocked(Tool::Decimate).is_none(), pressed: pressed(Tool::Decimate), tip: reason(app.tool_blocked(Tool::Decimate), "Reduce the triangle count") },
-                    RibbonButton { id: "fill_holes", icon: "patch", label: "Fill Holes", enabled: app.tool_blocked(Tool::FillHoles).is_none(), pressed: pressed(Tool::FillHoles), tip: reason(app.tool_blocked(Tool::FillHoles), "Close holes up to a size, shaped to continue the surface") },
+                    rb("smooth", "surface", "Smooth", app.tool_blocked(Tool::Smooth), pressed(Tool::Smooth), "Smooth the surface while keeping edges"),
+                    rb("decimate", "reach", "Decimate", app.tool_blocked(Tool::Decimate), pressed(Tool::Decimate), "Reduce the triangle count"),
+                    rb("fill_holes", "patch", "Fill Holes", app.tool_blocked(Tool::FillHoles), pressed(Tool::FillHoles), "Close holes up to a size, shaped to continue the surface"),
                 ],
             },
             RibbonGroup {
                 label: "Manage",
-                buttons: vec![RibbonButton { id: "delete_mesh", icon: "delete", label: "Delete Mesh", enabled: app.mesh.is_some() && app.can_edit(), pressed: false, tip: if app.mesh.is_some() { "Delete the mesh (undoable)" } else { "No mesh" } }],
+                buttons: vec![rb(
+                    "delete_mesh",
+                    "delete",
+                    "Delete Mesh",
+                    edit.or(app.mesh.is_none().then_some("No mesh")),
+                    false,
+                    "Delete the mesh",
+                )],
             },
         ],
         Stage::Export => vec![
             RibbonGroup {
                 label: "Points",
-                buttons: vec![RibbonButton {
-                    id: "export_ply_cloud",
-                    icon: "export",
-                    label: "Point Cloud PLY",
-                    enabled: app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)).is_none(),
-                    pressed: pressed(Tool::Export(ExportFormat::PlyCloud)),
-                    tip: reason(app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)), "Binary PLY of the merged model when shown, else of the shown passes"),
-                }],
+                buttons: vec![rb(
+                    "export_ply_cloud",
+                    "export",
+                    "Point Cloud PLY",
+                    app.tool_blocked(Tool::Export(ExportFormat::PlyCloud)),
+                    pressed(Tool::Export(ExportFormat::PlyCloud)),
+                    "Binary PLY of the merged model when shown, else of the shown passes",
+                )],
             },
             RibbonGroup {
                 label: "Mesh",
                 buttons: vec![
-                    RibbonButton { id: "export_ply_mesh", icon: "export", label: "Mesh PLY", enabled: app.tool_blocked(Tool::Export(ExportFormat::PlyMesh)).is_none(), pressed: pressed(Tool::Export(ExportFormat::PlyMesh)), tip: reason(app.tool_blocked(Tool::Export(ExportFormat::PlyMesh)), "Binary PLY mesh") },
-                    RibbonButton { id: "export_obj", icon: "export", label: "OBJ", enabled: app.tool_blocked(Tool::Export(ExportFormat::ObjMesh)).is_none(), pressed: pressed(Tool::Export(ExportFormat::ObjMesh)), tip: reason(app.tool_blocked(Tool::Export(ExportFormat::ObjMesh)), "Wavefront OBJ") },
-                    RibbonButton { id: "export_stl", icon: "export", label: "STL", enabled: app.tool_blocked(Tool::Export(ExportFormat::StlMesh)).is_none(), pressed: pressed(Tool::Export(ExportFormat::StlMesh)), tip: reason(app.tool_blocked(Tool::Export(ExportFormat::StlMesh)), "Binary STL for printing") },
+                    rb("export_ply_mesh", "export", "Mesh PLY", app.tool_blocked(Tool::Export(ExportFormat::PlyMesh)), pressed(Tool::Export(ExportFormat::PlyMesh)), "Binary PLY mesh"),
+                    rb("export_obj", "export", "OBJ", app.tool_blocked(Tool::Export(ExportFormat::ObjMesh)), pressed(Tool::Export(ExportFormat::ObjMesh)), "Wavefront OBJ"),
+                    rb("export_stl", "export", "STL", app.tool_blocked(Tool::Export(ExportFormat::StlMesh)), pressed(Tool::Export(ExportFormat::StlMesh)), "Binary STL for printing"),
                 ],
             },
         ],
-    };
+    }
+}
+
+/// The ribbon card for the current stage; runs the clicked command.
+pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
+    let tabs: Vec<&str> = Stage::ALL.iter().map(|s| s.label()).collect();
+    let mut active = app.stage.index();
+    let groups = ribbon_groups(app);
     let clicked = kit::ribbon_card(ui, rect, &tabs, &mut active, &groups).map(str::to_string);
     if active != app.stage.index() {
         app.stage = Stage::ALL[active];
@@ -607,7 +662,7 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         "merge" => app.merge_passes(),
         "colour_passes" => app.colour_passes = !app.colour_passes,
         "isolate" => {
-            if pressed(Tool::IsolateObject) {
+            if app.tool == Some(Tool::IsolateObject) {
                 app.close_tool();
             } else {
                 app.open_tool(Tool::IsolateObject);

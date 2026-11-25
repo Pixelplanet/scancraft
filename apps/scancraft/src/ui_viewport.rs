@@ -302,14 +302,14 @@ fn toast(app: &mut ScanCraftApp, ctx: &egui::Context, top_centre: egui::Pos2) {
                 ui.set_max_width(520.0);
                 ui.add(egui::Label::new(egui::RichText::new(&message).size(t.font_body).color(t.text)).wrap());
                 if let Some(a) = action {
-                    if ui.add_enabled(app.can_edit(), egui::Button::new(a.label())).clicked() {
+                    if kit::button(ui, a.label(), kit::Button::Normal, app.can_edit()).clicked() {
                         act = true;
                     }
                 }
-                if ui.add_enabled(app.history.can_undo() && app.can_edit(), egui::Button::new("Undo")).clicked() {
+                if kit::button(ui, "Undo", kit::Button::Normal, app.history.can_undo() && app.can_edit()).clicked() {
                     undo = true;
                 }
-                if ui.small_button("✕").on_hover_text("Dismiss").clicked() {
+                if kit::close_button(ui, "Dismiss").clicked() {
                     close = true;
                 }
             });

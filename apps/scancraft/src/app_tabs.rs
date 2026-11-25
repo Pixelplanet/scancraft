@@ -148,7 +148,7 @@ impl ScanCraftApp {
     /// Why tabs cannot be switched, opened or closed now.
     pub fn tabs_blocked(&self) -> Option<&'static str> {
         if self.busy.is_some() {
-            Some("Wait for the running operation to finish")
+            Some("Another operation is running")
         } else if self.capture != super::Capture::Idle {
             Some("Stop the capture first")
         } else if self.picker.is_open() {

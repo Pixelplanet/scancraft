@@ -561,7 +561,7 @@ impl ScanCraftApp {
         if dropped.is_empty() {
             return false;
         }
-        self.show_toast(format!("{reason}: removed the {}, which no longer match. Undo restores them.", dropped.join(" and ")));
+        self.show_toast(format!("{reason}: deleted the {}, which no longer match. Undo restores them.", dropped.join(" and ")));
         true
     }
 
@@ -1215,7 +1215,7 @@ impl ScanCraftApp {
         match targets.len() {
             0 => "Nothing shown".to_string(),
             1..=3 => targets.iter().map(|t| self.target_name(*t)).collect::<Vec<_>>().join(", "),
-            n => format!("{n} scans"),
+            n => format!("{n} passes"),
         }
     }
 
@@ -1318,6 +1318,17 @@ impl ScanCraftApp {
 
     pub fn can_edit(&self) -> bool {
         self.capture == Capture::Idle && self.busy.is_none()
+    }
+
+    /// Why editing the project is blocked right now (for a disabled button's tooltip).
+    pub fn edit_blocked(&self) -> Option<&'static str> {
+        if self.busy.is_some() {
+            Some("Another operation is running")
+        } else if self.capture != Capture::Idle {
+            Some("Stop the capture first")
+        } else {
+            None
+        }
     }
 
     /// Frames can be discarded while idle or paused (the worker is not registering then).
@@ -1514,7 +1525,7 @@ impl ScanCraftApp {
                 if !self.has_geometry() {
                     Some("No points to work on: scan or import first")
                 } else if self.clean_len() == 0 {
-                    Some("Nothing shown: show the scans to clean")
+                    Some("Nothing shown: show the passes to clean")
                 } else {
                     None
                 }
@@ -1631,7 +1642,7 @@ impl ScanCraftApp {
     fn spawn_clean(&mut self, label: &str, undo_label: &str, noun: &'static str, filter: impl Fn(&PointCloud) -> Option<PointCloud> + Send + Sync + 'static) {
         let targets = self.clean_targets();
         if targets.is_empty() {
-            self.say(Tone::Warning, "Nothing shown to clean: show the scans to work on");
+            self.say(Tone::Warning, "Nothing shown to clean: show the passes to work on");
             return;
         }
         // (target, name, surface to clean in its own frame, project <- own frame)
@@ -1867,9 +1878,9 @@ impl ScanCraftApp {
             return None;
         }
         match self.clean_targets().len() {
-            0 => Some("Nothing shown: show the scan to isolate"),
+            0 => Some("Nothing shown: show the pass to isolate"),
             1 => None,
-            _ => Some("Show only the scan to isolate (hide the others)"),
+            _ => Some("Show only the pass to isolate (hide the others)"),
         }
     }
 
@@ -2048,7 +2059,7 @@ impl ScanCraftApp {
                         })
                         .collect();
                     if points.len() < 100 {
-                        return JobResult::Failed("Make Solid needs points with normals: merge the scans first".into());
+                        return JobResult::Failed("Make Solid needs points with normals: merge the passes first".into());
                     }
                     let solid = scancraft_mesh::build_solid(&points, &[], &config);
                     if solid.mesh.triangles.is_empty() {
