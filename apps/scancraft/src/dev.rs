@@ -9,11 +9,13 @@
 //!   Auto Orient), `pairs`, `refine`, `isolate`, `keep`, `merge`, `save:<dir>`,
 //!   `import:<scan file>`, `autoorient`, `rejectorient`, `datumkind:<plane|axis|point>`,
 //!   `datumonto:<plane|axis>:<xy|yz|zx|x|y|z>`, `datumflip:<plane|axis>` (toggles),
+//!   `datumtol:<mm>` (the datum fit tolerance),
 //!   `scaletrue:<pair index>:<mm>`,
 //!   `addproject:<dir>`, `metres` (the toast's metres-to-mm conversion),
 //!   `wholescene:<on|off>`, `fit`, `wait:<frames>`, `tool:<name>` (connectip, plane, outliers,
 //!   crop, downsample, isolate, reconstruct, smooth, decimate, fillholes, makesolid, save,
-//!   export, pairs, datums, scale), `closetool`, `size:<w>,<h>` (window inner size in points),
+//!   export, pairs, datums, scale), `closetool`, `toolapply` (the open tool's primary action),
+//!   `size:<w>,<h>` (window inner size in points),
 //!   `rename:<project name>`, `askquit` (the unsaved-changes quit question),
 //!   `drag:<x>,<y>,<dx>,<dy>` (a left-button drag in points, injected as egui input so it works
 //!   without window focus), `rclick:<x>,<y>` (a right-button click, for context menus),
@@ -269,6 +271,11 @@ impl Script {
                 }
             }
             "closetool" => app.close_tool(),
+            "toolapply" => {
+                if let Some(t) = app.tool {
+                    app.run_tool(t);
+                }
+            }
             "size" => {
                 let v: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 if let [w, h] = v[..] {
@@ -294,6 +301,11 @@ impl Script {
             }
             "autoorient" => app.auto_orient(),
             "rejectorient" => app.reject_orient(),
+            "datumtol" => {
+                if let Ok(mm) = arg.parse::<f32>() {
+                    app.set_datum_tolerance(mm);
+                }
+            }
             "datumkind" => {
                 let kind = match arg {
                     "plane" => Some(crate::app::DatumKind::Plane),
