@@ -27,8 +27,12 @@
 //!    the fallback above [`FAIR_DIRECT_MAX`] unknowns. Fairing runs during refinement too, so the
 //!    splits measure the curved patch rather than the flat initial triangulation.
 //!
-//! Patches only ever add triangles and vertices; the original mesh is not changed (apart from the
-//! normals of the boundary vertices). Every patch is checked before it is applied: no degenerate
+//! Patches only add triangles and vertices. Afterwards each filled hole is blended into its
+//! surroundings ([`HoleFiller::blend_rings`], default two rings): the patch, its boundary loop
+//! and the rings around it are smoothed with a weight that falls off away from the hole, which
+//! removes the crease a patch otherwise shows where it meets a stair-stepped scan rim. With
+//! `blend_rings = 0` the original mesh is not changed (apart from the normals of the boundary
+//! vertices). Every patch is checked before it is applied: no degenerate
 //! triangles, every patch edge used once in each direction except the boundary loop (used once,
 //! opposite to the mesh triangle), and no new edge that already exists in the mesh. A patch that
 //! fails is skipped rather than applied.
@@ -55,7 +59,9 @@ const MAX_PATCH_TRIANGLES: usize = 4_000_000;
 /// (1 − cos θ ∈ [0, 2]), so it is used only when no other triangulation exists.
 const DEGENERATE_COST: f64 = 3.0;
 /// Largest fairing system solved directly (sparse Cholesky); larger ones use conjugate gradients.
-const FAIR_DIRECT_MAX: usize = 150_000;
+/// Measured on a hole of about 990 mm perimeter on a 0.5 mm grid (above the old cap of 150 000):
+/// conjugate gradients 177 s and up to 0.46 mm off the true surface, Cholesky 27 s and 0.06 mm.
+const FAIR_DIRECT_MAX: usize = 1_500_000;
 /// Conjugate-gradient limits of the fallback. The bi-Laplacian is badly conditioned (~n²): on a
 /// 19 000-vertex patch 1000 iterations still left vertices half an edge length from the minimum,
 /// which is why the direct solve is the default.
@@ -96,18 +102,21 @@ pub struct HoleFiller {
     pub max_perimeter_mm: f32,
     /// Never fill the boundary loop with the largest perimeter: the outer border of an open scan.
     pub keep_largest: bool,
+    /// Rings of the original mesh around each filled hole that are blended with the patch
+    /// afterwards (0 = none: the original mesh stays exactly as it was). See [`blend`].
+    pub blend_rings: usize,
 }
 
 impl Default for HoleFiller {
     /// Fill every hole (closes the mesh).
     fn default() -> Self {
-        Self { max_perimeter_mm: f32::INFINITY, keep_largest: false }
+        Self { max_perimeter_mm: f32::INFINITY, keep_largest: false, blend_rings: BLEND_RINGS }
     }
 }
 
 impl HoleFiller {
     pub fn new(max_perimeter_mm: f32, keep_largest: bool) -> Self {
-        Self { max_perimeter_mm, keep_largest }
+        Self { max_perimeter_mm, keep_largest, blend_rings: BLEND_RINGS }
     }
 
     /// All boundary loops of `mesh`, largest perimeter first.
@@ -156,8 +165,20 @@ impl HoleFiller {
                 None => report.skipped += 1,
             }
         }
-        update_normals(mesh, &vt, first_new_tri, &affected);
+        self.finish(mesh, &vt, first_new_tri, &affected);
         report
+    }
+
+    /// Blends the filled holes into their surroundings (if `blend_rings` > 0) and updates the
+    /// normals of every vertex that was added or moved.
+    fn finish(&self, mesh: &mut Mesh, vt: &VertexTris, first_new_tri: usize, affected: &[u32]) {
+        if self.blend_rings == 0 || affected.is_empty() {
+            update_normals(mesh, vt, first_new_tri, affected);
+            return;
+        }
+        let vt = VertexTris::build(mesh);
+        let moved = blend(mesh, &vt, affected, self.blend_rings);
+        recompute_normals_of(mesh, &vt, &moved);
     }
 
     /// Fills one hole (from [`HoleFiller::find_holes`] on the current mesh), ignoring
@@ -173,7 +194,7 @@ impl HoleFiller {
             Some(p) => apply_patch(mesh, &p, &mut report, &mut affected),
             None => report.skipped = 1,
         }
-        update_normals(mesh, &vt, first_new_tri, &affected);
+        self.finish(mesh, &vt, first_new_tri, &affected);
         report
     }
 }
@@ -1390,6 +1411,95 @@ fn apply_patch(mesh: &mut Mesh, p: &Patch, report: &mut FillReport, affected: &m
     report.added_vertices += p.new_pos.len();
 }
 
+/// Default for [`HoleFiller::blend_rings`].
+const BLEND_RINGS: usize = 2;
+
+/// Smooths the seam between patches and the mesh. Liepa's patch meets the boundary loop with
+/// matching tangents, but the loop itself is often the worst part of a scan mesh: the rim of a
+/// data gap is stair-stepped (marching cubes stops cell by cell) and noisy, and a patch hung from
+/// it shows a crease all round. So the patch, its boundary loop and `rings` rings of the
+/// original mesh around it get a few Taubin (λ|μ) steps, the original vertices with a weight
+/// that falls off with their ring (full on the loop, then 2/3, 1/3 for two rings), so measured
+/// surface a few edges away does not move at all. `seeds` are the loop and new vertices.
+/// Returns every vertex that moved, for the normals.
+fn blend(mesh: &mut Mesh, vt: &VertexTris, seeds: &[u32], rings: usize) -> Vec<u32> {
+    let n = mesh.vertices.len();
+    let mut weight = vec![0f32; n];
+    let mut frontier: Vec<u32> = Vec::new();
+    for &v in seeds {
+        if (v as usize) < n && weight[v as usize] == 0.0 {
+            weight[v as usize] = 1.0;
+            frontier.push(v);
+        }
+    }
+    let mut region = frontier.clone();
+    let mut nb = Vec::new();
+    for r in 1..=rings {
+        let w = 1.0 - r as f32 / (rings + 1) as f32;
+        let mut next = Vec::new();
+        for &v in &frontier {
+            vt.neighbours(mesh, v, &mut nb);
+            for &u in &nb {
+                if weight[u as usize] == 0.0 {
+                    weight[u as usize] = w;
+                    next.push(u);
+                }
+            }
+        }
+        region.extend_from_slice(&next);
+        frontier = next;
+    }
+    // Neighbour lists of the region (computed once).
+    let lists: Vec<Vec<u32>> = region
+        .par_iter()
+        .map(|&v| {
+            let mut out = Vec::new();
+            vt.neighbours(mesh, v, &mut out);
+            out
+        })
+        .collect();
+    let mut pos: Vec<Vec3> = mesh.vertices.iter().map(|p| Vec3::from_array(p.position)).collect();
+    let (lambda, mu) = (0.5f32, -0.53f32);
+    for _ in 0..BLEND_STEPS {
+        for f in [lambda, mu] {
+            let moves: Vec<Vec3> = region
+                .par_iter()
+                .zip(&lists)
+                .map(|(&v, l)| {
+                    if l.is_empty() {
+                        return Vec3::ZERO;
+                    }
+                    let c = l.iter().map(|&u| pos[u as usize]).sum::<Vec3>() / l.len() as f32;
+                    (c - pos[v as usize]) * (f * weight[v as usize])
+                })
+                .collect();
+            for (&v, m) in region.iter().zip(moves) {
+                pos[v as usize] += m;
+            }
+        }
+    }
+    for &v in &region {
+        mesh.vertices[v as usize].position = pos[v as usize].to_array();
+    }
+    mesh.update_bbox();
+    region
+}
+
+/// Taubin steps of [`blend`].
+const BLEND_STEPS: usize = 8;
+
+/// Normals of `verts` from all their triangles (sum of unit face normals).
+fn recompute_normals_of(mesh: &mut Mesh, vt: &VertexTris, verts: &[u32]) {
+    let face = |mesh: &Mesh, t: u32| {
+        let [a, b, c] = mesh.triangles[t as usize].indices.map(|i| Vec3::from_array(mesh.vertices[i as usize].position));
+        (b - a).cross(c - a).normalize_or_zero()
+    };
+    let normals: Vec<Vec3> = verts.par_iter().map(|&v| vt.of(v).iter().map(|&t| face(mesh, t)).sum::<Vec3>().try_normalize().unwrap_or(Vec3::Z)).collect();
+    for (&v, n) in verts.iter().zip(normals) {
+        mesh.vertices[v as usize].normal = n.to_array();
+    }
+}
+
 /// Normals of the boundary and new vertices from all their triangles (sum of unit face
 /// normals, as `Mesh::recompute_normals`), without touching the rest of the mesh.
 fn update_normals(mesh: &mut Mesh, vt: &VertexTris, first_new_tri: usize, affected: &[u32]) {
@@ -1835,6 +1945,60 @@ mod tests {
         let a = MeshMetrics::analyze(&mesh);
         assert_eq!(a.open_edges, 3 * rep.skipped, "seed {seed}: {a:?}");
         assert_valid(&mesh);
+    }
+
+    /// Largest angle (degrees) between the normals of two triangles sharing an edge, over the
+    /// edges that touch any of `verts`.
+    fn worst_dihedral_near(mesh: &Mesh, verts: &HashSet<u32>) -> f32 {
+        let pos = |i: u32| Vec3::from_array(mesh.vertices[i as usize].position);
+        let mut by_edge: HashMap<(u32, u32), Vec<Vec3>> = HashMap::new();
+        for t in &mesh.triangles {
+            let [a, b, c] = t.indices;
+            let n = (pos(b) - pos(a)).cross(pos(c) - pos(a)).normalize_or_zero();
+            for (u, v) in [(a, b), (b, c), (c, a)] {
+                if verts.contains(&u) || verts.contains(&v) {
+                    by_edge.entry((u.min(v), u.max(v))).or_default().push(n);
+                }
+            }
+        }
+        by_edge.values().filter(|n| n.len() == 2).map(|n| n[0].dot(n[1]).clamp(-1.0, 1.0).acos().to_degrees()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn blending_removes_the_crease_at_a_jagged_rim() {
+        // A cap hole whose rim is jagged like a marching-cubes data gap: every other loop vertex
+        // pushed 0.4 mm along the normal.
+        let r = 50.0;
+        let mut base = icosphere(r, 5);
+        let dir = Vec3::new(0.3, 0.2, 1.0).normalize();
+        cut(&mut base, dir * r, 12.0);
+        let hole = HoleFiller::find_holes(&base).remove(0);
+        for (k, &v) in hole.vertices.iter().enumerate() {
+            if k % 2 == 0 {
+                let p = Vec3::from_array(base.vertices[v as usize].position);
+                base.vertices[v as usize].position = (p + p.normalize() * 0.4).to_array();
+            }
+        }
+        let rim: HashSet<u32> = hole.vertices.iter().copied().collect();
+        let mut plain = base.clone();
+        HoleFiller { blend_rings: 0, ..HoleFiller::default() }.fill(&mut plain);
+        let mut blended = base.clone();
+        HoleFiller::default().fill(&mut blended);
+        for m in [&plain, &blended] {
+            assert!(MeshMetrics::analyze(m).is_watertight);
+            assert_valid(m);
+        }
+        let (a, b) = (worst_dihedral_near(&plain, &rim), worst_dihedral_near(&blended, &rim));
+        assert!(b < 0.6 * a, "crease at the rim: {b:.1}° blended vs {a:.1}° without");
+        // Away from the hole the measured surface does not move.
+        let n0 = base.vertices.len();
+        let far = (0..n0).filter(|&i| Vec3::from_array(base.vertices[i].position).normalize().dot(dir) < 0.9).all(|i| base.vertices[i].position == blended.vertices[i].position);
+        assert!(far, "blending moved vertices far from the hole");
+        // The filled area stays as close to the sphere as without blending (the raised rim lifts
+        // both patches).
+        let off = |m: &Mesh| m.vertices[n0..].iter().map(|v| (Vec3::from_array(v.position).length() - r).abs()).sum::<f32>() / (m.vertices.len() - n0) as f32;
+        let (p, q) = (off(&plain), off(&blended));
+        assert!(q < p + 0.05, "patch mean {q:.3} mm off the sphere blended vs {p:.3} mm without");
     }
 
     #[test]

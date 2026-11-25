@@ -252,3 +252,7 @@ laser model are not built.
   1.2 (cleaned passes seed Same Position), 1.3 (leave-one-out stray filter in `implicit.rs`)
   and 1.6 (`mesh_project` defaults), with tests. Next per `docs/open-issues.md`: 3.1 (project
   tabs, confirm before discarding), then 2.2 (mesher destroys small relief).
+- 2026-11-25 (second PC, later) — Fill Holes: patches are blended into their surroundings
+  (`HoleFiller::blend_rings`, default 2) to remove the crease at stair-stepped rims; the direct
+  fairing solve now covers holes up to 1.5 M new vertices (open-issues 1.7: a 1 193 mm hole fills
+  in 28 s). `mesh_project` close-ups use a grazing light and take `--fill MM --blend N`.

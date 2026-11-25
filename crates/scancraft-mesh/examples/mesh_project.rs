@@ -212,7 +212,7 @@ fn roughness(mesh: &Mesh) -> (f32, f32, usize) {
 }
 
 /// Shaded orthographic view of the mesh looking along `-axes[2]`, `axes[0]` to the right.
-fn render(mesh: &Mesh, centre: Vec3, axes: [Vec3; 3], half: f32, size: u32) -> image::RgbImage {
+fn render(mesh: &Mesh, centre: Vec3, axes: [Vec3; 3], half: f32, size: u32, grazing: bool) -> image::RgbImage {
     let mut img = image::RgbImage::from_pixel(size, size, image::Rgb([24, 26, 30]));
     let mut depth = vec![f32::MIN; (size * size) as usize];
     let s = size as f32 / (2.0 * half);
@@ -220,7 +220,8 @@ fn render(mesh: &Mesh, centre: Vec3, axes: [Vec3; 3], half: f32, size: u32) -> i
         let d = p - centre;
         Vec3::new((d.dot(axes[0]) * s) + size as f32 / 2.0, size as f32 / 2.0 - d.dot(axes[1]) * s, d.dot(axes[2]))
     };
-    let light = (axes[2] * 0.8 + axes[1] * 0.45 + axes[0] * 0.3).normalize();
+    // A grazing light (close-ups) shows small relief and creases; the default one the shape.
+    let light = if grazing { (axes[2] * 0.35 + axes[0] * 0.9 + axes[1] * 0.25).normalize() } else { (axes[2] * 0.8 + axes[1] * 0.45 + axes[0] * 0.3).normalize() };
     for t in &mesh.triangles {
         let p: Vec<Vec3> = t.indices.iter().map(|&i| Vec3::from(mesh.vertices[i as usize].position)).collect();
         let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
@@ -337,7 +338,8 @@ fn main() {
         Some(max) => {
             let t = Instant::now();
             let before = scancraft_mesh::HoleFiller::find_holes(&mesh).len();
-            let r = scancraft_mesh::HoleFiller { max_perimeter_mm: max, keep_largest: true }.fill(&mut mesh);
+            let blend = std::env::args().skip_while(|x| x != "--blend").nth(1).map(|v| v.parse().unwrap()).unwrap_or(2);
+            let r = scancraft_mesh::HoleFiller { blend_rings: blend, ..scancraft_mesh::HoleFiller::new(max, true) }.fill(&mut mesh);
             mesh.recompute_normals();
             println!("fill <= {max} mm: {before} holes, {r:?} in {:.2} s", t.elapsed().as_secs_f32());
             format!("{tag}_fill{max}")
@@ -366,11 +368,11 @@ fn main() {
     let ext = positions.iter().map(|p| (*p - c).dot(axes[0]).abs()).fold(0.0f32, f32::max) * 1.05;
     let views = [[axes[0], axes[1], axes[2]], [axes[0], axes[2], -axes[1]], [axes[1], axes[2], axes[0]]];
     for (k, v) in views.iter().enumerate() {
-        render(&mesh, c, *v, ext, 1400).save(a.out.join(format!("{tag}_view{}.png", k + 1))).unwrap();
+        render(&mesh, c, *v, ext, 1400, false).save(a.out.join(format!("{tag}_view{}.png", k + 1))).unwrap();
     }
     // A close-up of the area around the point nearest the centre along the view direction.
     // --zoom U,V: centre of the close-up in view 1, as fractions of the half-width (right, up).
     let zoom = std::env::args().skip_while(|x| x != "--zoom").nth(1).map(|z| z.split(',').map(|v| v.parse::<f32>().unwrap()).collect::<Vec<_>>()).unwrap_or(vec![0.3, 0.0]);
-    render(&mesh, c + axes[0] * ext * zoom[0] + axes[1] * ext * zoom[1], views[0], ext * 0.15, 1000).save(a.out.join(format!("{tag}_zoom.png"))).unwrap();
+    render(&mesh, c + axes[0] * ext * zoom[0] + axes[1] * ext * zoom[1], views[0], ext * 0.15, 1000, true).save(a.out.join(format!("{tag}_zoom.png"))).unwrap();
     let _ = (Quat::IDENTITY, Point3D::default());
 }

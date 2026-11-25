@@ -1969,7 +1969,7 @@ impl ScanCraftApp {
             }
             Tool::FillHoles => {
                 let Some(mut mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
-                let filler = scancraft_mesh::HoleFiller { max_perimeter_mm: s.fill_max_mm, keep_largest: s.fill_keep_largest };
+                let filler = scancraft_mesh::HoleFiller::new(s.fill_max_mm, s.fill_keep_largest);
                 self.spawn_undoable("Filling holes", "Fill holes", move || {
                     let report = filler.fill(&mut mesh);
                     if report.filled == 0 {

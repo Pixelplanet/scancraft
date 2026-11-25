@@ -2,7 +2,8 @@
 
 Collected after merging branch `feature/clean-per-pass-meshing` into `main` (commit 3151b3d:
 per-pass cleaning, meshing rework, Fill Holes, file dialogs). **Fixed on 2026-11-25: 1.1, 1.2,
-1.3 and 1.6** (marked below); the rest is open. Sections 1 and 2 come from a review and a measurement run on the original PC. Section 3
+1.3, 1.6 and 1.7, and the crease around filled holes from 2.2** (marked below); the rest is
+open. Sections 1 and 2 come from a review and a measurement run on the original PC. Section 3
 is what the user found by hand in the app. Line numbers refer to commit 3151b3d.
 
 Suggested order for the next session: bugs 1.1 and 1.2 first (small, and they corrupt
@@ -126,6 +127,11 @@ app's settings. **Fix:** change the example's defaults (use `--cell 0.7 --smooth
 
 ### 1.7 Filling a very large hole takes minutes (low)
 
+**Fixed 2026-11-25:** `FAIR_DIRECT_MAX` raised to 1 500 000, so holes up to the slider maximum
+use the direct solve. Check on a 0.5 mm grid: a 1 193 mm hole (199 000 new vertices, above the
+old cap) fills in 28 s; a 1 029 mm hole (144 000) in 14 s. The 1.3 M-triangle bench is unchanged
+(0.57 s, watertight).
+
 Above `FAIR_DIRECT_MAX` = 150 000 unknowns (`holes.rs:58`, `1074`), fairing switches from
 Cholesky to PCG.
 
@@ -180,7 +186,13 @@ detail 4 that drops to 1 212.
   The old one blends it away. It is probably a real alignment offset the old mesher was
   averaging, but it shows as a crease.
 - **Thin wall:** both meshers keep the 3 mm wall as two separate surfaces.
-- **Fill Holes** (perimeter ≤ 60 mm) closed 82 868 of 82 926 holes in 1 s. Every filled
+- **Fill Holes** (perimeter ≤ 60 mm) closed 82 868 of 82 926 holes in 1 s. *Partly fixed
+  2026-11-25:* every filled hole is now blended into its surroundings
+  (`HoleFiller::blend_rings`, default 2: Taubin steps over the patch, its rim and two rings,
+  weighted down away from the hole), because the crease came from the stair-stepped rim the patch
+  hangs from. Test `blending_removes_the_crease_at_a_jagged_rim`; on the two-pass project
+  roughness after Fill Holes 2.76° → 2.63°. Filling still does not fix the pinholes' cause (see
+  above): it should not be used to hide them. Every filled
   pinhole becomes a flat patch with a crease around it, so the result looks crumpled
   around detail, and roughness rises from 2.00° to 2.52° (in the 1.0 mm run). It should not
   be used to hide the pinholes.
