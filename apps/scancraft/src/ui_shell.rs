@@ -34,6 +34,16 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if kit::app_bar_button(ui, redo, "redo", &redo_tip, app.history.can_redo() && app.can_edit()).clicked() {
             app.redo();
         }
+        x += 32.0;
+        let history = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
+        let steps = app.history.timeline().len();
+        let history_tip = if steps == 0 { "History (nothing to undo yet)".to_string() } else { format!("History: {steps} step{} · jump to any of them", if steps == 1 { "" } else { "s" }) };
+        let resp = kit::app_bar_button(ui, history, "rollback", &history_tip, true);
+        app.history_button_hovered = resp.hovered();
+        if resp.clicked() {
+            app.show_history = !app.show_history;
+        }
+        let history_anchor = pos2(history.left(), r.bottom() + 4.0);
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
         // Project files.
@@ -81,6 +91,7 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
             None if app.connecting => (t.agent_busy, "Connecting…".to_string()),
             None => (t.text_dim, "No scanner".to_string()),
         };
+        crate::ui_history::timeline(app, ui.ctx(), history_anchor);
         let pill = kit::app_bar_pill(ui, r.right() - 10.0, r, dot, &text);
         let pill = match &app.connection {
             Some(c) => pill.on_hover_text(format!("{} · {}\nSerial {}\nFirmware {}", c.info.model, c.info.active_transport.description(), c.info.serial_number, c.info.firmware_version)),

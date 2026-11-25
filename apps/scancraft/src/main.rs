@@ -13,6 +13,7 @@ mod model;
 mod project;
 mod replay;
 mod scan_modes;
+mod ui_history;
 mod ui_panels;
 mod ui_shell;
 mod ui_viewport;

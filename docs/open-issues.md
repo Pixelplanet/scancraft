@@ -86,6 +86,10 @@ the point itself in its own neighbourhood.
 
 ### 1.4 Open Project choice is lost if the app became busy while the dialog was open (low)
 
+**Fixed 2026-11-25:** the picked project is kept (`pending_open`) and opened as soon as the app
+is free, with a message; tabs do not switch meanwhile. Test
+`a_project_picked_while_busy_opens_once_the_app_is_free`.
+
 The `rfd` dialog runs on its own thread without a parent window (`file_picker.rs:78-104`), so
 the main window stays usable.
 
@@ -328,6 +332,20 @@ Save dialogs) and the menus. While doing that, check that menu entries and butto
 the same words for the same action.
 
 ### 3.3 History timeline for Undo / Redo
+
+**Done 2026-11-25.** Layers share their points, mesh and GPU copies (`Arc` in `CloudLayer`,
+`MergedLayer`, `MeshLayer`), so a snapshot only costs what the action replaced and undo restores
+the very same data (no re-upload). The history is bounded by memory (`HISTORY_BUDGET_BYTES`
+2 GiB of geometry the live project no longer uses, counted once however many steps share it)
+and `MAX_HISTORY` = 200 steps, instead of 8. The History button next to Undo / Redo opens a
+timeline (`ui_history.rs`): every step with its age, the current state highlighted, undone steps
+greyed; a click jumps there in one go (`History::jump`, one restore, one frame-restore job). Each
+step keeps the action that leads out of it, so the timeline stays complete in both directions.
+Alignment and transform changes are listed (they change the passes); view changes are not.
+Tests: `a_jump_over_several_steps_keeps_the_timeline_in_both_directions`,
+`the_history_keeps_shared_geometry_once_and_trims_by_memory`,
+`snapshots_share_the_passes_that_did_not_change`,
+`jumping_to_a_timeline_step_undoes_or_redoes_several_actions_at_once`.
 
 **Wanted:** a timeline of the actions that modified the point clouds and mesh. The user can
 jump to any earlier or later step directly, not only one step back or forward.

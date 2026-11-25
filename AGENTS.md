@@ -295,3 +295,7 @@ laser model are not built.
   disabled buttons everywhere show their reason (`rb`, `edit_blocked`), tab strip ellipsises
   96–220 pt with a chevron overflow menu. New `--auto` steps `tool`, `closetool`, `size`,
   `rename`, `askquit`, `selectnode`, `rclick`, `hover` for screenshot checks.
+- 2026-11-25 (second PC, branch `agent/history`) — Undo/Redo timeline (open-issues 3.3): shared
+  layers make snapshots cheap, history bounded by 2 GiB / 200 steps, History button + timeline
+  card with jump to any step (`ui_history.rs`). Open Project picked while busy now opens when free
+  (1.4). Script steps `history`, `undo`, `removeplane`, `outliers`.

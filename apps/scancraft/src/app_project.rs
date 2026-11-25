@@ -219,7 +219,7 @@ impl ScanCraftApp {
         let Some(p) = self.passes.iter_mut().find(|p| p.id == id) else { return };
         let delta = scancraft_align::compose(&transform, &p.meta.transform.inverse());
         let visible = p.layer.visible;
-        p.layer = CloudLayer::new(PointCloud::from_points(project::place(std::mem::take(&mut p.layer.cloud.points), &delta)), g);
+        p.layer = CloudLayer::new(PointCloud::from_points(project::place(p.layer.cloud.points.clone(), &delta)), g);
         p.layer.visible = visible;
         p.meta.transform = transform;
         p.meta.alignment = alignment;
@@ -251,7 +251,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(id);
-        self.history.push(self.snapshot(&format!("make {name} the reference")));
+        self.record(self.snapshot(&format!("make {name} the reference")));
         self.clear_previews();
         self.rebase_project(id);
         self.say(Tone::Normal, format!("{name} is the reference; the project frame is now its frame"));
@@ -263,7 +263,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(id);
-        self.history.push(self.snapshot(&format!("reset alignment of {name}")));
+        self.record(self.snapshot(&format!("reset alignment of {name}")));
         self.clear_previews();
         self.place_pass(id, Transform::default(), AlignState::Unaligned);
         self.merged = None;
@@ -438,7 +438,7 @@ impl ScanCraftApp {
                     .collect(),
             ),
         };
-        self.history.push(self.snapshot(label));
+        self.record(self.snapshot(label));
         let n = placements.len();
         for (id, pose, state) in placements {
             self.place_pass(id, pose, state);
@@ -550,7 +550,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.pass_name(preview.pass);
-        self.history.push(self.snapshot(&format!("align {name}")));
+        self.record(self.snapshot(&format!("align {name}")));
         self.place_pass(preview.pass, preview.alignment.transform, AlignState::Aligned { method: preview.method, quality: Some(preview.alignment.quality) });
         self.merged = None;
         self.invalidate_derived(&format!("{name} was aligned"));
@@ -707,7 +707,7 @@ impl ScanCraftApp {
         if !self.can_edit() || self.merged.is_none() {
             return;
         }
-        self.history.push(self.snapshot("Delete merged model"));
+        self.record(self.snapshot("Delete merged model"));
         self.merged = None;
         for p in &mut self.passes {
             p.layer.visible = true;
@@ -730,8 +730,8 @@ impl ScanCraftApp {
             self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone())).collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
-        let merged = self.merged.as_ref().map(|m| (m.layer.cloud.clone(), m.passes.clone()));
-        let mesh = self.mesh.as_ref().map(|m| m.mesh.clone());
+        let merged = self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone()));
+        let mesh = self.mesh.as_ref().map(|m| (*m.mesh).clone());
         let settings = serde_json::json!({
             "min_mm": self.settings.min_mm,
             "max_mm": self.settings.max_mm,
@@ -991,7 +991,7 @@ impl ScanCraftApp {
         }
         let Some(surface) = self.passes.iter().find(|p| p.id == id).and_then(|p| p.surface.clone()) else { return };
         let name = self.pass_name(id);
-        self.history.push(self.snapshot(&format!("scale {name}")));
+        self.record(self.snapshot(&format!("scale {name}")));
         self.clear_previews();
         let surface = Arc::new(crate::imports::scaled(&surface, factor));
         let g = self.generation();

@@ -153,7 +153,7 @@ impl ScanCraftApp {
             Some("Stop the capture first")
         } else if self.picker.is_open() {
             Some("Close the file dialog first")
-        } else if !self.pending_imports.is_empty() {
+        } else if !self.pending_imports.is_empty() || self.pending_open.is_some() {
             Some("Wait for the imports to finish")
         } else {
             None

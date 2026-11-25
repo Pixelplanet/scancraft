@@ -178,8 +178,12 @@ pub enum CleanTarget {
 
 /// Point geometry and its GPU copy. `generation` changes whenever the points are replaced (not
 /// when they are only appended to), so the renderer knows to upload them again.
+///
+/// The points and the GPU copy are shared (`Arc`): cloning a layer is cheap, which is what lets
+/// undo snapshots keep every layer that did not change without copying it.
+#[derive(Clone)]
 pub struct CloudLayer {
-    pub cloud: PointCloud,
+    pub cloud: Arc<PointCloud>,
     pub gpu: Arc<Vec<GpuPoint>>,
     pub generation: u64,
     pub visible: bool,
@@ -188,16 +192,23 @@ pub struct CloudLayer {
 impl CloudLayer {
     pub fn new(cloud: PointCloud, generation: u64) -> Self {
         let gpu = Arc::new(scancraft_render::gpu_points(&cloud));
-        CloudLayer { cloud, gpu, generation, visible: true }
+        CloudLayer { cloud: Arc::new(cloud), gpu, generation, visible: true }
     }
 
     pub fn append(&mut self, points: Vec<Point3D>) {
+        // Copies only if an undo snapshot still shares the points.
         let gpu = Arc::make_mut(&mut self.gpu);
+        let cloud = Arc::make_mut(&mut self.cloud);
         gpu.reserve(points.len());
         for p in points {
             gpu.push(GpuPoint::from_point(&p));
-            self.cloud.push(p);
+            cloud.push(p);
         }
+    }
+
+    /// Memory held by the points and their GPU copy (for the history's memory limit).
+    pub fn bytes(&self) -> usize {
+        self.cloud.len() * std::mem::size_of::<Point3D>() + self.gpu.len() * std::mem::size_of::<GpuPoint>()
     }
 
     pub fn len(&self) -> usize {
@@ -327,6 +338,7 @@ pub fn tinted_points(cloud: &PointCloud, colour: [u8; 3]) -> Vec<GpuPoint> {
 }
 
 /// The fused result of Merge.
+#[derive(Clone)]
 pub struct MergedLayer {
     pub layer: CloudLayer,
     /// The layer shaded for the Align stage's colour mode.
@@ -367,8 +379,10 @@ impl HolePreview {
     }
 }
 
+/// A reconstructed surface. The mesh and its GPU copy are shared, as in [`CloudLayer`].
+#[derive(Clone)]
 pub struct MeshLayer {
-    pub mesh: Mesh,
+    pub mesh: Arc<Mesh>,
     pub analysis: MeshAnalysis,
     pub gpu: Arc<GpuMesh>,
     pub generation: u64,
@@ -378,7 +392,12 @@ pub struct MeshLayer {
 impl MeshLayer {
     pub fn new(mesh: Mesh, analysis: MeshAnalysis, generation: u64) -> Self {
         let gpu = Arc::new(GpuMesh::from_mesh(&mesh));
-        MeshLayer { mesh, analysis, gpu, generation, visible: true }
+        MeshLayer { mesh: Arc::new(mesh), analysis, gpu, generation, visible: true }
+    }
+
+    /// Memory held by the mesh (GPU copy estimated from the same counts).
+    pub fn bytes(&self) -> usize {
+        2 * (self.mesh.vertices.len() * std::mem::size_of::<Point3D>() + self.mesh.triangles.len() * 12)
     }
 }
 
@@ -510,13 +529,55 @@ pub struct OpenedProject {
     pub settings: serde_json::Value,
 }
 
-/// Restorable geometry for undo.
-#[derive(Clone, Default)]
+/// Restorable geometry for undo: the project as it was before an action. Layers are shared with
+/// the live project and with the neighbouring snapshots (see [`CloudLayer`]), so a step only
+/// costs what that action changed.
+#[derive(Clone)]
 pub struct Snapshot {
-    pub merged: Option<(PointCloud, Vec<u32>, String)>,
-    pub mesh: Option<(Mesh, MeshAnalysis)>,
+    pub merged: Option<MergedLayer>,
+    pub mesh: Option<MeshLayer>,
     pub passes: Vec<PassSnapshot>,
+    /// The action that leads from this state to the next one, and when it was done.
     pub label: String,
+    pub at: std::time::SystemTime,
+    /// Tests only: which state this is.
+    #[cfg(test)]
+    pub summary_for_test: String,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        Snapshot {
+            merged: None,
+            mesh: None,
+            passes: Vec::new(),
+            label: String::new(),
+            at: std::time::SystemTime::UNIX_EPOCH,
+            #[cfg(test)]
+            summary_for_test: String::new(),
+        }
+    }
+}
+
+impl Snapshot {
+    /// Every shared block of geometry it holds: (address, bytes). Equal addresses are the same
+    /// memory, held once however many snapshots share it.
+    pub fn blocks(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for p in &self.passes {
+            out.push((Arc::as_ptr(&p.layer.cloud) as usize, p.layer.bytes()));
+            if let Some(e) = &p.edit {
+                out.push((Arc::as_ptr(e) as usize, e.len() * std::mem::size_of::<Point3D>()));
+            }
+        }
+        if let Some(m) = &self.merged {
+            out.push((Arc::as_ptr(&m.layer.cloud) as usize, m.layer.bytes()));
+        }
+        if let Some(m) = &self.mesh {
+            out.push((Arc::as_ptr(&m.mesh) as usize, m.bytes()));
+        }
+        out
+    }
 }
 
 /// A pass as undo restores it: its points and which of its keyframes were discarded. The
@@ -525,7 +586,7 @@ pub struct Snapshot {
 pub struct PassSnapshot {
     pub id: u32,
     pub name: String,
-    pub cloud: PointCloud,
+    pub layer: CloudLayer,
     pub frames: u64,
     pub tracker: SharedTracker,
     pub keyframes: Vec<KeyframeInfo>,
@@ -535,35 +596,89 @@ pub struct PassSnapshot {
     pub edit: Option<Arc<PointCloud>>,
 }
 
-/// Bounded two-stack undo history (kept from the previous app; snapshots clone geometry, so the
-/// depth stays small).
+/// Undo history: the states before each action (oldest first) and, after an undo, the states
+/// that can be redone (next first). Bounded by memory, not by a small step count: snapshots
+/// share unchanged geometry, so only what each action replaced counts (see [`Snapshot`]).
 #[derive(Default)]
 pub struct History {
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
 }
 
-pub const MAX_HISTORY: usize = 8;
+/// Most steps kept, however small.
+pub const MAX_HISTORY: usize = 200;
+/// Most memory the history may hold on its own (geometry no longer in the live project);
+/// the oldest steps go first.
+pub const HISTORY_BUDGET_BYTES: usize = 2 << 30;
+
+/// One entry of the timeline, oldest first.
+pub struct TimelineStep {
+    pub label: String,
+    pub at: std::time::SystemTime,
+    /// Done (at or before the current state) rather than undone (redo).
+    pub done: bool,
+}
 
 impl History {
+    /// Records the state before a new action. The redo branch is dropped. The caller trims
+    /// against the live project afterwards ([`trim`](Self::trim)).
     pub fn push(&mut self, snapshot: Snapshot) {
         self.redo.clear();
         self.undo.push(snapshot);
-        if self.undo.len() > MAX_HISTORY {
+        while self.undo.len() > MAX_HISTORY {
             self.undo.remove(0);
         }
     }
 
-    pub fn undo(&mut self, current: Snapshot) -> Option<Snapshot> {
-        let previous = self.undo.pop()?;
-        self.redo.push(current);
-        Some(previous)
+    /// Drops the oldest steps while there are too many or they hold too much memory that the
+    /// live project (`live`: its blocks, as `Snapshot::blocks`) does not share.
+    pub fn trim(&mut self, live: &[(usize, usize)]) {
+        while self.undo.len() > MAX_HISTORY {
+            self.undo.remove(0);
+        }
+        while self.undo.len() > 1 && self.held_bytes(live) > HISTORY_BUDGET_BYTES {
+            self.undo.remove(0);
+        }
     }
 
-    pub fn redo(&mut self, current: Snapshot) -> Option<Snapshot> {
-        let next = self.redo.pop()?;
-        self.undo.push(current);
-        Some(next)
+    /// Memory held by the history alone: every distinct block once, minus the live project's.
+    pub fn held_bytes(&self, live: &[(usize, usize)]) -> usize {
+        let live: std::collections::HashSet<usize> = live.iter().map(|b| b.0).collect();
+        let mut seen = std::collections::HashSet::new();
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .flat_map(|s| s.blocks())
+            .filter(|(addr, _)| !live.contains(addr) && seen.insert(*addr))
+            .map(|(_, bytes)| bytes)
+            .sum()
+    }
+
+    /// Moves `steps` actions back (negative) or forward (positive) in one go and returns the
+    /// state to restore; `current` is the live state. Every state passed on the way is kept, each
+    /// labelled with the action that leads out of it, so the timeline stays complete in both
+    /// directions. `None` if there are not that many steps.
+    pub fn jump(&mut self, mut current: Snapshot, steps: isize) -> Option<Snapshot> {
+        if steps == 0 || (steps < 0 && self.undo.len() < steps.unsigned_abs()) || (steps > 0 && self.redo.len() < steps as usize) {
+            return None;
+        }
+        for _ in 0..steps.unsigned_abs() {
+            if steps < 0 {
+                let previous = self.undo.pop()?;
+                // The action between `previous` and `current` is the one being undone.
+                current.label = previous.label.clone();
+                current.at = previous.at;
+                self.redo.push(current);
+                current = previous;
+            } else {
+                let next = self.redo.pop()?;
+                current.label = next.label.clone();
+                current.at = next.at;
+                self.undo.push(current);
+                current = next;
+            }
+        }
+        Some(current)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -580,6 +695,18 @@ impl History {
 
     pub fn redo_label(&self) -> Option<&str> {
         self.redo.last().map(|s| s.label.as_str())
+    }
+
+    /// The actions in order, oldest first: the done ones, then the undone ones that can be
+    /// redone. The current state sits after the last done step (index `done_count()`).
+    pub fn timeline(&self) -> Vec<TimelineStep> {
+        let done = self.undo.iter().map(|s| TimelineStep { label: s.label.clone(), at: s.at, done: true });
+        let undone = self.redo.iter().rev().map(|s| TimelineStep { label: s.label.clone(), at: s.at, done: false });
+        done.chain(undone).collect()
+    }
+
+    pub fn done_count(&self) -> usize {
+        self.undo.len()
     }
 }
 
@@ -632,11 +759,81 @@ mod tests {
         let mut h = History::default();
         assert!(!h.can_undo());
         h.push(Snapshot { label: "a".into(), ..Default::default() });
-        let prev = h.undo(Snapshot { label: "now".into(), ..Default::default() }).unwrap();
+        let prev = h.jump(Snapshot { label: "now".into(), ..Default::default() }, -1).unwrap();
         assert_eq!(prev.label, "a");
         assert!(h.can_redo());
-        let next = h.redo(Snapshot { label: "a".into(), ..Default::default() }).unwrap();
-        assert_eq!(next.label, "now");
+        let next = h.jump(Snapshot { label: "a".into(), ..Default::default() }, 1).unwrap();
+        // The redone state is the one that was live; its label names the action leading into it.
+        assert_eq!(next.label, "a");
+        assert!(h.can_undo() && !h.can_redo());
+    }
+
+    fn state(name: &str, label: &str) -> Snapshot {
+        Snapshot { label: label.into(), summary_for_test: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_jump_over_several_steps_keeps_the_timeline_in_both_directions() {
+        // S0 -a-> S1 -b-> S2 -c-> S3 (live).
+        let mut h = History::default();
+        h.push(state("S0", "a"));
+        h.push(state("S1", "b"));
+        h.push(state("S2", "c"));
+        let labels = |h: &History| h.timeline().iter().map(|s| (s.label.clone(), s.done)).collect::<Vec<_>>();
+        assert_eq!(h.done_count(), 3);
+        let back = h.jump(state("S3", ""), -2).unwrap();
+        assert_eq!(back.summary_for_test, "S1");
+        assert_eq!(h.done_count(), 1);
+        assert_eq!(labels(&h), vec![("a".into(), true), ("b".into(), false), ("c".into(), false)]);
+        let s2 = h.jump(back, 1).unwrap();
+        assert_eq!(s2.summary_for_test, "S2");
+        let s3 = h.jump(s2, 1).unwrap();
+        assert_eq!(s3.summary_for_test, "S3");
+        assert_eq!(labels(&h), vec![("a".into(), true), ("b".into(), true), ("c".into(), true)]);
+        // Too far is refused and changes nothing.
+        assert!(h.jump(s3, -4).is_none());
+        assert_eq!(h.done_count(), 3);
+        // A new action drops the redo branch.
+        let back = h.jump(state("S3", ""), -1).unwrap();
+        h.push(Snapshot { label: "d".into(), ..back });
+        assert_eq!(labels(&h).last().unwrap(), &("d".to_string(), true));
+        assert!(!h.can_redo());
+    }
+
+    #[test]
+    fn the_history_keeps_shared_geometry_once_and_trims_by_memory() {
+        let big = |n: usize| CloudLayer::new(PointCloud::from_points(vec![Point3D::new([0.0, 0.0, 0.0]); n]), 1);
+        let layer = big(1000);
+        let pass = |layer: &CloudLayer| PassSnapshot {
+            id: 1,
+            name: "P".into(),
+            layer: layer.clone(),
+            frames: 0,
+            tracker: Arc::new(std::sync::Mutex::new(scancraft_slam::Tracker::new())),
+            keyframes: Vec::new(),
+            meta: PassMeta::new(scancraft_driver::ScanConfig::default(), None, crate::project::PassStart::Moved),
+            mask: crate::isolation::new_cache(),
+            surface: None,
+            edit: None,
+        };
+        let mut h = History::default();
+        for i in 0..5 {
+            h.push(Snapshot { passes: vec![pass(&layer)], label: format!("step {i}"), ..Default::default() });
+        }
+        // Five steps, one shared cloud: held once, and not at all while the live project has it.
+        let live = vec![(Arc::as_ptr(&layer.cloud) as usize, layer.bytes())];
+        assert_eq!(h.held_bytes(&[]), layer.bytes());
+        assert_eq!(h.held_bytes(&live), 0);
+        // Steps that each hold their own huge cloud are dropped oldest first past the budget.
+        let huge = HISTORY_BUDGET_BYTES / (std::mem::size_of::<Point3D>() + std::mem::size_of::<GpuPoint>()) / 3 + 1;
+        let mut h = History::default();
+        for i in 0..5 {
+            h.push(Snapshot { passes: vec![pass(&big(huge))], label: format!("huge {i}"), ..Default::default() });
+            h.trim(&[]);
+        }
+        assert!(h.held_bytes(&[]) <= HISTORY_BUDGET_BYTES, "{} bytes held", h.held_bytes(&[]));
+        assert_eq!(h.timeline().last().unwrap().label, "huge 4", "the newest step is kept");
+        assert!(h.timeline().len() < 5);
     }
 
     #[test]

@@ -303,6 +303,12 @@ pub struct ScanCraftApp {
     pending_close: bool,
     /// The user chose to quit without saving: the next close request goes through.
     pub quit_confirmed: bool,
+    /// The history timeline card is open, and whether its button was under the pointer this
+    /// frame (a click on the button toggles it instead of closing it as an outside click).
+    pub show_history: bool,
+    pub history_button_hovered: bool,
+    /// A project picked in the Open dialog while the app was busy: opened once it is free.
+    pending_open: Option<std::path::PathBuf>,
     pub history: History,
     pub settings: Settings,
     pub project: ProjectInfo,
@@ -428,6 +434,9 @@ impl ScanCraftApp {
             close_prompt: None,
             pending_close: false,
             quit_confirmed: false,
+            show_history: false,
+            history_button_hovered: false,
+            pending_open: None,
             mesh: None,
             history: History::default(),
             settings: Settings::default(),
@@ -1162,7 +1171,7 @@ impl ScanCraftApp {
     /// visible passes (each as cleaned).
     pub fn working_cloud(&self) -> PointCloud {
         match &self.merged {
-            Some(m) if self.working_is_merged() => m.layer.cloud.clone(),
+            Some(m) if self.working_is_merged() => (*m.layer.cloud).clone(),
             _ => self.merged_passes(),
         }
     }
@@ -1197,8 +1206,8 @@ impl ScanCraftApp {
     /// A clean target's points as shown (project frame).
     pub fn target_cloud(&self, target: CleanTarget) -> Option<&PointCloud> {
         match target {
-            CleanTarget::Pass(id) => self.passes.iter().find(|p| p.id == id).map(|p| &p.layer.cloud),
-            CleanTarget::Merged => self.merged.as_ref().map(|m| &m.layer.cloud),
+            CleanTarget::Pass(id) => self.passes.iter().find(|p| p.id == id).map(|p| &*p.layer.cloud),
+            CleanTarget::Merged => self.merged.as_ref().map(|m| &*m.layer.cloud),
         }
     }
 
@@ -1234,17 +1243,18 @@ impl ScanCraftApp {
         self.total_points() > 0 || self.merged.is_some() || self.mesh.is_some()
     }
 
+    /// The project as it is now, for the undo history. Cheap: layers are shared, not copied.
     fn snapshot(&self, label: &str) -> Snapshot {
         Snapshot {
-            merged: self.merged.as_ref().map(|m| (m.layer.cloud.clone(), m.passes.clone(), m.summary.clone())),
-            mesh: self.mesh.as_ref().map(|m| (m.mesh.clone(), m.analysis.clone())),
+            merged: self.merged.clone(),
+            mesh: self.mesh.clone(),
             passes: self
                 .passes
                 .iter()
                 .map(|p| PassSnapshot {
                     id: p.id,
                     name: p.name.clone(),
-                    cloud: p.layer.cloud.clone(),
+                    layer: p.layer.clone(),
                     frames: p.frames,
                     tracker: p.tracker.clone(),
                     keyframes: p.keyframes.clone(),
@@ -1255,9 +1265,22 @@ impl ScanCraftApp {
                 })
                 .collect(),
             label: label.to_string(),
+            at: std::time::SystemTime::now(),
+            #[cfg(test)]
+            summary_for_test: String::new(),
         }
     }
 
+    /// Records the state before an action in the undo history, then drops the oldest steps if
+    /// the history holds too much memory of its own.
+    fn record(&mut self, snapshot: Snapshot) {
+        self.history.push(snapshot);
+        let live = self.snapshot("").blocks();
+        self.history.trim(&live);
+    }
+
+    /// Puts a snapshot's project back. Its layers come back as they were (same points, same GPU
+    /// copy); only what is shown or hidden stays as it is now.
     fn restore(&mut self, s: Snapshot) {
         self.clear_previews();
         self.picking = None;
@@ -1266,18 +1289,14 @@ impl ScanCraftApp {
             self.tool = None;
         }
         let merged_visible = self.merged.as_ref().is_none_or(|m| m.layer.visible);
-        self.merged = s.merged.map(|(cloud, passes, summary)| {
-            let g = self.generation();
-            let mut m = MergedLayer::new(cloud, g, passes, summary);
+        self.merged = s.merged.map(|mut m| {
             m.layer.visible = merged_visible;
             m
         });
         let mesh_visible = self.mesh.as_ref().is_none_or(|m| m.visible);
-        self.mesh = s.mesh.map(|(m, a)| {
-            let g = self.generation();
-            let mut layer = MeshLayer::new(m, a, g);
-            layer.visible = mesh_visible;
-            layer
+        self.mesh = s.mesh.map(|mut m| {
+            m.visible = mesh_visible;
+            m
         });
         let visible: HashMap<u32, bool> = self.passes.iter().map(|p| (p.id, p.layer.visible)).collect();
         // Trackers whose discard flags differ from the restored ones are brought back in line.
@@ -1286,9 +1305,7 @@ impl ScanCraftApp {
             .passes
             .into_iter()
             .map(|p| {
-                let g = self.next_generation + 1;
-                self.next_generation = g;
-                let mut layer = CloudLayer::new(p.cloud, g);
+                let mut layer = p.layer;
                 layer.visible = visible.get(&p.id).copied().unwrap_or(true);
                 let flags: Vec<(u64, bool)> = p.keyframes.iter().map(|k| (k.id, k.discarded)).collect();
                 let differs = p
@@ -1302,18 +1319,46 @@ impl ScanCraftApp {
                 ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit }
             })
             .collect();
+        // The project changed (for unsaved-changes tracking), though no layer is new.
+        let _ = self.generation();
         match self.selection {
             Some(Node::Pass(id)) | Some(Node::Frame(id, _)) if !self.passes.iter().any(|p| p.id == id) => self.selection = None,
+            Some(Node::Merged) if self.merged.is_none() => self.selection = None,
+            Some(Node::Mesh) if self.mesh.is_none() => self.selection = None,
             _ => {}
         }
         self.highlight = None;
-        for (pass, tracker, flags) in resync {
-            self.spawn_tracker_job("Restoring frames", pass, tracker, move |t| {
-                let flags: Vec<(u64, bool)> = flags.into_iter().collect();
-                t.set_discarded_many(&flags);
-                "Restored the frames".to_string()
-            });
+        // Several passes may need their frames restored: one job, one pass after the other.
+        if !resync.is_empty() {
+            self.spawn_frames_job(resync);
         }
+    }
+
+    /// Re-applies discard flags to the trackers of restored passes and takes their rebuilt
+    /// models (one job for all of them, so a jump over several steps never collides with a job
+    /// still running).
+    fn spawn_frames_job(&mut self, passes: Vec<(u32, SharedTracker, Vec<(u64, bool)>)>) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.busy = Some("Restoring frames".to_string());
+        let tx = self.job_tx.clone();
+        self.rt.spawn_blocking(move || {
+            // All rebuilt first, then reported: the first result ends the busy state.
+            let results: Vec<JobResult> = passes
+                .into_iter()
+                .map(|(pass, tracker, flags)| match tracker.lock() {
+                    Ok(mut t) => {
+                        t.set_discarded_many(&flags);
+                        JobResult::Rebuilt { pass, points: t.fused_points(), keyframes: t.keyframes().iter().map(KeyframeInfo::of).collect(), message: "Restored the frames".into() }
+                    }
+                    Err(_) => JobResult::Failed("The pass's tracker is unavailable".into()),
+                })
+                .collect();
+            for result in results {
+                let _ = tx.blocking_send(result);
+            }
+        });
     }
 
     pub fn can_edit(&self) -> bool {
@@ -1367,7 +1412,7 @@ impl ScanCraftApp {
         }
         let Some(tracker) = self.passes.iter().find(|p| p.id == pass).map(|p| p.tracker.clone()) else { return };
         let verb = if discarded { "Discarded" } else { "Restored" };
-        self.history.push(self.snapshot(&format!("{} frame {frame}", if discarded { "discard" } else { "restore" })));
+        self.record(self.snapshot(&format!("{} frame {frame}", if discarded { "discard" } else { "restore" })));
         self.spawn_tracker_job(if discarded { "Discarding frame" } else { "Restoring frame" }, pass, tracker, move |t| {
             if t.set_discarded(frame, discarded) {
                 format!("{verb} frame {frame}")
@@ -1389,7 +1434,7 @@ impl ScanCraftApp {
         }
         let tracker = p.tracker.clone();
         let n = p.keyframes.iter().filter(|k| k.id >= frame && !k.discarded).count();
-        self.history.push(self.snapshot(&format!("discard frames from {frame}")));
+        self.record(self.snapshot(&format!("discard frames from {frame}")));
         self.spawn_tracker_job("Discarding frames", pass, tracker, move |t| {
             t.discard_from(frame);
             format!("Discarded {n} frame{} from frame {frame} on", if n == 1 { "" } else { "s" })
@@ -1424,27 +1469,42 @@ impl ScanCraftApp {
     }
 
     pub fn undo(&mut self) {
-        if !self.can_edit() {
-            return;
-        }
-        let label = self.history.undo_label().unwrap_or_default().to_string();
-        let current = self.snapshot(&label);
-        if let Some(prev) = self.history.undo(current) {
-            self.restore(prev);
-            self.say(Tone::Normal, format!("Undid {label}"));
-        }
+        self.jump_history(-1);
     }
 
     pub fn redo(&mut self) {
-        if !self.can_edit() {
+        self.jump_history(1);
+    }
+
+    /// Memory the undo history holds on its own (geometry the live project no longer uses).
+    pub fn history_memory(&self) -> usize {
+        self.history.held_bytes(&self.snapshot("").blocks())
+    }
+
+    /// Moves to the state after `done` actions of the timeline (0 = before the first one kept).
+    pub fn jump_to_step(&mut self, done: usize) {
+        let delta = done as isize - self.history.done_count() as isize;
+        self.jump_history(delta);
+    }
+
+    /// Undoes (negative) or redoes (positive) `steps` actions in one go.
+    fn jump_history(&mut self, steps: isize) {
+        if steps == 0 || !self.can_edit() {
             return;
         }
-        let label = self.history.redo_label().unwrap_or_default().to_string();
-        let current = self.snapshot(&label);
-        if let Some(next) = self.history.redo(current) {
-            self.restore(next);
-            self.say(Tone::Normal, format!("Redid {label}"));
-        }
+        let steps_list = self.history.timeline();
+        let done = self.history.done_count();
+        let current = self.snapshot("");
+        let Some(target) = self.history.jump(current, steps) else { return };
+        self.restore(target);
+        let message = if steps < 0 {
+            let undone: Vec<&str> = steps_list[(done as isize + steps) as usize..done].iter().rev().map(|s| s.label.as_str()).collect();
+            if undone.len() == 1 { format!("Undid {}", undone[0]) } else { format!("Undid {} steps (back to before {})", undone.len(), undone.last().copied().unwrap_or_default()) }
+        } else {
+            let redone: Vec<&str> = steps_list[done..done + steps as usize].iter().map(|s| s.label.as_str()).collect();
+            if redone.len() == 1 { format!("Redid {}", redone[0]) } else { format!("Redid {} steps (up to {})", redone.len(), redone.last().copied().unwrap_or_default()) }
+        };
+        self.say(Tone::Normal, message);
     }
 
     pub fn delete_pass(&mut self, id: u32) {
@@ -1452,7 +1512,7 @@ impl ScanCraftApp {
             return;
         }
         let name = self.passes.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();
-        self.history.push(self.snapshot(&format!("Delete {name}")));
+        self.record(self.snapshot(&format!("Delete {name}")));
         let was_reference = self.passes.iter().any(|p| p.id == id && p.meta.alignment == AlignState::Reference);
         self.passes.retain(|p| p.id != id);
         if self.align_preview.as_ref().is_some_and(|a| a.pass == id) {
@@ -1481,7 +1541,7 @@ impl ScanCraftApp {
         if !self.can_edit() || self.mesh.is_none() {
             return;
         }
-        self.history.push(self.snapshot("Delete mesh"));
+        self.record(self.snapshot("Delete mesh"));
         self.mesh = None;
         if self.selection == Some(Node::Mesh) {
             self.selection = None;
@@ -1493,7 +1553,7 @@ impl ScanCraftApp {
         if !self.can_edit() || !self.has_geometry() {
             return;
         }
-        self.history.push(self.snapshot("Clear session"));
+        self.record(self.snapshot("Clear session"));
         self.passes.clear();
         self.clear_previews();
         self.picking = None;
@@ -1654,7 +1714,7 @@ impl ScanCraftApp {
             .iter()
             .filter_map(|t| match *t {
                 CleanTarget::Pass(id) => self.passes.iter().find(|p| p.id == id).map(|p| Input::Pass(id, p.name.clone(), p.source(), p.meta.transform)),
-                CleanTarget::Merged => self.merged.as_ref().map(|m| Input::Merged(m.layer.cloud.clone())),
+                CleanTarget::Merged => self.merged.as_ref().map(|m| Input::Merged((*m.layer.cloud).clone())),
             })
             .collect();
         self.spawn_undoable(label, undo_label, move || {
@@ -1806,7 +1866,7 @@ impl ScanCraftApp {
         if !self.can_edit() || !self.passes.iter().any(|p| ids.contains(&p.id) && p.is_cleaned()) {
             return;
         }
-        self.history.push(self.snapshot("Reset cleaning"));
+        self.record(self.snapshot("Reset cleaning"));
         let mut names = Vec::new();
         for i in 0..self.passes.len() {
             if !(ids.contains(&self.passes[i].id) && self.passes[i].is_cleaned()) {
@@ -1859,7 +1919,7 @@ impl ScanCraftApp {
                 }
             }
             CleanTarget::Merged => match &self.merged {
-                Some(m) => m.layer.cloud.clone(),
+                Some(m) => (*m.layer.cloud).clone(),
                 None => return false,
             },
         };
@@ -1929,7 +1989,7 @@ impl ScanCraftApp {
             return;
         };
         let Some((before, target)) = self.object_picking.as_ref().map(|o| (o.input.len(), o.target)) else { return };
-        self.history.push(self.snapshot("Isolate object"));
+        self.record(self.snapshot("Isolate object"));
         let message = format!("{}: kept the object, {} of {} points", self.target_name(target), thousands(object.len()), thousands(before));
         match target {
             CleanTarget::Pass(id) => {
@@ -2012,7 +2072,7 @@ impl ScanCraftApp {
                 });
             }
             Tool::Smooth => {
-                let Some(mut mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
+                let Some(mut mesh) = self.mesh.as_ref().map(|m| (*m.mesh).clone()) else { return };
                 let sm = smoother(s.smooth_iterations, s.smooth_keep_edges);
                 let it = s.smooth_iterations;
                 self.spawn_undoable("Smoothing", "Smooth", move || {
@@ -2022,7 +2082,7 @@ impl ScanCraftApp {
                 });
             }
             Tool::FillHoles => {
-                let Some(mut mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
+                let Some(mut mesh) = self.mesh.as_ref().map(|m| (*m.mesh).clone()) else { return };
                 let filler = scancraft_mesh::HoleFiller::new(s.fill_max_mm, s.fill_keep_largest);
                 self.spawn_undoable("Filling holes", "Fill holes", move || {
                     let report = filler.fill(&mut mesh);
@@ -2081,7 +2141,7 @@ impl ScanCraftApp {
                 });
             }
             Tool::Decimate => {
-                let Some(mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
+                let Some(mesh) = self.mesh.as_ref().map(|m| (*m.mesh).clone()) else { return };
                 let ratio = s.decimate_ratio;
                 self.spawn_undoable("Decimating", "Decimate", move || {
                     let before = mesh.triangles.len();
@@ -2097,7 +2157,7 @@ impl ScanCraftApp {
                     return;
                 }
                 let cloud = (!format.needs_mesh()).then(|| self.working_cloud());
-                let mesh = self.mesh.as_ref().map(|m| m.mesh.clone());
+                let mesh = self.mesh.as_ref().map(|m| (*m.mesh).clone());
                 self.spawn_job("Exporting", move || {
                     let result = match (format, &cloud, &mesh) {
                         (ExportFormat::PlyCloud, Some(c), _) => scancraft_io::save_ply_binary(c, &path).map(|_| format!("Exported {} points to {path}", thousands(c.len()))),
@@ -2164,7 +2224,15 @@ impl ScanCraftApp {
             P::OpenProject => {
                 if scancraft_io::project::is_project(&first) {
                     self.settings.project_path = first.display().to_string();
-                    self.open_project(first);
+                    if self.can_edit() {
+                        self.open_project(first);
+                    } else {
+                        // The dialog has no parent window, so the app may have started something
+                        // meanwhile: open as soon as it is free instead of dropping the choice.
+                        let name = first.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                        self.pending_open = Some(first);
+                        self.say(Tone::Normal, format!("{name} opens when the running operation has finished"));
+                    }
                 } else {
                     self.say(Tone::Warning, format!("{} is not a ScanCraft project (no project.json)", first.display()));
                 }
@@ -2202,12 +2270,17 @@ impl ScanCraftApp {
 
     pub fn poll_jobs(&mut self) {
         self.next_import();
+        if self.can_edit() {
+            if let Some(dir) = self.pending_open.take() {
+                self.open_project(dir);
+            }
+        }
         while let Ok(result) = self.job_rx.try_recv() {
             self.busy = None;
             // The state before the job goes on the undo stack only if the job changed it: a job
             // that failed or changed nothing leaves the history as it was.
             if let Some(snapshot) = self.pending_undo.take().filter(|_| Self::changes_geometry(&result)) {
-                self.history.push(snapshot);
+                self.record(snapshot);
             }
             match result {
                 JobResult::Cleaned { passes, merged, message } => {
@@ -2857,6 +2930,70 @@ mod tests {
         let _ = app.preview_generation();
         app.refresh_holes();
         assert!(!app.dirty(), "showing something is not a change");
+    }
+
+    #[test]
+    fn snapshots_share_the_passes_that_did_not_change() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        app.passes[1].layer.visible = false;
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        assert!(app.passes[0].is_cleaned());
+        // The step holds the old cloud of pass 1 and shares pass 2 with the live project.
+        let held = app.history_memory();
+        let old_pass1 = table_and_block().len() * (std::mem::size_of::<Point3D>() + std::mem::size_of::<scancraft_render::GpuPoint>());
+        assert_eq!(held, old_pass1, "only the replaced cloud is held");
+        // Undo brings back the very same layer (no copy, same GPU data).
+        let before = Arc::as_ptr(&app.passes[1].layer.gpu);
+        app.undo();
+        assert!(!app.passes[0].is_cleaned());
+        assert_eq!(Arc::as_ptr(&app.passes[1].layer.gpu), before);
+    }
+
+    #[test]
+    fn jumping_to_a_timeline_step_undoes_or_redoes_several_actions_at_once() {
+        let mut app = app();
+        let total = table_and_block().len();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        let after_plane = app.passes[0].layer.len();
+        app.settings.voxel_mm = 3.0;
+        app.run_tool(Tool::Downsample);
+        finish_job(&mut app);
+        let after_down = app.passes[0].layer.len();
+        assert!(after_down < after_plane && after_plane < total);
+        assert_eq!(app.history.timeline().len(), 2);
+        app.jump_to_step(0);
+        assert_eq!(app.passes[0].layer.len(), total, "both steps undone in one go");
+        assert!(app.history.timeline().iter().all(|s| !s.done));
+        app.jump_to_step(2);
+        assert_eq!(app.passes[0].layer.len(), after_down, "both redone");
+        app.jump_to_step(1);
+        assert_eq!(app.passes[0].layer.len(), after_plane);
+        assert!(app.status.contains("Undid"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_project_picked_while_busy_opens_once_the_app_is_free() {
+        let mut app = app();
+        let dir = temp_dir("pending-open");
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.save_project(dir.clone());
+        finish_job(&mut app);
+        app.new_tab();
+        app.busy = Some("Merging".into());
+        app.pending_open = Some(dir.clone());
+        app.poll_jobs();
+        assert!(app.pending_open.is_some() && app.passes.is_empty(), "nothing opens while busy");
+        app.busy = None;
+        app.poll_jobs();
+        finish_job(&mut app);
+        assert!(app.pending_open.is_none());
+        assert_eq!(app.passes.len(), 1, "opened after the operation finished");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

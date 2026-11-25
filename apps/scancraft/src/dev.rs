@@ -290,6 +290,16 @@ impl Script {
                 self.waiting_for_shot = Some(arg.to_string());
             }
             "newtab" => app.new_tab(),
+            "history" => app.show_history = !app.show_history,
+            "undo" => app.undo(),
+            "removeplane" => {
+                app.stage = Stage::Clean;
+                app.run_tool(Tool::RemovePlane);
+            }
+            "outliers" => {
+                app.stage = Stage::Clean;
+                app.run_tool(Tool::Outliers);
+            }
             "tab" => {
                 if let Ok(i) = arg.parse() {
                     app.switch_tab(i);
