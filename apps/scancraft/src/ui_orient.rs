@@ -82,15 +82,11 @@ pub fn datums_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
 
     if let Some((rms, n, onto, flip)) = plane {
         kit::row(ui, "Plane", |ui| {
-            ui.horizontal(|ui| {
-                kit::value_text(ui, &format!("{rms:.2} mm RMS · {n} points"), false);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::close_button(ui, "Remove the plane").clicked() {
-                        remove = Some(DatumKind::Plane);
-                    }
-                });
-            });
+            if datum_value_row(ui, &format!("{n} points"), "Remove the plane") {
+                remove = Some(DatumKind::Plane);
+            }
         });
+        kit::row(ui, "Fit", |ui| kit::value_text(ui, &format!("{rms:.2} mm RMS"), false));
         kit::row(ui, "Onto", |ui| {
             let mut sel = match onto {
                 WorldPlane::XY => 0,
@@ -108,15 +104,11 @@ pub fn datums_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
     if let Some((radius, rms, _n, onto, flip)) = axis {
         kit::row(ui, "Axis", |ui| {
-            ui.horizontal(|ui| {
-                kit::value_text(ui, &format!("Dia. {:.2} mm · {:.2} mm RMS", radius * 2.0, rms), false);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::close_button(ui, "Remove the axis").clicked() {
-                        remove = Some(DatumKind::Axis);
-                    }
-                });
-            });
+            if datum_value_row(ui, &format!("\u{00D8} {:.2} mm", radius * 2.0), "Remove the axis") {
+                remove = Some(DatumKind::Axis);
+            }
         });
+        kit::row(ui, "Fit", |ui| kit::value_text(ui, &format!("{rms:.2} mm RMS"), false));
         kit::row(ui, "Onto", |ui| {
             let mut sel = match onto {
                 WorldAxis::X => 0,
@@ -134,14 +126,9 @@ pub fn datums_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     }
     if let Some(p) = origin {
         kit::row(ui, "Origin", |ui| {
-            ui.horizontal(|ui| {
-                kit::value_text(ui, &format!("{:.1}, {:.1}, {:.1}", p.x, p.y, p.z), false);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if kit::close_button(ui, "Remove the origin").clicked() {
-                        remove = Some(DatumKind::Point);
-                    }
-                });
-            });
+            if datum_value_row(ui, &format!("{:.1}, {:.1}, {:.1}", p.x, p.y, p.z), "Remove the origin") {
+                remove = Some(DatumKind::Point);
+            }
         });
     }
     if plane.is_none() && axis.is_none() && origin.is_none() {
@@ -191,6 +178,26 @@ pub fn datums_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
 
 /// Scale from Lengths: the picked pairs, the factor they give, and Apply / Cancel in the
 /// footer.
+/// The value of a picked datum's row: its text fills the width left of the remove (×) button
+/// (the button's width is reserved first so text can never run underneath it), ellipsised
+/// beyond that, with the full text on hover when it does not fit. Returns the button click.
+fn datum_value_row(ui: &mut egui::Ui, text: &str, remove_tip: &str) -> bool {
+    let t = Tokens::get();
+    let font = egui::FontId::proportional(t.font_label);
+    let natural = ui.painter().layout_no_wrap(text.to_string(), font.clone(), t.form_ink).size().x;
+    let text_w = (ui.available_width() - t.form_close_size - t.space_4).max(1.0);
+    let mut clicked = false;
+    ui.horizontal(|ui| {
+        let (rect, response) = ui.allocate_exact_size(egui::vec2(text_w, t.control_height), egui::Sense::hover());
+        kit::paint_text(ui.painter(), rect, text, font, t.form_ink);
+        if natural > text_w {
+            response.on_hover_text(text);
+        }
+        clicked = kit::close_button(ui, remove_tip).clicked();
+    });
+    clicked
+}
+
 pub fn scale_form(app: &mut ScanCraftApp, ui: &mut egui::Ui, id: u32) {
     let t = Tokens::get();
     let name = app.passes.iter().find(|p| p.id == id).map(|p| p.name.clone()).unwrap_or_default();

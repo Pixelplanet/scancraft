@@ -473,19 +473,38 @@ fn scale_picks(app: &mut ScanCraftApp, ui: &egui::Ui, response: &egui::Response,
         }
     }
     let Some(s) = app.scale_picking.as_ref() else { return };
+    // Markers first, then the segments and their labels: a label is placed beside the segment's
+    // midpoint, never underneath a marker.
+    let mut markers: Vec<Rect> = Vec::new();
     for (i, pair) in s.pairs.iter().enumerate() {
         for p in [pair.a].into_iter().chain(pair.b) {
             if let Some((pt, _)) = project(&vp, view, p) {
                 ui.painter().circle(pt, 7.0, t.accent, egui::Stroke::new(1.5, egui::Color32::WHITE));
                 ui.painter().text(pt, egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+                markers.push(Rect::from_center_size(pt, egui::vec2(16.0, 16.0)));
             }
         }
-        if let Some(b) = pair.b {
-            if let (Some((a, _)), Some((bb, _))) = (project(&vp, view, pair.a), project(&vp, view, b)) {
-                ui.painter().line_segment([a, bb], egui::Stroke::new(1.5, t.accent));
-                let mid = egui::pos2((a.x + bb.x) * 0.5, (a.y + bb.y) * 0.5 - 9.0);
-                ui.painter().text(mid, egui::Align2::CENTER_BOTTOM, format!("{:.1} mm", (b - pair.a).length()), egui::FontId::proportional(t.font_small), egui::Color32::WHITE);
+    }
+    for pair in &s.pairs {
+        let Some(b) = pair.b else { continue };
+        if let (Some((a, _)), Some((bb, _))) = (project(&vp, view, pair.a), project(&vp, view, b)) {
+            ui.painter().line_segment([a, bb], egui::Stroke::new(1.5, t.accent));
+            let seg = bb - a;
+            if seg.length() < 1e-3 {
+                continue;
             }
+            let perp = egui::vec2(-seg.y, seg.x).normalized();
+            let mid = a + seg * 0.5;
+            let text = format!("{:.1} mm", (b - pair.a).length());
+            let font = egui::FontId::proportional(t.font_small);
+            let size = ui.painter().layout_no_wrap(text.clone(), font.clone(), egui::Color32::WHITE).size();
+            // Marker radius plus ~10 pt to the side of the segment; flip sides when a marker is
+            // in the way.
+            let mut rect = Rect::from_center_size(mid + perp * 17.0, size);
+            if markers.iter().any(|m| m.intersects(rect)) {
+                rect = Rect::from_center_size(mid - perp * 17.0, size);
+            }
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, text, font, egui::Color32::WHITE);
         }
     }
     if response.hovered() {
