@@ -1,13 +1,14 @@
-//! Alignment from user-picked point pairs: Kabsch on the pairs gives the starting transform,
-//! point-to-plane ICP on the surfaces refines it (picks are only accurate to a few mm).
+//! Alignment from user-picked point pairs: Horn's closed form on the pairs gives the
+//! starting transform, point-to-plane ICP on the surfaces refines it (picks are only
+//! accurate to a few mm).
 
 use glam::Vec3;
-use scancraft_slam::kabsch::kabsch_align;
 use scancraft_slam::point_to_plane::{align, PlaneTarget};
 
 use crate::cloud::downsample;
 use crate::global::refine_fine;
-use crate::{rigid, AlignError, Alignment, PassCloud};
+use crate::horn::fit_pairs;
+use crate::{AlignError, Alignment, PassCloud};
 
 /// Aligns `source` to `target` from `pairs` of (point on source, same point on target), each in
 /// its pass's frame. Needs at least three pairs that are not on a line.
@@ -18,38 +19,23 @@ pub fn align_point_pairs(source: &PassCloud, target: &PassCloud, pairs: &[(Vec3,
     if source.points.len() < 100 || target.points.len() < 100 {
         return Err(AlignError::TooFewPoints("pass"));
     }
-    let (s, t): (Vec<Vec3>, Vec<Vec3>) = pairs.iter().copied().unzip();
-    if !spans_a_plane(&s) || !spans_a_plane(&t) {
-        return Err(AlignError::Degenerate);
-    }
-    let (rot, trans) = kabsch_align(&s, &t).ok_or(AlignError::Degenerate)?;
+    let fit = fit_pairs(pairs)?;
     // Coarse ICP with wide gates first: picks can be several millimetres off.
     let coarse_mm = 3.0f32.max(fine_mm);
     let src = downsample(&source.points, coarse_mm);
     let tgt = downsample(&target.points, coarse_mm);
     let plane = PlaneTarget::new(tgt.iter().map(|p| p.0).collect(), tgt.iter().map(|p| p.1).collect());
-    let guess = rigid(rot, trans);
+    let guess = fit.transform;
     let r = align(&src, &plane, guess, &[24.0, 12.0, 6.0, 3.0], 8);
     let guess = if r.inliers > 0 { r.pose } else { guess };
     Ok(refine_fine(source, target, guess, fine_mm))
-}
-
-/// Whether the points span more than a line (the triangle of the farthest points has some area).
-fn spans_a_plane(points: &[Vec3]) -> bool {
-    let a = points[0];
-    let Some(b) = points.iter().copied().max_by(|p, q| (*p - a).length_squared().total_cmp(&(*q - a).length_squared())) else { return false };
-    let ab = b - a;
-    if ab.length() < 5.0 {
-        return false;
-    }
-    let off = points.iter().map(|p| ab.cross(*p - a).length() / ab.length()).fold(0.0f32, f32::max);
-    off > 3.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cloud::Rng;
+    use crate::rigid;
     use crate::synthetic;
     use glam::Quat;
     use scancraft_core::Transform;

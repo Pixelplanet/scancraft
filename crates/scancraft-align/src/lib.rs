@@ -9,7 +9,13 @@
 //!   results ranked on one grid, with a check that the two directions agree;
 //! - [`graph::align_all`]: every pair of passes measured, a maximum-quality spanning tree from the
 //!   reference, missing pairs composed through it, cycles checked;
-//! - [`pairs::align_point_pairs`]: from >= 3 user-picked correspondences (Kabsch, then ICP);
+//! - [`pairs::align_point_pairs`]: from >= 3 user-picked correspondences (Horn's closed
+//!   form, then ICP);
+//! - [`horn`]: the closed-form fit itself, with the pick spread (collinear warnings);
+//! - [`fit::Surface`]: plane and cylinder fits grown from a clicked point (datum picking);
+//! - [`datum::datum_frame`]: a `new <- old` frame from picked datums (3-2-1 alignment);
+//! - [`orient::auto_orient`]: a part stood square on its own faces / axis / open rim;
+//! - [`scale::scale_from_lengths`]: scale correction from hand-measured lengths;
 //! - [`markers::align_markers`]: from marker dots rigidly attached to the object;
 //! - [`refine::refine_global`]: pairwise ICP between overlapping passes + pose-graph optimisation;
 //! - [`refine::refine_shell`]: fine ICP that also pulls the inside of a wall onto the outside at
@@ -25,26 +31,37 @@
 //! Positions are millimetres in the scanner convention (+X right, +Y forward, +Z up).
 
 pub mod cloud;
+pub mod datum;
+mod eigen;
 pub mod features;
+pub mod fit;
 pub mod global;
 pub mod graph;
+pub mod horn;
 pub mod markers;
 pub mod merge;
+pub mod orient;
 pub mod pairs;
 pub mod quality;
 pub mod refine;
+pub mod scale;
 pub mod synthetic;
 
 use glam::{Quat, Vec3};
 use scancraft_core::Transform;
 
+pub use datum::{datum_frame, AxisDatum, DatumError, DatumFrame, Datums, PlaneDatum, WorldAxis, WorldPlane};
+pub use fit::{Fit, FitConfig, Primitive, Surface};
 pub use global::{align_global, align_robust, Candidate, GlobalConfig, RobustAlignment, RobustConfig};
 pub use graph::{align_all, ComposedEdge, CycleCheck, EdgeState, GraphConfig, GraphEdge, GraphResult, Rejection};
 pub use markers::{align_markers, Marker, MarkerAlignment, MarkerPlacement};
 pub use merge::{merge, MergeConfig, MergeInput, MergeResult};
+pub use horn::{fit_pairs, PairFit, PairSpread};
+pub use orient::{auto_orient, AutoOrient, FaceDirection, OrientConfig, Rim, UpSource};
 pub use pairs::align_point_pairs;
 pub use quality::{evaluate, Quality, Shell, Verdict};
 pub use refine::{refine_global, refine_shell, RefineConfig, RefineEdge, RefineInput, RefineResult, ShellConfig, ShellFit};
+pub use scale::{scale_from_lengths, ScaleEstimate};
 
 /// A point with its unit normal.
 pub type Oriented = (Vec3, Vec3);
