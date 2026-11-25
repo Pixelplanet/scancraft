@@ -23,7 +23,7 @@ sha2 = "0.10"
 libloading = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62", features = ["Win32_Graphics_Dxgi"] }
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [dev-dependencies]
 anyhow.workspace = true

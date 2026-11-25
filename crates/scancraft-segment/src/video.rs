@@ -1,7 +1,7 @@
 //! Stateful SAM 2.1 video segmentation loop and DirectML-vs-CPU adapter self-test.
 
 use crate::graphs::Sam2Graphs;
-use crate::manifest::ModelFiles;
+use crate::manifest::{ModelFiles, ModelVariant};
 use crate::memory_bank::{MemoryBank, MemoryEntry};
 use crate::postprocess::{FrameMask, FrameTimings, PostprocessConfig, threshold_mask};
 use crate::preprocess::{FramePrompt, ResizeMode, preprocess_rgb};
@@ -12,6 +12,25 @@ use std::time::Instant;
 
 /// Minimum DirectML-vs-CPU IoU required by the adapter self-test.
 pub const SELF_TEST_MIN_IOU: f32 = 0.98;
+
+/// Per-variant evaluation entry emitted by [`Sam2VideoSegmenter::load_fastest_variant`].
+#[derive(Debug, Clone)]
+pub struct VariantBenchmark {
+    pub variant: ModelVariant,
+    pub provider: Option<ActiveProvider>,
+    pub self_test_passed: bool,
+    pub mean_tracked_ms: Option<f32>,
+    pub note: String,
+}
+
+/// Result of benchmarking installed variants on the current hardware adapter.
+#[derive(Debug, Clone)]
+pub struct VariantSelectionReport {
+    pub chosen: ModelVariant,
+    pub provider: ActiveProvider,
+    pub mean_tracked_ms: f32,
+    pub benchmarks: Vec<VariantBenchmark>,
+}
 
 /// Stateful SAM 2.1 video segmenter carrying the memory bank across frames.
 pub struct Sam2VideoSegmenter {
@@ -118,6 +137,92 @@ impl Sam2VideoSegmenter {
         Self { graphs, bank, config, resize_mode: ResizeMode::DirectResize }
     }
 
+    /// Evaluates candidate variants in `candidates` via the DirectML-vs-CPU self-test plus a short
+    /// warmup + 3-frame timing clip and returns the fastest passing variant.
+    ///
+    /// Prefers passing DirectML candidates over CPU fallbacks whenever `preference` allows GPU.
+    pub fn load_fastest_variant(
+        runtime: &OrtRuntime,
+        candidates: &[(ModelVariant, ModelFiles)],
+        preference: ExecutionPreference,
+        config: PostprocessConfig,
+    ) -> Result<(Self, VariantSelectionReport)> {
+        if candidates.is_empty() {
+            return Err(SegmentError::InvalidInput("no model variants supplied".into()));
+        }
+        let mut benchmarks = Vec::with_capacity(candidates.len());
+        let mut best_gpu: Option<(f32, ModelVariant, Self)> = None;
+        let mut best_cpu: Option<(f32, ModelVariant, Self)> = None;
+
+        for (variant, files) in candidates {
+            match Self::load(runtime, files, preference.clone(), config.clone()) {
+                Ok((mut seg, self_test)) => {
+                    let provider = seg.provider().clone();
+                    let passed = self_test.as_ref().map(|r| r.passed).unwrap_or(true);
+                    match benchmark_short_clip(&mut seg) {
+                        Ok(mean_ms) => {
+                            seg.reset();
+                            let is_gpu = matches!(provider, ActiveProvider::DirectMl { .. });
+                            let note = self_test
+                                .as_ref()
+                                .map(|r| format!("{}; bench={mean_ms:.1} ms", r.message))
+                                .unwrap_or_else(|| format!("bench={mean_ms:.1} ms"));
+                            benchmarks.push(VariantBenchmark {
+                                variant: *variant,
+                                provider: Some(provider.clone()),
+                                self_test_passed: passed,
+                                mean_tracked_ms: Some(mean_ms),
+                                note,
+                            });
+                            let target = if is_gpu && passed { &mut best_gpu } else { &mut best_cpu };
+                            let replace = target.as_ref().is_none_or(|(best_ms, _, _)| mean_ms < *best_ms);
+                            if replace {
+                                *target = Some((mean_ms, *variant, seg));
+                            }
+                        }
+                        Err(e) => {
+                            benchmarks.push(VariantBenchmark {
+                                variant: *variant,
+                                provider: Some(provider),
+                                self_test_passed: passed,
+                                mean_tracked_ms: None,
+                                note: format!("benchmark error: {e}"),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    benchmarks.push(VariantBenchmark {
+                        variant: *variant,
+                        provider: None,
+                        self_test_passed: false,
+                        mean_tracked_ms: None,
+                        note: format!("load error: {e}"),
+                    });
+                }
+            }
+        }
+
+        let Some((best_ms, chosen, mut winner)) = best_gpu.or(best_cpu) else {
+            let summary = benchmarks
+                .iter()
+                .map(|b| format!("{}: {}", b.variant.dir_name(), b.note))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(SegmentError::NoUsableBackend(format!(
+                "no SAM 2.1 variant passed loading: {summary}"
+            )));
+        };
+        winner.reset();
+        let report = VariantSelectionReport {
+            chosen,
+            provider: winner.provider().clone(),
+            mean_tracked_ms: best_ms,
+            benchmarks,
+        };
+        Ok((winner, report))
+    }
+
     pub fn set_resize_mode(&mut self, mode: ResizeMode) {
         self.resize_mode = mode;
     }
@@ -169,6 +274,20 @@ impl Sam2VideoSegmenter {
         let t2 = Instant::now();
         let cond_feats = if let Some(assembled) = self.bank.assemble_for_frame(frame_index) {
             self.graphs.attend_memory(&vfeats.feats2, &vfeats.pos2, &assembled)?
+        } else if let Some(no_mem) = &self.graphs.constants.no_memory_embedding {
+            let mut out = vfeats.feats2.clone();
+            let (_, c, fh, fw) = out.dim();
+            if no_mem.len() == c {
+                for ch in 0..c {
+                    let add = no_mem[ch];
+                    for y in 0..fh {
+                        for x in 0..fw {
+                            out[[0, ch, y, x]] += add;
+                        }
+                    }
+                }
+            }
+            out
         } else {
             vfeats.feats2.clone()
         };
@@ -268,6 +387,23 @@ fn run_self_test_clip(seg: &mut Sam2VideoSegmenter) -> Result<ClipOutput> {
     let f0 = seg.add_prompt(0, &img0, &prompt)?;
     let f1 = seg.propagate(1, &img1)?;
     Ok(ClipOutput { f0, f1 })
+}
+
+fn benchmark_short_clip(seg: &mut Sam2VideoSegmenter) -> Result<f32> {
+    seg.reset();
+    let prompt = FramePrompt::default().with_point(56.0, 64.0, true);
+    let img0 = synthetic_test_frame(56, 64);
+    let _ = seg.add_prompt(0, &img0, &prompt)?;
+    // Warm up on frame 1, then time 3 tracked frames (2..=4).
+    let img1 = synthetic_test_frame(60, 64);
+    let _ = seg.propagate(1, &img1)?;
+    let mut sum_ms = 0.0f32;
+    for i in 2..=4usize {
+        let img = synthetic_test_frame(60 + i * 2, 64);
+        let res = seg.propagate(i as u64, &img)?;
+        sum_ms += res.timings.total_ms;
+    }
+    Ok(sum_ms / 3.0)
 }
 
 fn compare_self_test(provider: ActiveProvider, cpu: &ClipOutput, cand: &ClipOutput) -> SelfTestReport {

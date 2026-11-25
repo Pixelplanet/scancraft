@@ -8,6 +8,7 @@ calibration/
 *.py
 !client/*.py
 !tests/*.py
+!tools/sam2/*.py
 3dcamera_exports.txt
 target/
 *.pdb

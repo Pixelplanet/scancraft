@@ -78,7 +78,7 @@ fn spawn_live_ai_helper(
         while let Ok(job) = in_rx.recv() {
             if job.reset {
                 active = false;
-                let _ = engine.with_segmenter(|seg, _| {
+                let _ = engine.with_live_segmenter(|seg, _| {
                     seg.reset();
                     Ok(())
                 });
@@ -86,7 +86,7 @@ fn spawn_live_ai_helper(
             if job.prompt_norm.is_none() && !active {
                 continue;
             }
-            let res = engine.with_segmenter(|seg, provider| {
+            let res = engine.with_live_segmenter(|seg, provider| {
                 let fm = if let Some((nx, ny)) = job.prompt_norm {
                     seg.reset();
                     active = true;

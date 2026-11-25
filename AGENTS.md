@@ -366,3 +366,16 @@ laser model are not built.
 - 2026-11-25 (second PC) — `agent/orient` reviewed and merged. Fix: Make Reference and deleting the
   reference pass only relabel the reference (`rebase_project`); they no longer rebuild the frame
   around it at the origin, which silently undid Auto Orient / Datums and dropped the merged model.
+- 2026-11-25 (second PC, branch `agent/sam-fast`) — Fast 512 px SAM 2.1 live tracking for iGPUs
+  (`tools/sam2/export_sam2_video.py`, `validate_sam2_video.py`, `scancraft-segment`, `apps/scancraft`):
+  exported static-memory 512 px variants (`mem4`/`mem2` in `fp32` and `fp16` encoders+attention /
+  `fp32` decoder, zero control-flow ops) from `facebook/sam2.1-hiera-tiny` (`de431c404385`); fixed
+  antialiased scaled-triangle RGB downsampling + uint8 rounding in `preprocess.rs`; added `ModelVariant`,
+  `static_memory_blocks` / `memory_attention_mask` (`-10000.0`), `no_memory_embedding`, projected pointer
+  PE, and `Sam2VideoSegmenter::load_fastest_variant` (self-test + timing selector). Measured on Radeon
+  890M DirectML (`bedroom` 960×540 & `blocks` 1280×720): `1024-fp32` 1004–1034 ms/frame (1188 MB RSS) →
+  `512-mem2-fp16` **106–111 ms/frame (~9.4× faster, 361–362 MB RSS)**, passing PyTorch `>= 0.99` worst
+  IoU gate on both sequences (`bedroom` mean 0.9977/worst 0.9925; `blocks` mean 0.9984/worst 0.9960);
+  `512-mem2-fp32` (124–128 ms) and `512-mem4-fp32` (144–159 ms) also pass both sequences. Wired live
+  capture (`worker.rs` + `ai_pack.rs` + `ui_ai.rs`) to `load_fastest_variant` while keeping 1024 px for
+  post-scan `Tool::AiSegment`; release files staged under `%LOCALAPPDATA%\ScanCraft\ai\release-staging\`.

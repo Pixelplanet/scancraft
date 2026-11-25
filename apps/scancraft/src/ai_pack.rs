@@ -12,8 +12,8 @@ use scancraft_segment::manifest::{
     DIRECTML_VERSION_PIN, ORT_VERSION_PIN, SAM21_TINY_HF_COMMIT, SAM21_TINY_HF_REPO, sha256_file,
 };
 use scancraft_segment::{
-    ActiveProvider, ExecutionPreference, ModelFiles, OrtRuntime, PostprocessConfig, RuntimeFiles,
-    Sam2VideoSegmenter, SelfTestReport,
+    ActiveProvider, ExecutionPreference, ModelFiles, ModelVariant, OrtRuntime, PostprocessConfig,
+    RuntimeFiles, Sam2VideoSegmenter, SelfTestReport,
 };
 
 pub const ESTIMATED_MODELS_MB: f32 = 165.0;
@@ -42,18 +42,23 @@ pub struct AiPackStatus {
     pub models_bytes: u64,
     pub runtime_bytes: u64,
     pub provider_summary: String,
+    pub live_models_ready: bool,
+    pub live_models_bytes: u64,
+    pub live_variant_summary: String,
 }
 
 impl AiPackStatus {
     pub fn total_mb(&self) -> f32 {
-        (self.models_bytes + self.runtime_bytes) as f32 / 1_000_000.0
+        (self.models_bytes + self.live_models_bytes + self.runtime_bytes) as f32 / 1_000_000.0
     }
 }
 
-/// Shared lazy holder for the loaded ONNX Runtime + verified SAM 2.1 segmenter.
+/// Shared lazy holder for the loaded ONNX Runtime + verified SAM 2.1 segmenters (1024 px post-scan
+/// and fast 512 px live capture).
 #[derive(Default)]
 pub struct SharedAiEngine {
     inner: Mutex<Option<LoadedAiEngine>>,
+    live: Mutex<Option<LoadedLiveEngine>>,
 }
 
 struct LoadedAiEngine {
@@ -63,6 +68,14 @@ struct LoadedAiEngine {
     report: Option<SelfTestReport>,
 }
 
+struct LoadedLiveEngine {
+    variant: ModelVariant,
+    models_root: PathBuf,
+    runtime_dir: PathBuf,
+    segmenter: Sam2VideoSegmenter,
+    summary: String,
+}
+
 impl SharedAiEngine {
     pub fn provider_summary(&self) -> Option<String> {
         let guard = self.inner.lock().ok()?;
@@ -70,14 +83,23 @@ impl SharedAiEngine {
         Some(format_provider(loaded.segmenter.provider(), loaded.report.as_ref()))
     }
 
+    pub fn live_summary(&self) -> Option<String> {
+        let guard = self.live.lock().ok()?;
+        let loaded = guard.as_ref()?;
+        Some(loaded.summary.clone())
+    }
+
     pub fn unload(&self) {
         if let Ok(mut guard) = self.inner.lock() {
             *guard = None;
         }
+        if let Ok(mut guard) = self.live.lock() {
+            *guard = None;
+        }
     }
 
-    /// Runs `op` with the loaded, SHA-256 verified [`Sam2VideoSegmenter`] (loading it once on
-    /// first use via DirectML hardware self-test with CPU fallback).
+    /// Runs `op` with the loaded, SHA-256 verified [`Sam2VideoSegmenter`] (1024 px post-scan
+    /// quality, loading once on first use via DirectML hardware self-test with CPU fallback).
     pub fn with_segmenter<T>(&self, op: impl FnOnce(&mut Sam2VideoSegmenter, &str) -> Result<T, String>) -> Result<T, String> {
         let mut guard = self.inner.lock().map_err(|_| "AI engine lock poisoned".to_string())?;
         let models_dir = effective_models_dir();
@@ -95,6 +117,96 @@ impl SharedAiEngine {
         let summary = format_provider(loaded.segmenter.provider(), loaded.report.as_ref());
         op(&mut loaded.segmenter, &summary)
     }
+
+    /// Runs `op` with the fastest passing 512 px variant for live capture segmentation (falling
+    /// back to the 1024 px post-scan model only if no fast 512 px variant is installed).
+    pub fn with_live_segmenter<T>(&self, op: impl FnOnce(&mut Sam2VideoSegmenter, &str) -> Result<T, String>) -> Result<T, String> {
+        let mut guard = self.live.lock().map_err(|_| "Live AI engine lock poisoned".to_string())?;
+        let models_dir = effective_models_dir();
+        let models_root = live_models_root(&models_dir);
+        let runtime_dir = effective_runtime_dir();
+
+        let needs_reload = match guard.as_ref() {
+            Some(loaded) => loaded.models_root != models_root || loaded.runtime_dir != runtime_dir,
+            None => true,
+        };
+        if needs_reload {
+            let loaded = load_live_engine(&models_dir, &models_root, &runtime_dir)?;
+            *guard = Some(loaded);
+        }
+        let loaded = guard.as_mut().ok_or_else(|| "Live AI engine unavailable".to_string())?;
+        let summary = loaded.summary.clone();
+        let _ = loaded.variant;
+        op(&mut loaded.segmenter, &summary)
+    }
+}
+
+fn live_models_root(models_dir: &Path) -> PathBuf {
+    if models_dir.file_name().is_some_and(|n| n == "sam21-tiny-video-onnx") {
+        if let Some(parent) = models_dir.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    default_ai_root().join("models")
+}
+
+fn discover_live_candidates(models_dir: &Path, models_root: &Path) -> Vec<(ModelVariant, ModelFiles)> {
+    let mut out = Vec::new();
+    if let Ok(override_dir) = std::env::var("SCANCRAFT_SAM2_LIVE_DIR") {
+        let p = PathBuf::from(override_dir.trim());
+        if p.is_dir() {
+            for &variant in ModelVariant::all_live_fast() {
+                let files = ModelFiles::for_variant(variant, &p);
+                if files.verify_all().is_ok() {
+                    out.push((variant, files));
+                    break;
+                }
+            }
+        }
+    }
+    for &variant in ModelVariant::all_live_fast() {
+        let dir = models_root.join(variant.dir_name());
+        if dir.is_dir() {
+            let files = ModelFiles::for_variant(variant, &dir);
+            if files.verify_all().is_ok() && !out.iter().any(|(v, _)| *v == variant) {
+                out.push((variant, files));
+            }
+        }
+    }
+    if out.is_empty() {
+        let fallback = ModelFiles::sam21_tiny_from_dir(models_dir);
+        if fallback.verify_all().is_ok() {
+            out.push((ModelVariant::Sam21Tiny1024Fp32, fallback));
+        }
+    }
+    out
+}
+
+fn load_live_engine(models_dir: &Path, models_root: &Path, runtime_dir: &Path) -> Result<LoadedLiveEngine, String> {
+    let candidates = discover_live_candidates(models_dir, models_root);
+    if candidates.is_empty() {
+        return Err("No verified SAM 2.1 model variants installed".to_string());
+    }
+    let runtime_files = RuntimeFiles::ort_1244_dml_from_dir(runtime_dir);
+    runtime_files.verify_all().map_err(|e| format!("ONNX Runtime check failed: {e}"))?;
+    let ort = OrtRuntime::init(&runtime_files).map_err(|e| format!("Could not initialize ONNX Runtime: {e}"))?;
+
+    let (segmenter, sel) = Sam2VideoSegmenter::load_fastest_variant(
+        &ort,
+        &candidates,
+        ExecutionPreference::Auto,
+        PostprocessConfig::default(),
+    )
+    .map_err(|e| format!("Could not load live SAM 2.1 variant: {e}"))?;
+
+    let summary = format!("{} · {} ({:.0} ms/frame)", sel.chosen.display_name(), sel.provider, sel.mean_tracked_ms);
+    Ok(LoadedLiveEngine {
+        variant: sel.chosen,
+        models_root: models_root.to_path_buf(),
+        runtime_dir: runtime_dir.to_path_buf(),
+        segmenter,
+        summary,
+    })
 }
 
 fn format_provider(provider: &ActiveProvider, report: Option<&SelfTestReport>) -> String {
@@ -199,6 +311,41 @@ pub fn inspect_pack_in(models_dir: &Path, runtime_dir: &Path, engine: Option<&Sh
             }
         });
 
+    let live_root = live_models_root(models_dir);
+    let mut installed_fast = Vec::new();
+    let mut live_models_bytes = 0u64;
+    for &variant in ModelVariant::all_live_fast() {
+        let dir = live_root.join(variant.dir_name());
+        let lf = ModelFiles::for_variant(variant, &dir);
+        if lf.verify_all().is_ok() {
+            installed_fast.push(variant);
+            live_models_bytes += dir_bytes(&[
+                &lf.vision_encoder.path,
+                &lf.mask_decoder.path,
+                &lf.memory_attention.path,
+                &lf.memory_encoder.path,
+                &lf.constants_json.path,
+            ]);
+        }
+    }
+    let live_models_ready = !installed_fast.is_empty();
+    let live_variant_summary = engine
+        .and_then(SharedAiEngine::live_summary)
+        .unwrap_or_else(|| {
+            if live_models_ready {
+                let names = installed_fast
+                    .iter()
+                    .map(|v| v.display_name())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("Verified ({names}) · fastest picked on first use")
+            } else if models_ready {
+                "1024 px fallback (copy 512 px variant folder for ~10x faster live tracking)".to_string()
+            } else {
+                "Not installed".to_string()
+            }
+        });
+
     AiPackStatus {
         models_dir: models_dir.to_path_buf(),
         runtime_dir: runtime_dir.to_path_buf(),
@@ -211,6 +358,9 @@ pub fn inspect_pack_in(models_dir: &Path, runtime_dir: &Path, engine: Option<&Sh
         models_bytes,
         runtime_bytes,
         provider_summary,
+        live_models_ready,
+        live_models_bytes,
+        live_variant_summary,
     }
 }
 
@@ -279,6 +429,40 @@ pub fn install_from_folder_into(source: &Path, models_dir: &Path, runtime_dir: &
         if let Some(src) = roots.iter().map(|r| r.join(notice)).find(|p| p.is_file()) {
             if std::fs::create_dir_all(runtime_dir).is_ok() {
                 let _ = std::fs::copy(src, runtime_dir.join(notice));
+            }
+        }
+    }
+
+    // Also install any verified fast 512 px live variants found under `source`.
+    let live_root = live_models_root(models_dir);
+    for &variant in ModelVariant::all_live_fast() {
+        let cand_dirs = [
+            source.join(variant.dir_name()),
+            source.join("models").join(variant.dir_name()),
+            source.join("exports").join(variant.dir_name()),
+            source.join("release-staging").join(variant.dir_name()),
+            source.to_path_buf(),
+        ];
+        for cand_dir in cand_dirs {
+            if !cand_dir.is_dir() {
+                continue;
+            }
+            let expected = ModelFiles::for_variant(variant, &cand_dir);
+            if expected.verify_all().is_ok() {
+                let dst_dir = live_root.join(variant.dir_name());
+                std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
+                for name in ["vision_encoder.onnx", "mask_decoder.onnx", "memory_attention.onnx", "memory_encoder.onnx", "constants.json"] {
+                    std::fs::copy(cand_dir.join(name), dst_dir.join(name))
+                        .map_err(|e| format!("copy {name}: {e}"))?;
+                    copied += 1;
+                }
+                for opt in ["manifest.json", "LICENSE", "NOTICE"] {
+                    let src_opt = cand_dir.join(opt);
+                    if src_opt.is_file() {
+                        let _ = std::fs::copy(src_opt, dst_dir.join(opt));
+                    }
+                }
+                break;
             }
         }
     }
@@ -465,5 +649,18 @@ mod tests {
         assert!(verify_candidate(&p, &expected).is_ok());
         assert!(verify_candidate(&p, &"0".repeat(64)).is_err());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn live_models_root_uses_parent_for_standard_subdir() {
+        let root = live_models_root(Path::new("/tmp/ai/models/sam21-tiny-video-onnx"));
+        assert_eq!(root, Path::new("/tmp/ai/models"));
+        let status = inspect_pack_in(
+            Path::new("/tmp/ai/nonexistent/sam21-tiny-video-onnx"),
+            Path::new("/tmp/ai/nonexistent/runtime"),
+            None,
+        );
+        assert!(!status.live_models_ready);
+        assert_eq!(status.live_models_bytes, 0);
     }
 }

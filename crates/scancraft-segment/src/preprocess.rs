@@ -198,36 +198,106 @@ pub fn preprocess_rgb(image: &RgbImage, model_size: u32, mode: ResizeMode) -> Re
         }
     };
 
-    for my in 0..s {
-        let oy = (my as f32 + 0.5 - tf.pad_y) / tf.scale_y - 0.5;
-        if matches!(mode, ResizeMode::Letterbox) && (oy < -0.5 || oy > h as f32 - 0.5) {
+    let dst_w = if matches!(mode, ResizeMode::Letterbox) {
+        ((w as f32 * tf.scale_x).round() as usize).clamp(1, s)
+    } else {
+        s
+    };
+    let dst_h = if matches!(mode, ResizeMode::Letterbox) {
+        ((h as f32 * tf.scale_y).round() as usize).clamp(1, s)
+    } else {
+        s
+    };
+    let off_x = if matches!(mode, ResizeMode::Letterbox) { tf.pad_x.round() as isize } else { 0 };
+    let off_y = if matches!(mode, ResizeMode::Letterbox) { tf.pad_y.round() as isize } else { 0 };
+
+    // Separable scaled-triangle (PIL BILINEAR equivalent) filter so downsampling avoids aliasing.
+    let support_x = if tf.scale_x < 1.0 { 1.0 / tf.scale_x } else { 1.0 };
+    let support_y = if tf.scale_y < 1.0 { 1.0 / tf.scale_y } else { 1.0 };
+
+    let mut x_taps: Vec<(usize, usize, usize, f32, Vec<f32>)> = Vec::with_capacity(s);
+    for mx in 0..s {
+        let local_x = mx as isize - off_x;
+        if local_x < 0 || local_x >= dst_w as isize {
             continue;
         }
-        let oy_c = oy.clamp(0.0, (h - 1) as f32);
-        let y0 = oy_c.floor() as usize;
-        let y1 = (y0 + 1).min(h - 1);
-        let wy = oy_c - y0 as f32;
-
-        for mx in 0..s {
-            let ox = (mx as f32 + 0.5 - tf.pad_x) / tf.scale_x - 0.5;
-            if matches!(mode, ResizeMode::Letterbox) && (ox < -0.5 || ox > w as f32 - 0.5) {
-                continue;
+        let cx = (mx as f32 + 0.5 - tf.pad_x) / tf.scale_x - 0.5;
+        let xmin = ((cx - support_x).floor() as isize + 1).max(0) as usize;
+        let xmax = ((cx + support_x).ceil() as isize).min(w as isize) as usize;
+        if xmin >= xmax {
+            let x_c = cx.round().clamp(0.0, (w - 1) as f32) as usize;
+            x_taps.push((mx, x_c, x_c + 1, 1.0, vec![1.0]));
+        } else {
+            let mut wts = Vec::with_capacity(xmax - xmin);
+            let mut wsum = 0.0f32;
+            for sx in xmin..xmax {
+                let wt = (1.0 - (sx as f32 - cx).abs() / support_x).max(0.0);
+                wts.push(wt);
+                wsum += wt;
             }
-            let ox_c = ox.clamp(0.0, (w - 1) as f32);
-            let x0 = ox_c.floor() as usize;
-            let x1 = (x0 + 1).min(w - 1);
-            let wx = ox_c - x0 as f32;
+            let inv = if wsum > 0.0 { 1.0 / wsum } else { 1.0 };
+            x_taps.push((mx, xmin, xmax, inv, wts));
+        }
+    }
 
-            let c00 = sample_rgb(x0, y0);
-            let c10 = sample_rgb(x1, y0);
-            let c01 = sample_rgb(x0, y1);
-            let c11 = sample_rgb(x1, y1);
+    let mut horiz = vec![0.0f32; h * s * 3];
+    for y in 0..h {
+        let row_off = y * s;
+        for (mx, xmin, xmax, inv, wts) in &x_taps {
+            let mut acc = [0.0f32; 3];
+            for (k, sx) in (*xmin..*xmax).enumerate() {
+                let c = sample_rgb(sx, y);
+                let wt = wts[k];
+                acc[0] += c[0] * wt;
+                acc[1] += c[1] * wt;
+                acc[2] += c[2] * wt;
+            }
+            let idx = (row_off + *mx) * 3;
+            horiz[idx] = acc[0] * *inv;
+            horiz[idx + 1] = acc[1] * *inv;
+            horiz[idx + 2] = acc[2] * *inv;
+        }
+    }
 
-            let dst = my * s + mx;
+    for my in 0..s {
+        let local_y = my as isize - off_y;
+        if local_y < 0 || local_y >= dst_h as isize {
+            continue;
+        }
+        let cy = (my as f32 + 0.5 - tf.pad_y) / tf.scale_y - 0.5;
+        let ymin = ((cy - support_y).floor() as isize + 1).max(0) as usize;
+        let ymax = ((cy + support_y).ceil() as isize).min(h as isize) as usize;
+        if ymin >= ymax {
+            let y_c = cy.round().clamp(0.0, (h - 1) as f32) as usize;
+            for (mx, ..) in &x_taps {
+                let src = (y_c * s + *mx) * 3;
+                let dst = my * s + *mx;
+                for c in 0..3 {
+                    let val = (horiz[src + c] * 255.0).round().clamp(0.0, 255.0) / 255.0;
+                    buf[c * plane + dst] = (val - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
+                }
+            }
+            continue;
+        }
+        let mut weights = Vec::with_capacity(ymax - ymin);
+        let mut wsum = 0.0f32;
+        for sy in ymin..ymax {
+            let wt = (1.0 - (sy as f32 - cy).abs() / support_y).max(0.0);
+            weights.push((sy, wt));
+            wsum += wt;
+        }
+        let inv = if wsum > 0.0 { 1.0 / wsum } else { 1.0 };
+        for (mx, ..) in &x_taps {
+            let mut acc = [0.0f32; 3];
+            for &(sy, wt) in &weights {
+                let src = (sy * s + *mx) * 3;
+                acc[0] += horiz[src] * wt;
+                acc[1] += horiz[src + 1] * wt;
+                acc[2] += horiz[src + 2] * wt;
+            }
+            let dst = my * s + *mx;
             for c in 0..3 {
-                let top = c00[c] + (c10[c] - c00[c]) * wx;
-                let bot = c01[c] + (c11[c] - c01[c]) * wx;
-                let val = top + (bot - top) * wy;
+                let val = (acc[c] * inv * 255.0).round().clamp(0.0, 255.0) / 255.0;
                 buf[c * plane + dst] = (val - IMAGENET_MEAN[c]) / IMAGENET_STD[c];
             }
         }

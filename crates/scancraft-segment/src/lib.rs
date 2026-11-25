@@ -52,13 +52,13 @@ pub mod runtime;
 pub mod video;
 
 pub use fallback::{GeometricSegmenter, ObjectSegmenter, SegmentationBackend};
-pub use manifest::{ModelFiles, PinnedFile, RuntimeFiles, sha256_file, verify_sha256};
+pub use manifest::{ModelFiles, ModelVariant, PinnedFile, RuntimeFiles, sha256_file, verify_sha256};
 pub use memory_bank::{AssembledMemory, MemoryBank, MemoryEntry, ModelConstants};
 pub use postprocess::{FrameMask, FrameTimings, LostReason, Mask2D, PostprocessConfig, TrackingStatus};
 pub use preprocess::{BoxPrompt, FramePrompt, ImageTransform, PointPrompt, ResizeMode};
 pub use project3d::{ColorDepthBuffer, DepthMaskProjection, MultiViewVoter, PointLabel, Project3DConfig};
 pub use runtime::{ActiveProvider, ExecutionPreference, GpuAdapterInfo, OrtRuntime, SelfTestReport, enumerate_dxgi_adapters};
-pub use video::Sam2VideoSegmenter;
+pub use video::{Sam2VideoSegmenter, VariantBenchmark, VariantSelectionReport};
 
 /// Errors returned by `scancraft-segment`.
 #[derive(Debug, thiserror::Error)]

@@ -9,6 +9,8 @@ use std::path::Path;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ModelConstants {
     pub model: String,
+    #[serde(default)]
+    pub variant: Option<String>,
     pub image_size: u32,
     pub hidden_dim: usize,
     pub mem_dim: usize,
@@ -22,6 +24,27 @@ pub struct ModelConstants {
     pub enable_temporal_pos_encoding_for_object_pointers: bool,
     #[serde(default = "default_opset")]
     pub opset: u32,
+    /// Fixed number of spatial memory blocks expected by static-shape exports (padded with zeros + attention bias).
+    #[serde(default)]
+    pub static_memory_blocks: Option<usize>,
+    /// Fixed number of pointer tokens expected by static-shape exports (padded with zeros + attention bias).
+    #[serde(default)]
+    pub static_pointer_tokens: Option<usize>,
+    /// Whether `memory_attention.onnx` expects a `memory_attention_mask` additive bias tensor `[1, 1, 1, total_len]`.
+    #[serde(default)]
+    pub has_memory_attn_mask: bool,
+    /// Learned `no_memory_embedding` (`hidden_dim`) added to `feats2` on unconditioned frames when exported raw.
+    #[serde(default)]
+    pub no_memory_embedding: Option<Vec<f32>>,
+    /// Per-slot spatial temporal position embeddings (`[num_maskmem][mem_dim]`).
+    #[serde(default)]
+    pub memory_temporal_positional_encoding: Option<Vec<Vec<f32>>>,
+    /// Optional linear projection matrix `[mem_dim * hidden_dim]` mapping `hidden_dim`-d sine PE to `mem_dim`.
+    #[serde(default)]
+    pub pointer_tpos_proj_weight: Option<Vec<f32>>,
+    /// Optional linear projection bias `[mem_dim]`.
+    #[serde(default)]
+    pub pointer_tpos_proj_bias: Option<Vec<f32>>,
 }
 
 fn default_opset() -> u32 {
@@ -32,6 +55,7 @@ impl Default for ModelConstants {
     fn default() -> Self {
         Self {
             model: "sam2.1-tiny".into(),
+            variant: None,
             image_size: 1024,
             hidden_dim: 256,
             mem_dim: 64,
@@ -42,6 +66,13 @@ impl Default for ModelConstants {
             spatial_tokens_per_memory_block: 4096,
             enable_temporal_pos_encoding_for_object_pointers: true,
             opset: 17,
+            static_memory_blocks: None,
+            static_pointer_tokens: None,
+            has_memory_attn_mask: false,
+            no_memory_embedding: None,
+            memory_temporal_positional_encoding: None,
+            pointer_tpos_proj_weight: None,
+            pointer_tpos_proj_bias: None,
         }
     }
 }
@@ -65,6 +96,22 @@ impl ModelConstants {
                     parsed.tokens_per_pointer, parsed.mem_dim, parsed.hidden_dim
                 ),
             });
+        }
+        if let Some(nme) = &parsed.no_memory_embedding {
+            if nme.len() != parsed.hidden_dim {
+                return Err(SegmentError::InvalidConstants {
+                    path: path.to_path_buf(),
+                    reason: format!("no_memory_embedding len {} != hidden_dim {}", nme.len(), parsed.hidden_dim),
+                });
+            }
+        }
+        if let Some(tpos) = &parsed.memory_temporal_positional_encoding {
+            if tpos.len() < parsed.num_maskmem || tpos.iter().any(|v| v.len() != parsed.mem_dim) {
+                return Err(SegmentError::InvalidConstants {
+                    path: path.to_path_buf(),
+                    reason: "invalid memory_temporal_positional_encoding shape".into(),
+                });
+            }
         }
         Ok(parsed)
     }
@@ -97,6 +144,8 @@ pub struct AssembledMemory {
     /// `[pointer_len, 1, mem_dim]` row-major.
     pub pointer_memory_pos: Vec<f32>,
     pub pointer_len: usize,
+    /// Optional `[spatial_len + pointer_len]` additive attention mask (`0.0` valid, `-10000.0` padded).
+    pub attention_bias: Option<Vec<f32>>,
 }
 
 /// Computes SAM 2's 1D sinusoidal positional encoding `get_1d_sine_pe(pos, dim)` for a single scalar
@@ -110,6 +159,20 @@ pub fn sine_pe_1d(pos: f32, dim: usize) -> Vec<f32> {
         let exponent = (2 * i) as f32 / dim as f32;
         let omega = 1.0 / 10000.0f32.powf(exponent);
         let angle = pos_scaled * omega;
+        out[i] = angle.sin();
+        out[half + i] = angle.cos();
+    }
+    out
+}
+
+/// Exact PyTorch `get_1d_sine_pe(pos, dim)` used before `temporal_positional_encoding_projection_layer`.
+fn sine_pe_1d_exact(pos: f32, dim: usize) -> Vec<f32> {
+    let half = dim / 2;
+    let mut out = vec![0.0f32; dim];
+    for i in 0..half {
+        let exponent = (2 * (i / 2)) as f32 / half as f32;
+        let denom = 10000.0f32.powf(exponent);
+        let angle = pos / denom;
         out[i] = angle.sin();
         out[half + i] = angle.cos();
     }
@@ -229,24 +292,64 @@ impl MemoryBank {
         let block_tokens = self.constants.spatial_tokens_per_memory_block;
         let mem_dim = self.constants.mem_dim;
         let block_floats = block_tokens * mem_dim;
-        let total_blocks = selected_cond.len() + selected_recent.len();
-        let mut spatial_memory = Vec::with_capacity(total_blocks * block_floats);
-        let mut spatial_memory_pos = Vec::with_capacity(total_blocks * block_floats);
+        let mut spatial_entries: Vec<(usize, &MemoryEntry)> = Vec::new();
+        let num_maskmem = self.constants.num_maskmem;
+        let tpos = self.constants.memory_temporal_positional_encoding.as_deref();
 
-        for entry in selected_cond.iter().chain(selected_recent.iter()) {
-            spatial_memory.extend_from_slice(&entry.memory_tokens);
-            spatial_memory_pos.extend_from_slice(&entry.memory_pos_enc);
+        for entry in selected_cond {
+            let slot = num_maskmem.saturating_sub(1);
+            spatial_entries.push((slot, entry));
+        }
+        // PyTorch iterates recent frames nearest-first or preserves chronological order; slot depends only on t_diff.
+        for entry in selected_recent.into_iter().rev() {
+            let t_diff = current_frame.saturating_sub(entry.frame_index) as usize;
+            let slot = t_diff.saturating_sub(1).min(num_maskmem.saturating_sub(2));
+            spatial_entries.push((slot, entry));
+        }
+
+        let real_blocks = spatial_entries.len();
+        let target_blocks = self.constants.static_memory_blocks.unwrap_or(real_blocks);
+        if spatial_entries.len() > target_blocks {
+            spatial_entries.truncate(target_blocks);
+        }
+        let used_blocks = spatial_entries.len();
+        let spatial_len = target_blocks * block_tokens;
+
+        let mut spatial_memory = vec![0.0f32; spatial_len * mem_dim];
+        let mut spatial_memory_pos = vec![0.0f32; spatial_len * mem_dim];
+        for (block_idx, (slot, entry)) in spatial_entries.into_iter().enumerate() {
+            let dst = block_idx * block_floats;
+            spatial_memory[dst..dst + block_floats].copy_from_slice(&entry.memory_tokens);
+            spatial_memory_pos[dst..dst + block_floats].copy_from_slice(&entry.memory_pos_enc);
+            if let Some(tpos_table) = tpos {
+                if let Some(tvec) = tpos_table.get(slot) {
+                    for tok in 0..block_tokens {
+                        let base = dst + tok * mem_dim;
+                        for c in 0..mem_dim {
+                            spatial_memory_pos[base + c] += tvec[c];
+                        }
+                    }
+                }
+            }
         }
 
         // Object pointers: conditioning pointers first, then recent non-conditioning pointers up to
-        // `max_object_pointers_in_encoder` (16).
+        // `max_object_pointers_in_encoder`.
         let max_ptrs = self.constants.max_object_pointers_in_encoder;
         let tpp = self.constants.tokens_per_pointer;
         let mut ptr_entries: Vec<(i64, &MemoryEntry)> = Vec::new();
-        for e in &selected_cond {
+        for e in self.cond_frames.values().filter(|e| e.frame_index < current_frame) {
             if ptr_entries.len() < max_ptrs {
                 let pos = (current_frame as i64 - e.frame_index as i64).max(0);
                 ptr_entries.push((pos, e));
+            }
+        }
+        if ptr_entries.is_empty() {
+            for e in self.cond_frames.values() {
+                if ptr_entries.len() < max_ptrs {
+                    let pos = (current_frame as i64 - e.frame_index as i64).max(0);
+                    ptr_entries.push((pos, e));
+                }
             }
         }
         let rem_ptrs = max_ptrs.saturating_sub(ptr_entries.len());
@@ -255,31 +358,77 @@ impl MemoryBank {
             ptr_entries.push((pos, e));
         }
 
-        let pointer_len = ptr_entries.len() * tpp;
-        let mut pointer_memory = Vec::with_capacity(pointer_len * mem_dim);
-        let mut pointer_memory_pos = Vec::with_capacity(pointer_len * mem_dim);
-        let max_pos_norm = (max_ptrs.saturating_sub(1)).max(1) as f32;
+        let real_ptr_tokens = ptr_entries.len() * tpp;
+        let pointer_len = self
+            .constants
+            .static_pointer_tokens
+            .map(|cap| cap.max(tpp))
+            .unwrap_or(real_ptr_tokens);
+        let used_ptr_tokens = real_ptr_tokens.min(pointer_len);
+        let used_ptrs = used_ptr_tokens / tpp;
 
-        for (t_diff, entry) in ptr_entries {
-            // Split the 256-d pointer into `tpp` (4) x `mem_dim` (64) tokens.
-            pointer_memory.extend_from_slice(&entry.object_pointer);
+        let mut pointer_memory = vec![0.0f32; pointer_len * mem_dim];
+        let mut pointer_memory_pos = vec![0.0f32; pointer_len * mem_dim];
+        let max_pos_norm = (max_ptrs.saturating_sub(1)).max(1) as f32;
+        let ptr_proj = match (
+            self.constants.pointer_tpos_proj_weight.as_deref(),
+            self.constants.pointer_tpos_proj_bias.as_deref(),
+        ) {
+            (Some(w), Some(b))
+                if w.len() == mem_dim * self.constants.hidden_dim && b.len() == mem_dim =>
+            {
+                Some((w, b))
+            }
+            _ => None,
+        };
+
+        for (ptr_idx, (t_diff, entry)) in ptr_entries.into_iter().take(used_ptrs).enumerate() {
+            // Split the hidden_dim pointer into `tpp` x `mem_dim` tokens.
+            let mem_dst = ptr_idx * tpp * mem_dim;
+            let copy_len = (tpp * mem_dim).min(entry.object_pointer.len());
+            pointer_memory[mem_dst..mem_dst + copy_len].copy_from_slice(&entry.object_pointer[..copy_len]);
+
             if self.constants.enable_temporal_pos_encoding_for_object_pointers {
-                let pe = sine_pe_1d(t_diff as f32 / max_pos_norm, mem_dim);
-                for _ in 0..tpp {
-                    pointer_memory_pos.extend_from_slice(&pe);
+                let pe = if let Some((w, b)) = ptr_proj {
+                    let raw = sine_pe_1d_exact(t_diff as f32 / max_pos_norm, self.constants.hidden_dim);
+                    let mut proj = vec![0.0f32; mem_dim];
+                    for m in 0..mem_dim {
+                        let row = &w[m * self.constants.hidden_dim..(m + 1) * self.constants.hidden_dim];
+                        let mut acc = b[m];
+                        for (k, &rv) in raw.iter().enumerate() {
+                            acc += row[k] * rv;
+                        }
+                        proj[m] = acc;
+                    }
+                    proj
+                } else {
+                    sine_pe_1d(t_diff as f32 / max_pos_norm, mem_dim)
+                };
+                for t in 0..tpp {
+                    let pdst = mem_dst + t * mem_dim;
+                    pointer_memory_pos[pdst..pdst + mem_dim].copy_from_slice(&pe);
                 }
-            } else {
-                pointer_memory_pos.resize(pointer_memory_pos.len() + tpp * mem_dim, 0.0);
             }
         }
+
+        let attention_bias = if self.constants.has_memory_attn_mask {
+            let mut bias = vec![-10000.0f32; spatial_len + pointer_len];
+            let real_spatial = used_blocks * block_tokens;
+            bias[..real_spatial].fill(0.0);
+            bias[spatial_len..spatial_len + used_ptr_tokens].fill(0.0);
+            Some(bias)
+        } else {
+            None
+        };
 
         Some(AssembledMemory {
             spatial_memory,
             spatial_memory_pos,
-            spatial_len: total_blocks * block_tokens,
+            spatial_len,
             pointer_memory,
             pointer_memory_pos,
             pointer_len,
+            attention_bias,
         })
     }
 }
@@ -355,5 +504,59 @@ mod tests {
         assert_eq!(p0.len(), 64);
         assert!(p0.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
         assert_ne!(p0, p1);
+    }
+
+    #[test]
+    fn static_memory_pads_zeros_applies_attention_bias_and_temporal_pe() {
+        let mut cfg = ModelConstants {
+            image_size: 512,
+            num_maskmem: 4,
+            max_object_pointers_in_encoder: 8,
+            spatial_tokens_per_memory_block: 16, // small synthetic block size for test
+            static_memory_blocks: Some(4),
+            static_pointer_tokens: Some(8 * 4),
+            has_memory_attn_mask: true,
+            no_memory_embedding: Some(vec![0.25; 256]),
+            memory_temporal_positional_encoding: Some(vec![
+                vec![1.0; 64],
+                vec![2.0; 64],
+                vec![3.0; 64],
+                vec![10.0; 64], // conditioning slot (num_maskmem - 1)
+            ]),
+            pointer_tpos_proj_weight: Some(vec![0.5; 64 * 256]),
+            pointer_tpos_proj_bias: Some(vec![0.1; 64]),
+            ..ModelConstants::default()
+        };
+        let mut bank = MemoryBank::new(cfg.clone());
+        bank.insert(dummy_entry(0, true, &cfg)).unwrap();
+        bank.insert(dummy_entry(1, false, &cfg)).unwrap();
+
+        let assembled = bank.assemble_for_frame(2).expect("assembled");
+        // 4 static blocks * 16 = 64 spatial tokens; 8 pointers * 4 = 32 pointer tokens
+        assert_eq!(assembled.spatial_len, 64);
+        assert_eq!(assembled.pointer_len, 32);
+        // Block 0 (cond frame 0) should get +10.0 added to dummy pos_enc (0.5 -> 10.5)
+        assert!((assembled.spatial_memory_pos[0] - 10.5).abs() < 1e-5);
+        // Block 1 (recent frame 1, t_diff=1 -> slot 0 = 1.0) -> 0.5 + 1.0 = 1.5
+        assert!((assembled.spatial_memory_pos[16 * 64] - 1.5).abs() < 1e-5);
+        // Block 2 & 3 padded with zeros
+        assert_eq!(assembled.spatial_memory[2 * 16 * 64], 0.0);
+
+        let bias = assembled.attention_bias.expect("attention_bias present");
+        assert_eq!(bias.len(), 64 + 32);
+        assert!(bias[..32].iter().all(|&v| v == 0.0));
+        assert!(bias[32..64].iter().all(|&v| v == -10000.0));
+        assert!(bias[64..64 + 8].iter().all(|&v| v == 0.0));
+        assert!(bias[64 + 8..].iter().all(|&v| v == -10000.0));
+
+        // Verify evicting old non-conditioning frames beyond num_maskmem - 1 window works when assembling
+        for t in 2..=6 {
+            bank.insert(dummy_entry(t, false, &cfg)).unwrap();
+        }
+        let assembled_late = bank.assemble_for_frame(7).unwrap();
+        let bias_late = assembled_late.attention_bias.unwrap();
+        // 1 conditioning + 3 recent = 4 active blocks => all 64 spatial tokens active (0.0)
+        assert!(bias_late[..64].iter().all(|&v| v == 0.0));
+        cfg.static_memory_blocks = None;
     }
 }

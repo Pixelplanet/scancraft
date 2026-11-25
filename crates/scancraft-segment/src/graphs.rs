@@ -93,14 +93,33 @@ impl Sam2Graphs {
         let pointer_pos = Array3::from_shape_vec((assembled.pointer_len, 1, mem_dim), assembled.pointer_memory_pos.clone())
             .map_err(|e| SegmentError::InvalidShape { name: "pointer_memory_position_embeddings", detail: e.to_string() })?;
 
-        let outputs = self.memory_attention.run(ort::inputs! {
-            "current_vision_features" => TensorRef::from_array_view(curr_feats.view())?,
-            "current_vision_position_embeddings" => TensorRef::from_array_view(curr_pos.view())?,
-            "spatial_memory" => TensorRef::from_array_view(spatial_mem.view())?,
-            "spatial_memory_position_embeddings" => TensorRef::from_array_view(spatial_pos.view())?,
-            "pointer_memory" => TensorRef::from_array_view(pointer_mem.view())?,
-            "pointer_memory_position_embeddings" => TensorRef::from_array_view(pointer_pos.view())?,
-        })?;
+        let outputs = if self.constants.has_memory_attn_mask {
+            let total_len = assembled.spatial_len + assembled.pointer_len;
+            let bias_vec = assembled
+                .attention_bias
+                .clone()
+                .unwrap_or_else(|| vec![0.0f32; total_len]);
+            let attn_mask = Array4::from_shape_vec((1, 1, 1, total_len), bias_vec)
+                .map_err(|e| SegmentError::InvalidShape { name: "memory_attention_mask", detail: e.to_string() })?;
+            self.memory_attention.run(ort::inputs! {
+                "current_vision_features" => TensorRef::from_array_view(curr_feats.view())?,
+                "current_vision_position_embeddings" => TensorRef::from_array_view(curr_pos.view())?,
+                "spatial_memory" => TensorRef::from_array_view(spatial_mem.view())?,
+                "spatial_memory_position_embeddings" => TensorRef::from_array_view(spatial_pos.view())?,
+                "pointer_memory" => TensorRef::from_array_view(pointer_mem.view())?,
+                "pointer_memory_position_embeddings" => TensorRef::from_array_view(pointer_pos.view())?,
+                "memory_attention_mask" => TensorRef::from_array_view(attn_mask.view())?,
+            })?
+        } else {
+            self.memory_attention.run(ort::inputs! {
+                "current_vision_features" => TensorRef::from_array_view(curr_feats.view())?,
+                "current_vision_position_embeddings" => TensorRef::from_array_view(curr_pos.view())?,
+                "spatial_memory" => TensorRef::from_array_view(spatial_mem.view())?,
+                "spatial_memory_position_embeddings" => TensorRef::from_array_view(spatial_pos.view())?,
+                "pointer_memory" => TensorRef::from_array_view(pointer_mem.view())?,
+                "pointer_memory_position_embeddings" => TensorRef::from_array_view(pointer_pos.view())?,
+            })?
+        };
 
         let cond_dyn = outputs["conditioned_features"].try_extract_array::<f32>()?;
         conditioned_to_nchw(cond_dyn.shape(), cond_dyn.as_slice().ok_or_else(|| SegmentError::InvalidShape {

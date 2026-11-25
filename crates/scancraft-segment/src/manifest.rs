@@ -16,6 +16,98 @@ pub const MEMORY_ATTENTION_SHA256: &str = "afd5045a8fe48628d4da49a82b77351a43f75
 pub const MEMORY_ENCODER_SHA256: &str = "3a97e8ba25180b39e938ab52a0c4d085007b25f3e919f5672d4ecbcdd2ab9ee3";
 pub const CONSTANTS_JSON_SHA256: &str = "292eac72e80431c796041b4d550405b1b4648e8ef25a7c265ad58859315c8b7b";
 
+// ScanCraft 512 px static-memory exports (Apache-2.0, derived from facebook/sam2.1-hiera-tiny @ de431c404385).
+pub const V512_VISION_ENCODER_FP32_SHA256: &str = "b14aef9fcb9e25d1432ed01b94fce754222cf61a7031197a1120e7272f51836b";
+pub const V512_VISION_ENCODER_FP16_SHA256: &str = "be27db9a1283c301a4f55cb0c569a4f4fb42d9af1d448d89835090c81ead4e3d";
+pub const V512_MASK_DECODER_FP32_SHA256: &str = "7a12b70d916311b1771fd768a030c3434d7a598ea041281b59979dbb08519772";
+pub const V512_MEMORY_ENCODER_FP32_SHA256: &str = "c5e894449c3c7f57a4653f4f116aefeeb5c80ef619fa0f24aa4e51822706e3bb";
+pub const V512_MEMORY_ENCODER_FP16_SHA256: &str = "aa2465e77ba1f22060a2d076cf34e25872963b4fe142377ab4e274b2cd97f16c";
+
+pub const V512_MEM4_ATTN_FP32_SHA256: &str = "8435625935be22a54f58683fdb94b8fb9593dc50f76c1c73b614774a02f4581d";
+pub const V512_MEM4_CONSTANTS_FP32_SHA256: &str = "26393cfd8aa9f0cb4e01bc5c8cdf3885452d09ba204f90eb7532af27eda8d549";
+
+pub const V512_MEM4_ATTN_FP16_SHA256: &str = "0ca02b063cd86b2419f2d497156e7756dd9bcd3f847822f39c266d1abc44f138";
+pub const V512_MEM4_CONSTANTS_FP16_SHA256: &str = "61d27804c40947369568a33cdb96af3bd2a65914c8cd5135da795e7ad407ad0a";
+
+pub const V512_MEM2_ATTN_FP32_SHA256: &str = "4260e8018807df2e35cf82e577179e4196081992512b8aa9ae040c43beef44ec";
+pub const V512_MEM2_CONSTANTS_FP32_SHA256: &str = "5535bac0265acb367a3ee37b44033016795eb05f1212a82f7f7c428ec434c352";
+
+pub const V512_MEM2_ATTN_FP16_SHA256: &str = "1a1811dde825e45ab6123c86c9622bdda4103243d10cce7e6719128462ee7290";
+pub const V512_MEM2_CONSTANTS_FP16_SHA256: &str = "f56135a29519840715138f12dcb7b685b7b42bb10bf5e1d94ca3c6f6fcf891bd";
+
+/// Supported SAM 2.1 video model variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ModelVariant {
+    /// Upstream `jax-image-tools` 1024 px FP32 dynamic-memory export (post-scan keyframe quality).
+    Sam21Tiny1024Fp32,
+    /// ScanCraft 512 px, 4 static memory blocks, FP32 weights.
+    Sam21Tiny512Mem4Fp32,
+    /// ScanCraft 512 px, 4 static memory blocks, FP16 encoders/attention + FP32 mask decoder.
+    Sam21Tiny512Mem4Fp16,
+    /// ScanCraft 512 px, 2 static memory blocks, FP32 weights.
+    Sam21Tiny512Mem2Fp32,
+    /// ScanCraft 512 px, 2 static memory blocks, FP16 encoders/attention + FP32 mask decoder.
+    Sam21Tiny512Mem2Fp16,
+}
+
+impl ModelVariant {
+    /// Fast 512 px variants ordered cleanly for adapter selection benchmarks.
+    pub fn all_live_fast() -> &'static [ModelVariant] {
+        &[
+            Self::Sam21Tiny512Mem2Fp16,
+            Self::Sam21Tiny512Mem4Fp16,
+            Self::Sam21Tiny512Mem2Fp32,
+            Self::Sam21Tiny512Mem4Fp32,
+        ]
+    }
+
+    pub fn all() -> &'static [ModelVariant] {
+        &[
+            Self::Sam21Tiny1024Fp32,
+            Self::Sam21Tiny512Mem4Fp32,
+            Self::Sam21Tiny512Mem4Fp16,
+            Self::Sam21Tiny512Mem2Fp32,
+            Self::Sam21Tiny512Mem2Fp16,
+        ]
+    }
+
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            Self::Sam21Tiny1024Fp32 => "sam21-tiny-video-onnx",
+            Self::Sam21Tiny512Mem4Fp32 => "sam21-tiny-512-mem4-fp32",
+            Self::Sam21Tiny512Mem4Fp16 => "sam21-tiny-512-mem4-fp16",
+            Self::Sam21Tiny512Mem2Fp32 => "sam21-tiny-512-mem2-fp32",
+            Self::Sam21Tiny512Mem2Fp16 => "sam21-tiny-512-mem2-fp16",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Sam21Tiny1024Fp32 => "1024 px FP32",
+            Self::Sam21Tiny512Mem4Fp32 => "512 px · mem4 · FP32",
+            Self::Sam21Tiny512Mem4Fp16 => "512 px · mem4 · FP16",
+            Self::Sam21Tiny512Mem2Fp32 => "512 px · mem2 · FP32",
+            Self::Sam21Tiny512Mem2Fp16 => "512 px · mem2 · FP16",
+        }
+    }
+
+    pub fn is_live_fast(self) -> bool {
+        !matches!(self, Self::Sam21Tiny1024Fp32)
+    }
+
+    pub fn from_dir_name(s: &str) -> Option<Self> {
+        let norm = s.trim().to_ascii_lowercase();
+        match norm.as_str() {
+            "sam21-tiny-video-onnx" | "1024-fp32" | "1024" => Some(Self::Sam21Tiny1024Fp32),
+            "sam21-tiny-512-mem4-fp32" | "512-mem4-fp32" => Some(Self::Sam21Tiny512Mem4Fp32),
+            "sam21-tiny-512-mem4-fp16" | "512-mem4-fp16" => Some(Self::Sam21Tiny512Mem4Fp16),
+            "sam21-tiny-512-mem2-fp32" | "512-mem2-fp32" => Some(Self::Sam21Tiny512Mem2Fp32),
+            "sam21-tiny-512-mem2-fp16" | "512-mem2-fp16" => Some(Self::Sam21Tiny512Mem2Fp16),
+            _ => None,
+        }
+    }
+}
+
 /// Pinned Windows x64 binaries from NuGet:
 /// `Microsoft.ML.OnnxRuntime.DirectML` 1.24.4 + `Microsoft.AI.DirectML` 1.15.4.
 pub const ORT_VERSION_PIN: &str = "1.24.4";
@@ -53,16 +145,58 @@ pub struct ModelFiles {
 }
 
 impl ModelFiles {
-    /// Builds the pinned `jax-image-tools/sam21-tiny-video-onnx` manifest from `dir`.
-    pub fn sam21_tiny_from_dir(dir: impl AsRef<Path>) -> Self {
+    /// Builds a pinned manifest for any supported [`ModelVariant`] in `dir`.
+    pub fn for_variant(variant: ModelVariant, dir: impl AsRef<Path>) -> Self {
         let d = dir.as_ref();
+        let (ve, md, ma, me, cj) = match variant {
+            ModelVariant::Sam21Tiny1024Fp32 => (
+                VISION_ENCODER_SHA256,
+                MASK_DECODER_SHA256,
+                MEMORY_ATTENTION_SHA256,
+                MEMORY_ENCODER_SHA256,
+                CONSTANTS_JSON_SHA256,
+            ),
+            ModelVariant::Sam21Tiny512Mem4Fp32 => (
+                V512_VISION_ENCODER_FP32_SHA256,
+                V512_MASK_DECODER_FP32_SHA256,
+                V512_MEM4_ATTN_FP32_SHA256,
+                V512_MEMORY_ENCODER_FP32_SHA256,
+                V512_MEM4_CONSTANTS_FP32_SHA256,
+            ),
+            ModelVariant::Sam21Tiny512Mem4Fp16 => (
+                V512_VISION_ENCODER_FP16_SHA256,
+                V512_MASK_DECODER_FP32_SHA256,
+                V512_MEM4_ATTN_FP16_SHA256,
+                V512_MEMORY_ENCODER_FP16_SHA256,
+                V512_MEM4_CONSTANTS_FP16_SHA256,
+            ),
+            ModelVariant::Sam21Tiny512Mem2Fp32 => (
+                V512_VISION_ENCODER_FP32_SHA256,
+                V512_MASK_DECODER_FP32_SHA256,
+                V512_MEM2_ATTN_FP32_SHA256,
+                V512_MEMORY_ENCODER_FP32_SHA256,
+                V512_MEM2_CONSTANTS_FP32_SHA256,
+            ),
+            ModelVariant::Sam21Tiny512Mem2Fp16 => (
+                V512_VISION_ENCODER_FP16_SHA256,
+                V512_MASK_DECODER_FP32_SHA256,
+                V512_MEM2_ATTN_FP16_SHA256,
+                V512_MEMORY_ENCODER_FP16_SHA256,
+                V512_MEM2_CONSTANTS_FP16_SHA256,
+            ),
+        };
         Self {
-            vision_encoder: PinnedFile::new(d.join("vision_encoder.onnx"), VISION_ENCODER_SHA256),
-            mask_decoder: PinnedFile::new(d.join("mask_decoder.onnx"), MASK_DECODER_SHA256),
-            memory_attention: PinnedFile::new(d.join("memory_attention.onnx"), MEMORY_ATTENTION_SHA256),
-            memory_encoder: PinnedFile::new(d.join("memory_encoder.onnx"), MEMORY_ENCODER_SHA256),
-            constants_json: PinnedFile::new(d.join("constants.json"), CONSTANTS_JSON_SHA256),
+            vision_encoder: PinnedFile::new(d.join("vision_encoder.onnx"), ve),
+            mask_decoder: PinnedFile::new(d.join("mask_decoder.onnx"), md),
+            memory_attention: PinnedFile::new(d.join("memory_attention.onnx"), ma),
+            memory_encoder: PinnedFile::new(d.join("memory_encoder.onnx"), me),
+            constants_json: PinnedFile::new(d.join("constants.json"), cj),
         }
+    }
+
+    /// Builds the pinned `jax-image-tools/sam21-tiny-video-onnx` (1024 px FP32) manifest from `dir`.
+    pub fn sam21_tiny_from_dir(dir: impl AsRef<Path>) -> Self {
+        Self::for_variant(ModelVariant::Sam21Tiny1024Fp32, dir)
     }
 
     /// Verifies that every model file exists and matches its pinned SHA-256 digest.
@@ -190,5 +324,24 @@ mod tests {
         assert!(text.contains("load-dynamic"));
         assert!(text.contains("directml"));
         assert!(text.contains("api-24"));
+    }
+
+    #[test]
+    fn model_variants_have_distinct_manifests_and_roundtrip_names() {
+        for &v in ModelVariant::all() {
+            assert_eq!(ModelVariant::from_dir_name(v.dir_name()), Some(v));
+            let files = ModelFiles::for_variant(v, Path::new("/models"));
+            assert_eq!(files.constants_json.sha256.len(), 64);
+            assert_eq!(files.vision_encoder.sha256.len(), 64);
+            assert_eq!(files.mask_decoder.sha256.len(), 64);
+            assert_eq!(files.memory_attention.sha256.len(), 64);
+            assert_eq!(files.memory_encoder.sha256.len(), 64);
+        }
+        assert!(!ModelVariant::Sam21Tiny1024Fp32.is_live_fast());
+        assert!(ModelVariant::Sam21Tiny512Mem4Fp16.is_live_fast());
+        assert_eq!(
+            ModelFiles::sam21_tiny_from_dir(Path::new("/models")),
+            ModelFiles::for_variant(ModelVariant::Sam21Tiny1024Fp32, Path::new("/models"))
+        );
     }
 }

@@ -10,7 +10,8 @@
 use anyhow::{Context, Result, bail};
 use scancraft_core::RgbImage;
 use scancraft_segment::{
-    ExecutionPreference, FrameMask, FramePrompt, ModelFiles, OrtRuntime, PostprocessConfig, RuntimeFiles, Sam2VideoSegmenter,
+    ExecutionPreference, FrameMask, FramePrompt, ModelFiles, ModelVariant, OrtRuntime, PostprocessConfig,
+    RuntimeFiles, Sam2VideoSegmenter,
 };
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -20,7 +21,10 @@ struct CliArgs {
     output: PathBuf,
     model_dir: PathBuf,
     runtime_dir: PathBuf,
+    variant: ModelVariant,
     backend: ExecutionPreference,
+    save_masks: Option<PathBuf>,
+    no_overlay: bool,
     initial_prompt: FramePrompt,
     reprompts: BTreeMap<usize, FramePrompt>,
 }
@@ -56,13 +60,14 @@ fn parse_box(s: &str) -> Result<[f32; 4]> {
 fn parse_args() -> Result<CliArgs> {
     let mut input = None;
     let mut output = None;
-    let mut model_dir = std::env::var_os("SCANCRAFT_SAM2_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| default_ai_subdir("models/sam21-tiny-video-onnx"));
+    let mut variant = ModelVariant::Sam21Tiny1024Fp32;
+    let mut model_dir: Option<PathBuf> = std::env::var_os("SCANCRAFT_SAM2_DIR").map(PathBuf::from);
     let mut runtime_dir = std::env::var_os("SCANCRAFT_ORT_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| default_ai_subdir("runtime/ort-1.24.4-dml"));
     let mut backend = ExecutionPreference::Auto;
+    let mut save_masks = None;
+    let mut no_overlay = false;
     let mut initial_prompt = FramePrompt::default();
     let mut reprompts: BTreeMap<usize, FramePrompt> = BTreeMap::new();
 
@@ -71,8 +76,15 @@ fn parse_args() -> Result<CliArgs> {
         match arg.as_str() {
             "--input" => input = Some(PathBuf::from(it.next().context("missing --input value")?)),
             "--output" => output = Some(PathBuf::from(it.next().context("missing --output value")?)),
-            "--model-dir" => model_dir = PathBuf::from(it.next().context("missing --model-dir value")?),
+            "--variant" => {
+                let val = it.next().context("missing --variant value")?;
+                variant = ModelVariant::from_dir_name(&val)
+                    .with_context(|| format!("unknown --variant `{val}`"))?;
+            }
+            "--model-dir" => model_dir = Some(PathBuf::from(it.next().context("missing --model-dir value")?)),
             "--runtime-dir" => runtime_dir = PathBuf::from(it.next().context("missing --runtime-dir value")?),
+            "--save-masks" => save_masks = Some(PathBuf::from(it.next().context("missing --save-masks value")?)),
+            "--no-overlay" => no_overlay = true,
             "--backend" => {
                 let val = it.next().context("missing --backend value")?;
                 backend = match val.to_ascii_lowercase().as_str() {
@@ -111,7 +123,7 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--help" | "-h" => {
                 println!(
-                    "Usage: segment_seq --input <dir> --output <dir> --point <x,y> [--neg-point <x,y>] [--box <x0,y0,x1,y1>] [--reprompt <idx>:<x,y>[:pos|neg]] [--backend auto|directml|cpu] [--model-dir <dir>] [--runtime-dir <dir>]"
+                    "Usage: segment_seq --input <dir> --output <dir> --point <x,y> [--variant <1024-fp32|512-mem4-fp32|512-mem4-fp16|512-mem2-fp32|512-mem2-fp16>] [--save-masks <dir>] [--no-overlay] [--neg-point <x,y>] [--box <x0,y0,x1,y1>] [--reprompt <idx>:<x,y>[:pos|neg]] [--backend auto|directml|cpu] [--model-dir <dir>] [--runtime-dir <dir>]"
                 );
                 std::process::exit(0);
             }
@@ -124,7 +136,11 @@ fn parse_args() -> Result<CliArgs> {
     if initial_prompt.is_empty() {
         bail!("at least one --point or --box prompt is required for frame 0");
     }
-    Ok(CliArgs { input, output, model_dir, runtime_dir, backend, initial_prompt, reprompts })
+    let model_dir = model_dir.unwrap_or_else(|| {
+        let exports = default_ai_subdir("exports").join(variant.dir_name());
+        if exports.is_dir() { exports } else { default_ai_subdir("models").join(variant.dir_name()) }
+    });
+    Ok(CliArgs { input, output, model_dir, runtime_dir, variant, backend, save_masks, no_overlay, initial_prompt, reprompts })
 }
 
 fn collect_frames(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -215,9 +231,12 @@ fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = parse_args()?;
     std::fs::create_dir_all(&args.output)?;
+    if let Some(dir) = &args.save_masks {
+        std::fs::create_dir_all(dir)?;
+    }
 
     let frames = collect_frames(&args.input)?;
-    let models = ModelFiles::sam21_tiny_from_dir(&args.model_dir);
+    let models = ModelFiles::for_variant(args.variant, &args.model_dir);
     let runtime_files = RuntimeFiles::ort_1244_dml_from_dir(&args.runtime_dir);
 
     let load_t0 = std::time::Instant::now();
@@ -225,6 +244,7 @@ fn main() -> Result<()> {
     let (mut segmenter, self_test) = Sam2VideoSegmenter::load(&runtime, &models, args.backend, PostprocessConfig::default())?;
     let load_ms = load_t0.elapsed().as_secs_f32() * 1000.0;
 
+    println!("Variant: {} ({})", args.variant.display_name(), args.model_dir.display());
     println!("Provider: {} (init+load+selftest: {load_ms:.1} ms)", segmenter.provider());
     if let Some(rep) = self_test {
         println!("Self-test [{}]: {}", rep.provider, rep.message);
@@ -245,7 +265,14 @@ fn main() -> Result<()> {
             segmenter.propagate(idx as u64, &img)?
         };
         let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("frame");
-        write_outputs(&args.output, stem, &img, &res, prompt_used)?;
+        if !args.no_overlay {
+            write_outputs(&args.output, stem, &img, &res, prompt_used)?;
+        }
+        if let Some(mask_dir) = &args.save_masks {
+            let mask_img = image::GrayImage::from_raw(res.mask.width, res.mask.height, res.mask.data.clone())
+                .context("failed to build GrayImage")?;
+            mask_img.save(mask_dir.join(format!("frame_{idx:05}.png")))?;
+        }
 
         let t = res.timings;
         println!(
@@ -270,8 +297,9 @@ fn main() -> Result<()> {
     if !tracked_timings.is_empty() {
         let n = tracked_timings.len() as f32;
         let avg = |f: fn(&scancraft_segment::FrameTimings) -> f32| tracked_timings.iter().map(f).sum::<f32>() / n;
+        let peak_rss_mb = query_peak_working_set_mb();
         println!(
-            "Mean tracked frame ({} propagated frames): vision_encoder={:.1} ms, memory_attention={:.1} ms, mask_decoder={:.1} ms, memory_encoder={:.1} ms, pre+post={:.1} ms, total={:.1} ms",
+            "Mean tracked frame ({} propagated frames): vision_encoder={:.1} ms, memory_attention={:.1} ms, mask_decoder={:.1} ms, memory_encoder={:.1} ms, pre+post={:.1} ms, total={:.1} ms, peak_rss={:.1} MB",
             tracked_timings.len(),
             avg(|t| t.vision_encoder_ms),
             avg(|t| t.memory_attention_ms),
@@ -279,8 +307,28 @@ fn main() -> Result<()> {
             avg(|t| t.memory_encoder_ms),
             avg(|t| t.preprocess_ms + t.postprocess_ms),
             avg(|t| t.total_ms),
+            peak_rss_mb.unwrap_or(0.0),
         );
     }
 
     Ok(())
+}
+
+#[cfg(windows)]
+fn query_peak_working_set_mb() -> Option<f64> {
+    use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+    use windows::Win32::System::Threading::GetCurrentProcess;
+    let mut pmc = PROCESS_MEMORY_COUNTERS::default();
+    pmc.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    let ok = unsafe { GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+    if ok.is_ok() {
+        Some(pmc.PeakWorkingSetSize as f64 / (1024.0 * 1024.0))
+    } else {
+        None
+    }
+}
+
+#[cfg(not(windows))]
+fn query_peak_working_set_mb() -> Option<f64> {
+    None
 }

@@ -65,6 +65,7 @@ pub fn ai_pack_modal(app: &mut ScanCraftApp, ctx: &egui::Context) {
                         kit::status_line(ui, &msg, if status.ready { t.agent_ok } else { t.warning });
                     });
                     kit::row(ui, "Backend", |ui| kit::value_text(ui, &status.provider_summary, !status.ready));
+                    kit::row(ui, "Live tracking", |ui| kit::value_text(ui, &status.live_variant_summary, !status.live_models_ready));
                     kit::row(ui, "Models", |ui| {
                         kit::value_text(
                             ui,

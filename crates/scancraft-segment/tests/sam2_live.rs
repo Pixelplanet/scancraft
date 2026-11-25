@@ -81,3 +81,48 @@ fn cpu_and_directml_self_test_and_tracking() {
     assert!(r2.mask.is_foreground(140, 128));
     assert!(!r1.mask.is_foreground(10, 10));
 }
+
+#[test]
+#[ignore]
+fn load_fastest_variant_selects_fast_512_variant() {
+    use scancraft_segment::ModelVariant;
+
+    let local = PathBuf::from(std::env::var("LOCALAPPDATA").unwrap()).join("ScanCraft/ai");
+    let rt_dir = std::env::var("SCANCRAFT_ORT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| local.join("runtime/ort-1.24.4-dml"));
+    let rt_files = RuntimeFiles::ort_1244_dml_from_dir(&rt_dir);
+    let runtime = OrtRuntime::init(&rt_files).expect("OrtRuntime::init");
+
+    let mut candidates = Vec::new();
+    for &variant in ModelVariant::all() {
+        let dir = [
+            local.join("models").join(variant.dir_name()),
+            local.join("exports").join(variant.dir_name()),
+        ]
+        .into_iter()
+        .find(|d| d.join("constants.json").is_file());
+        if let Some(d) = dir {
+            let files = ModelFiles::for_variant(variant, &d);
+            if files.verify_all().is_ok() {
+                candidates.push((variant, files));
+            }
+        }
+    }
+    assert!(!candidates.is_empty(), "expected at least one verified variant under ScanCraft/ai");
+    let (mut seg, report) =
+        Sam2VideoSegmenter::load_fastest_variant(&runtime, &candidates, ExecutionPreference::Auto, PostprocessConfig::default())
+            .expect("load_fastest_variant");
+    println!("Selected variant: {} on {} ({:.1} ms/frame)", report.chosen.display_name(), report.provider, report.mean_tracked_ms);
+    for b in &report.benchmarks {
+        println!("  - {:24} ok={} mean={:?} note={}", b.variant.dir_name(), b.self_test_passed, b.mean_tracked_ms, b.note);
+    }
+    assert!(report.chosen.is_live_fast(), "expected a fast 512px variant to beat 1024px baseline, got {:?}", report.chosen);
+
+    let f0 = synthetic_moving_frame(96, 128);
+    let f1 = synthetic_moving_frame(118, 128);
+    let r0 = seg.add_prompt(0, &f0, &FramePrompt::default().with_point(96.0, 128.0, true)).unwrap();
+    let r1 = seg.propagate(1, &f1).unwrap();
+    assert!(r0.mask.is_foreground(96, 128));
+    assert!(r1.mask.is_foreground(118, 128));
+}
