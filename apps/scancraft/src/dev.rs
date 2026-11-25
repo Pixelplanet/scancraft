@@ -4,12 +4,17 @@
 //!   second flipped upside down and moved, unaligned) and exits;
 //! - `--open <dir>` opens a project at start;
 //! - `--auto <steps>` runs comma-separated steps once the app is idle: `stage:<name>`,
-//!   `select:<pass>`, `start`, `stop`, `same`, `moved`, `align`, `alignall`, `accept` (the open
-//!   proposal: one pass, Align All or Refine All), `pairs`, `refine`, `isolate`, `keep`,
-//!   `merge`, `save:<dir>`, `import:<scan file>`, `addproject:<dir>`, `metres` (the toast's
-//!   metres-to-mm conversion), `wholescene:<on|off>`, `fit`, `wait:<frames>`,
+//!   `select:<pass>`, `selectnode:<merged|mesh|device>`, `start`, `stop`, `same`, `moved`,
+//!   `align`, `alignall`, `accept` (the open proposal: one pass, Align All or Refine All),
+//!   `pairs`, `refine`, `isolate`, `keep`, `merge`, `save:<dir>`, `import:<scan file>`,
+//!   `addproject:<dir>`, `metres` (the toast's metres-to-mm conversion),
+//!   `wholescene:<on|off>`, `fit`, `wait:<frames>`, `tool:<name>` (connectip, plane, outliers,
+//!   crop, downsample, isolate, reconstruct, smooth, decimate, fillholes, makesolid, save,
+//!   export, pairs), `closetool`, `size:<w>,<h>` (window inner size in points),
+//!   `rename:<project name>`, `askquit` (the unsaved-changes quit question),
 //!   `drag:<x>,<y>,<dx>,<dy>` (a left-button drag in points, injected as egui input so it works
-//!   without window focus), `shot:<png path>`, `quit`.
+//!   without window focus), `rclick:<x>,<y>` (a right-button click, for context menus),
+//!   `hover:<x>,<y>` (just the pointer, for tooltips), `shot:<png path>`, `quit`.
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -21,7 +26,7 @@ use scancraft_core::Transform;
 use scancraft_driver::ScanConfig;
 use scancraft_slam::{KeyframeData, VoxelMap};
 
-use crate::app::{Capture, ScanCraftApp};
+use crate::app::{Capture, ClosePrompt, ScanCraftApp};
 use crate::model::{Node, Stage, Tool};
 use crate::project::{self, AlignState, PassMeta, PassStart, StoredPass, StoredProject};
 
@@ -79,11 +84,19 @@ pub struct Script {
 
 impl Script {
     pub fn new(steps: &str) -> Self {
-        // `drag:x,y,dx,dy` contains commas: re-join its arguments after splitting the steps.
+        // Steps with comma arguments (`drag:x,y,dx,dy`, `size:w,h`, `rclick:x,y`, `hover:x,y`):
+        // re-join their arguments after splitting the steps.
         let mut list: Vec<String> = Vec::new();
         for part in steps.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
             match list.last_mut() {
                 Some(last) if last.starts_with("drag:") && last.matches(',').count() < 3 => {
+                    last.push(',');
+                    last.push_str(&part);
+                }
+                Some(last)
+                    if (last.starts_with("size:") || last.starts_with("rclick:") || last.starts_with("hover:"))
+                        && !last.contains(',') =>
+                {
                     last.push(',');
                     last.push_str(&part);
                 }
@@ -107,6 +120,15 @@ impl Script {
             self.pending_input.push_back(egui::Event::PointerMoved(at(i as f32 / 12.0)));
         }
         self.pending_input.push_back(button(false, at(1.0)));
+    }
+
+    /// Queue a right-button click at (x, y), points.
+    fn queue_rclick(&mut self, x: f32, y: f32) {
+        let pos = egui::pos2(x, y);
+        let button = |pressed: bool| egui::Event::PointerButton { pos, button: egui::PointerButton::Secondary, pressed, modifiers: egui::Modifiers::NONE };
+        self.pending_input.push_back(egui::Event::PointerMoved(pos));
+        self.pending_input.push_back(button(true));
+        self.pending_input.push_back(button(false));
     }
 
     pub fn tick(&mut self, app: &mut ScanCraftApp, ctx: &egui::Context) {
@@ -158,6 +180,53 @@ impl Script {
                     app.selection = Some(Node::Pass(id));
                 }
             }
+            "selectnode" => {
+                app.selection = match arg {
+                    "merged" => Some(Node::Merged),
+                    "mesh" => Some(Node::Mesh),
+                    "device" => Some(Node::Device),
+                    _ => None,
+                };
+            }
+            "tool" => {
+                let tool = match arg {
+                    "connectip" => Some(Tool::ConnectIp),
+                    "plane" => Some(Tool::RemovePlane),
+                    "outliers" => Some(Tool::Outliers),
+                    "crop" => Some(Tool::Crop),
+                    "downsample" => Some(Tool::Downsample),
+                    "isolate" => Some(Tool::IsolateObject),
+                    "reconstruct" => Some(Tool::Reconstruct),
+                    "smooth" => Some(Tool::Smooth),
+                    "decimate" => Some(Tool::Decimate),
+                    "fillholes" => Some(Tool::FillHoles),
+                    "makesolid" => Some(Tool::MakeSolid),
+                    "save" => Some(Tool::SaveProject),
+                    "export" => Some(Tool::Export(app.settings.export_format)),
+                    "pairs" => app.align_target().map(Tool::PointPairs),
+                    _ => None,
+                };
+                match tool {
+                    // The ribbon opens a tool from its own stage; file tools (Save Project) open
+                    // from the app bar and leave the stage alone.
+                    Some(t) => {
+                        if !t.is_file() {
+                            app.stage = t.stage();
+                        }
+                        app.open_tool(t);
+                    }
+                    None => eprintln!("auto: unknown tool {arg}"),
+                }
+            }
+            "closetool" => app.close_tool(),
+            "size" => {
+                let v: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                if let [w, h] = v[..] {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w, h)));
+                }
+            }
+            "rename" => app.project.name = arg.to_string(),
+            "askquit" => app.close_prompt = Some(ClosePrompt::Quit),
             "align" => {
                 if let Some(id) = app.align_target() {
                     app.align_auto(id);
@@ -202,6 +271,18 @@ impl Script {
                 let v: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 if let [x, y, dx, dy] = v[..] {
                     self.queue_drag(x, y, dx, dy);
+                }
+            }
+            "rclick" => {
+                let v: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                if let [x, y] = v[..] {
+                    self.queue_rclick(x, y);
+                }
+            }
+            "hover" => {
+                let v: Vec<f32> = arg.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                if let [x, y] = v[..] {
+                    self.pending_input.push_back(egui::Event::PointerMoved(egui::pos2(x, y)));
                 }
             }
             "shot" => {
