@@ -333,3 +333,16 @@ laser model are not built.
   separate scans with merge-weight priority, optional sharp top pass and the tracker's marker maps
   as listed markers (was: one anonymous cloud). Save All in the quit question. Script steps
   `open:DIR` and `apply`.
+- 2026-11-25 (second PC, branch `agent/orient`) — Orientation tools (merge-and-ai.md §8):
+  `scancraft-align` gained `horn.rs` (closed-form point-pair fit; `fit_pairs` is now the
+  `align_point_pairs` start and drives a "Pick fit" read-out + nearly-collinear warning in the
+  Point Pairs card), `fit.rs` (plane / cylinder grown from a clicked point over a `Surface`),
+  `datum.rs` (3-2-1 datum frames onto world planes / axes), `orient.rs` (`auto_orient`:
+  area-weighted normal histogram, main axis from wall normals, open-rim detection, base on the
+  grid) and `scale.rs` (least-squares factor from measured lengths). App (`app_orient.rs`,
+  `ui_orient.rs`): `move_project_frame` re-places every placed pass, the merged model and the
+  mesh together; ribbon group "Orient" on the Align stage holds Auto Orient (Accept/Reject
+  proposal), Orient by Datums and Scale from Lengths. New `--auto` steps `autoorient`,
+  `rejectorient`, `tool:datums`, `tool:scale`, `datumkind`, `datumonto`, `datumflip`,
+  `scaletrue`; `accept` also accepts an orient proposal. On the real two-pass shell scan Auto
+  Orient chose "largest face" (no rim detected), turning the project 9.9°.

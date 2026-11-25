@@ -44,6 +44,12 @@ solid-model commit:
   shell project: watertight, wall 3.2 mm, 279 holes filled, 6 markers removed. **Next:** keep the
   tracker marker maps in the project (they are session-only), and read Revo's
   `marker_framework.mkf` for imported Revo scans.
+- **Done 2026-11-25:** the orientation tools of merge-and-ai.md §8 — Auto Orient (an
+  Accept/Reject proposal), Orient by Datums (plane / axis / point grown from a click onto world
+  planes and axes), Scale from Lengths for imported passes, and Horn's start plus a
+  nearly-collinear warning in Point Pairs (`scancraft-align` `horn`/`fit`/`datum`/`orient`/`scale`,
+  app `app_orient.rs` / `ui_orient.rs`, ribbon group "Orient" on the Align stage). On the real
+  shell scan Auto Orient found no rim and stood the part on its largest face — worth a look.
 
 **Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,
 automatic table removal, wall-aware quality for inside/outside scans), Refine as a preview, Merge,

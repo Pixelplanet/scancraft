@@ -35,6 +35,7 @@ A disabled button, ribbon button or menu entry always says why in its tooltip.
 | **Merged model** | The point cloud Merge makes from the included passes. | "merge result", "project model" (that is what a pass is aligned onto) |
 | **Mesh** | The triangle surface from Reconstruct or Make Solid. | "model", "surface" as a noun for the result |
 | **Project** | Everything in one tab; a folder on disk. | "session" |
+| **Datum** | A plane, axis or point picked on the model that the project is oriented by ("Onto XY (floor)", "Flip"). | |
 
 | Verb | Use for | Examples |
 | --- | --- | --- |
@@ -45,6 +46,8 @@ A disabled button, ribbon button or menu entry always says why in its tooltip.
 | **Accept / Reject** | Deciding on a proposal the app previews (Align Pass, Align All, Refine All). | not "Discard" |
 | **Apply / Cancel** | A tool card that changes points or the mesh. Apply runs the tool with the settings shown. | not "OK" |
 | **Connect, Export, Save, Align** | Cards whose action has its own name use it as the primary button. | |
+| **Orient** | Turning and moving the whole project frame so the model sits square to the world axes, base on the grid. Not "align" — alignment places passes onto each other. | Auto Orient, Orient by Datums, "orient the project" |
+| **Scale** | Giving an imported pass its true size from lengths measured on it. | Scale from Lengths…, "× 1.2016" |
 | **Import Scan…** | Adding scan files (PLY, OBJ, STL) as new passes. | |
 | **Add Project…** | Appending the passes of another ScanCraft project. | |
 | **New Project / Open Project… / Save Project…** | Project files; New and Open use a new tab. | |

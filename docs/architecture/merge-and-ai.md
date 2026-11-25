@@ -193,12 +193,12 @@ re-implement from the ideas, never copy its code.
 
 | Item | Where | Effort |
 | --- | --- | --- |
-| Auto-orient a merged part to its own faces (area-weighted normal histogram, axis from wall normals, open rim as the base) | after merging, before meshing/export | S–M |
+| Auto-orient a merged part to its own faces (area-weighted normal histogram, axis from wall normals, open rim as the base) — done 2026-11-25 (`scancraft_align::auto_orient`, app "Auto Orient" proposal via `move_project_frame`) | after merging, before meshing/export | S–M |
 | "Ambiguous" warning when a clearly different pose scores almost as well | `scancraft-align` quality | S |
 | Score poses by a capped mean over all samples; facing-aware closest-point search | refine / quality | S |
-| Manual 3-point alignment (Horn's method, collinear warning) as the fallback when Align All rejects an edge | `align_point_pairs`, app | S |
-| Datum alignment to world axes (plane / axis / origin, live preview) and primitive fits grown from a click | app | M |
-| Scale from several measured lengths (imported photogrammetry scans) | import | S |
+| Manual 3-point alignment (Horn's method, collinear warning) as the fallback when Align All rejects an edge — done 2026-11-25 (`scancraft_align::fit_pairs` as the `align_point_pairs` start, Pick-fit row + nearly-collinear warning in the Point Pairs card) | `align_point_pairs`, app | S |
+| Datum alignment to world axes (plane / axis / origin, live preview) and primitive fits grown from a click — done 2026-11-25 (`scancraft_align::fit` / `datum`, app "Orient by Datums" tool) | app | M |
+| Scale from several measured lengths (imported photogrammetry scans) — done 2026-11-25 (`scancraft_align::scale_from_lengths`, app "Scale from Lengths" tool on imported passes) | import | S |
 | Volume-error check (excess / missing material regions) | solid-model benchmark | M |
 | Review tool for an AI agent (ranked worst places on renders, trend, target) with guides served by the app | AI assistant, §6 | M |
 | STEP export of fitted primitives (analytic AP214, own writer or `truck-stepio`) | export | M |
