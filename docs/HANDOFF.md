@@ -36,9 +36,14 @@ solid-model commit:
   Measured on the user's two-pass shell scan with `examples/mesh_project.rs` (rebuilds a saved
   project's merge, meshes, prints roughness / holes, renders PNGs); numbers in merge-and-ai.md §7.
 - **Done 2026-11-25:** `scancraft-mesh::solid` (`build_solid`) is in the Mesh stage as the
-  "Make Solid" tool, next to Reconstruct (it takes the points, not the mesh). **Next:** pass the
-  scan each point came from (scan priority, sharp scans) and the project's markers to it; test the new
-  Mesh tools by hand in the app (they were checked on renders and tests, not clicked through).
+  "Make Solid" tool, next to Reconstruct (it takes the points, not the mesh). Since 2026-11-25 it
+  takes the included, placed passes as separate scans (`solid_input` / `solid_points` in
+  `app_project.rs`: object only unless "whole scene", scan id per pass), the merge weights as scan
+  priority (equal weights: averaged), optionally the most trusted pass as a sharp scan, and the
+  tracker's marker map of each pass as listed markers (normal from the pass's surface). Two-pass
+  shell project: watertight, wall 3.2 mm, 279 holes filled, 6 markers removed. **Next:** keep the
+  tracker marker maps in the project (they are session-only), and read Revo's
+  `marker_framework.mkf` for imported Revo scans.
 
 **Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,
 automatic table removal, wall-aware quality for inside/outside scans), Refine as a preview, Merge,

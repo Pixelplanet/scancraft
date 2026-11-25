@@ -354,6 +354,13 @@ impl Script {
                 self.waiting_for_shot = Some(arg.to_string());
             }
             "newtab" => app.new_tab(),
+            "open" => app.open_project(std::path::PathBuf::from(arg)),
+            // The open tool's primary button (Apply / Fill / Make Solid …).
+            "apply" => {
+                if let Some(tool) = app.tool {
+                    app.run_tool(tool);
+                }
+            }
             "history" => app.show_history = !app.show_history,
             "undo" => app.undo(),
             "removeplane" => {

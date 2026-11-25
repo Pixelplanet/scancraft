@@ -275,20 +275,24 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
             Some(if app.project.path.is_some() { "Save" } else { "Save…" }),
             "Discard Changes",
         ),
-        ClosePrompt::Quit => (
-            warning,
-            "Quit ScanCraft",
-            format!("Unsaved changes in {}. Quit anyway? Save each project from its tab first to keep them.", app.dirty_names().join(", ")),
-            None,
-            "Quit Without Saving",
-        ),
+        ClosePrompt::Quit => {
+            let unsaved = app.dirty_without_folder();
+            let message = if unsaved.is_empty() {
+                format!("Unsaved changes in {}. Save them before quitting?", app.dirty_names().join(", "))
+            } else {
+                format!("Unsaved changes in {}. {} never saved yet: save from its tab to choose a folder, or quit without saving.", app.dirty_names().join(", "), unsaved.join(", ") + if unsaved.len() == 1 { " was" } else { " were" })
+            };
+            (warning, "Quit ScanCraft", message, Some(if unsaved.is_empty() { "Save All" } else { "" }), "Quit Without Saving")
+        }
     };
-    let actions = kit::Actions { primary: primary.map(|label| (label, true)), cancel: Some("Cancel"), destructive: Some((destructive, true)), ..Default::default() };
+    // An empty primary label means "not possible here" (Save All with a never-saved project).
+    let actions = kit::Actions { primary: primary.filter(|l| !l.is_empty()).map(|label| (label, true)), cancel: Some("Cancel"), destructive: Some((destructive, true)), ..Default::default() };
     let choice = kit::confirm_modal(ctx, egui::Id::new("close_prompt"), icon, title, &message, &actions);
     match (prompt, choice) {
         (_, Some(kit::Choice::Cancel)) => app.close_prompt = None,
         (ClosePrompt::Tab, Some(kit::Choice::Primary)) => app.save_then_close(),
         (ClosePrompt::Tab, Some(kit::Choice::Destructive)) => app.close_active_tab(),
+        (ClosePrompt::Quit, Some(kit::Choice::Primary)) => app.save_all_then_quit(),
         (ClosePrompt::Quit, Some(kit::Choice::Destructive)) => {
             app.close_prompt = None;
             app.quit_confirmed = true;

@@ -731,12 +731,30 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         }
         Tool::FillHoles => fill_holes_form(app, ui),
         Tool::MakeSolid => {
-            let points = app.working_len();
-            let source = app.working_source();
+            // The placed passes go in as separate scans; without any, the working cloud.
+            let placed: Vec<(String, f32)> = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).map(|p| (p.name.clone(), p.meta.weight)).collect();
+            let input = if placed.is_empty() {
+                format!("{} · {} points", app.working_source(), thousands(app.working_len()))
+            } else {
+                format!("{} placed pass{}", placed.len(), if placed.len() == 1 { "" } else { "es" })
+            };
+            let weights_differ = placed.iter().any(|p| (p.1 - placed[0].1).abs() > 1e-6);
+            let top = placed.iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0.clone());
+            let markers: usize = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).filter_map(|p| app.marker_maps.get(&p.id)).map(|m| m.len()).sum();
             let s = &mut app.settings;
-            kit::row(ui, "Input", |ui| kit::value_field(ui, &format!("{source} · {} points", thousands(points)), true));
+            kit::row(ui, "Input", |ui| kit::value_field(ui, &input, true));
+            if !placed.is_empty() {
+                let order = if weights_differ { "the higher merge weight wins where passes overlap" } else { "equal merge weights: overlapping passes are averaged" };
+                kit::note_with_tip(ui, &format!("Each pass is a scan of its own: {order}."), "Set a pass's merge weight in its Selected Pass panel. The solid keeps one layer per surface, from the most trusted pass covering it.");
+            }
             kit::slider_row(ui, "Cell size", &mut s.solid_cell_mm, 0.25..=1.5, 2, "mm").on_hover_text("The wall should be at least 6 cells thick. Smaller cells keep finer detail and take longer.");
-            kit::checkbox(ui, "Find and remove marker stickers", &mut s.solid_remove_markers);
+            let marker_label = if markers > 0 { format!("Remove marker stickers ({markers} from tracking + detected)") } else { "Find and remove marker stickers".to_string() };
+            kit::checkbox(ui, &marker_label, &mut s.solid_remove_markers);
+            if weights_differ {
+                if let Some(top) = top {
+                    kit::checkbox(ui, &format!("Sharp edges from {top}"), &mut s.solid_sharp_top).on_hover_text("Treat the most trusted pass as clean and dense: a narrower kernel keeps its edges sharp. Leave off for noisy scans (thin plates can open slits).");
+                }
+            }
             kit::note_with_tip(
                 ui,
                 "Builds a closed, watertight solid of a thin-walled part and replaces the mesh. Takes longer than Reconstruct.",

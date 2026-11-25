@@ -121,6 +121,8 @@ pub struct Settings {
     /// Make Solid: grid spacing of the solve and whether marker stickers are found and removed.
     pub solid_cell_mm: f32,
     pub solid_remove_markers: bool,
+    /// Make Solid: keep edges sharp on the most trusted pass (highest merge weight).
+    pub solid_sharp_top: bool,
     pub decimate_ratio: f32,
     pub export_path: String,
     pub export_format: ExportFormat,
@@ -162,6 +164,7 @@ impl Default for Settings {
             fill_keep_largest: true,
             solid_cell_mm: 0.4,
             solid_remove_markers: true,
+            solid_sharp_top: false,
             decimate_ratio: 0.5,
             export_path: "scan.ply".to_string(),
             export_format: ExportFormat::PlyCloud,
@@ -317,6 +320,10 @@ pub struct ScanCraftApp {
     pending_close: bool,
     /// The user chose to quit without saving: the next close request goes through.
     pub quit_confirmed: bool,
+    /// Save All on quit: the tabs still to save, in order; quits when the last save worked.
+    save_all_queue: Option<std::collections::VecDeque<usize>>,
+    /// Set when the app should close the window (Save All finished).
+    pub close_window: bool,
     /// The history timeline card is open, and whether its button was under the pointer this
     /// frame (a click on the button toggles it instead of closing it as an outside click).
     pub show_history: bool,
@@ -461,6 +468,8 @@ impl ScanCraftApp {
             close_prompt: None,
             pending_close: false,
             quit_confirmed: false,
+            save_all_queue: None,
+            close_window: false,
             show_history: false,
             history_button_hovered: false,
             pending_open: None,
@@ -2423,21 +2432,27 @@ impl ScanCraftApp {
                 });
             }
             Tool::MakeSolid => {
-                let input = self.working_cloud();
-                let config = scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() };
+                let input = self.solid_input();
+                let mut config = scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() };
+                let (remove_markers, sharp_top) = (s.solid_remove_markers, s.solid_sharp_top);
                 self.spawn_undoable("Making the solid", "Make Solid", move || {
-                    let points: Vec<scancraft_mesh::SolidPoint> = input
-                        .points
-                        .iter()
-                        .filter_map(|p| {
-                            let (position, normal) = (glam::Vec3::from_array(p.position), glam::Vec3::from_array(p.normal));
-                            (position.is_finite() && normal.is_finite() && normal.length() > 1e-3).then(|| scancraft_mesh::SolidPoint { position, normal: normal.normalize(), scan: 0 })
-                        })
-                        .collect();
+                    let (points, markers, priority) = match project_ops::solid_points(input) {
+                        Ok(v) => v,
+                        Err(e) => return JobResult::Failed(e),
+                    };
                     if points.len() < 100 {
-                        return JobResult::Failed("Make Solid needs points with normals: merge the passes first".into());
+                        return JobResult::Failed("Make Solid needs points with normals: align the passes (or merge them) first".into());
                     }
-                    let solid = scancraft_mesh::build_solid(&points, &[], &config);
+                    // The most trusted pass wins where passes cover the same surface; with equal
+                    // weights all passes are averaged (`SolidConfig::scan_priority`).
+                    if let Some(order) = priority {
+                        if sharp_top {
+                            config.sharp_scans = vec![order[0]];
+                        }
+                        config.scan_priority = order;
+                    }
+                    let markers = if remove_markers { markers } else { Vec::new() };
+                    let solid = scancraft_mesh::build_solid(&points, &markers, &config);
                     if solid.mesh.triangles.is_empty() {
                         return JobResult::Failed("No solid could be built from these points; try a larger cell size".into());
                     }
@@ -2689,14 +2704,20 @@ impl ScanCraftApp {
                     if std::mem::take(&mut self.pending_close) {
                         self.close_active_tab();
                     }
+                    if self.save_all_queue.is_some() {
+                        self.save_next_for_quit();
+                    }
                 }
                 JobResult::Opened(opened) => self.install_project(*opened),
                 JobResult::Imported(scan) => self.install_imported(*scan),
                 JobResult::AddedProject { name, passes } => self.install_added(name, passes),
                 JobResult::Exported(message) => self.say(Tone::Success, message),
                 JobResult::Failed(message) => {
-                    // A failed save must not close the tab it was for.
+                    // A failed save must not close the tab it was for, nor quit.
                     self.pending_close = false;
+                    if self.save_all_queue.take().is_some() {
+                        self.quit_confirmed = false;
+                    }
                     self.say(Tone::Error, message)
                 }
             }
@@ -2816,9 +2837,9 @@ mod tests {
             }
         }
         let mut app = app();
-        add_pass(&mut app, 1, AlignState::Reference);
-        let g = app.generation();
-        app.passes[0].layer = CloudLayer::new(PointCloud::from_points(points), g);
+        // An imported pass: Make Solid reads each placed pass's own surface.
+        add_fixed_pass(&mut app, 1, points, Transform::default());
+        app.settings.whole_scene = true;
         app.settings.solid_cell_mm = 0.5;
         assert!(app.tool_blocked(Tool::MakeSolid).is_none());
         app.run_tool(Tool::MakeSolid);
@@ -3356,6 +3377,63 @@ mod tests {
         app.switch_tab(1);
         app.undo();
         assert!(app.passes.is_empty());
+    }
+
+    #[test]
+    fn make_solid_gets_the_passes_as_separate_scans_with_priority_and_markers() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let moved = scancraft_align::rigid(glam::Quat::IDENTITY, glam::Vec3::new(0.0, 0.0, 0.5));
+        add_fixed_pass(&mut app, 2, table_and_block(), moved);
+        app.passes[1].meta.weight = 3.0;
+        // A marker the tracker saw on top of the block of pass 2 (pass frame).
+        app.marker_maps.insert(2, vec![([0.0, 0.0, 40.0], true)]);
+        app.settings.whole_scene = true;
+        let (points, markers, priority) = project_ops::solid_points(app.solid_input()).unwrap();
+        let total = table_and_block().len();
+        assert_eq!(points.len(), 2 * total, "both passes, whole scene");
+        assert_eq!(points.iter().filter(|p| p.scan == 1).count(), total);
+        assert_eq!(points.iter().filter(|p| p.scan == 2).count(), total);
+        // Pass 2 sits 0.5 mm higher in the project frame: its points were placed.
+        let top2 = points.iter().filter(|p| p.scan == 2).map(|p| p.position.z).fold(f32::MIN, f32::max);
+        assert!((top2 - 40.5).abs() < 1e-3, "{top2}");
+        assert_eq!(priority, Some(vec![2, 1]), "the heavier pass is trusted first");
+        assert_eq!(markers.len(), 1);
+        let m = &markers[0];
+        assert_eq!(m.scan, Some(2));
+        assert!((m.center - glam::Vec3::new(0.0, 0.0, 40.5)).length() < 1e-3);
+        assert!(m.normal.dot(glam::Vec3::Z) > 0.9, "normal from the surface around it: {:?}", m.normal);
+        // Equal weights: no priority (overlapping passes are averaged).
+        app.passes[1].meta.weight = app.passes[0].meta.weight;
+        assert_eq!(project_ops::solid_points(app.solid_input()).unwrap().2, None);
+        // Unplaced passes are left out, as in Merge.
+        app.passes[1].meta.alignment = AlignState::Unaligned;
+        assert_eq!(project_ops::solid_points(app.solid_input()).unwrap().0.len(), total);
+    }
+
+    #[test]
+    fn save_all_on_quit_saves_every_project_then_closes() {
+        let mut app = app();
+        let (d1, d2) = (temp_dir("saveall-1"), temp_dir("saveall-2"));
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.project.path = Some(d1.clone());
+        app.new_tab();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        // Never saved: Save All cannot know where to put it.
+        assert_eq!(app.dirty_without_folder().len(), 1);
+        app.save_all_then_quit();
+        assert!(!app.close_window && app.busy.is_none(), "nothing is saved while one project has no folder");
+        app.project.path = Some(d2.clone());
+        app.save_all_then_quit();
+        for _ in 0..4 {
+            finish_job(&mut app);
+            app.poll_jobs();
+        }
+        assert!(d1.join(scancraft_io::project::PROJECT_FILE).is_file() && d2.join(scancraft_io::project::PROJECT_FILE).is_file());
+        assert!(!app.any_dirty());
+        assert!(app.close_window && app.quit_confirmed, "the window closes once all are saved");
+        let _ = std::fs::remove_dir_all(&d1);
+        let _ = std::fs::remove_dir_all(&d2);
     }
 
     #[test]

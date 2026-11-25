@@ -62,6 +62,77 @@ fn job_inputs(passes: &[JobPass], whole_scene: bool) -> Result<Vec<PassInput>, S
         .collect()
 }
 
+/// What Make Solid is built from: the placed passes as separate scans (the solid keeps one layer
+/// per surface, from the most trusted pass), or, when no pass is placed (an opened older project
+/// with only a merged model), the working cloud as one scan.
+pub enum SolidInput {
+    Passes {
+        /// (scan id from 1, project <- pass, surface, isolation, merge weight, tracker markers in the pass frame)
+        passes: Vec<(u8, Transform, PassSource, MaskCache, f32, Vec<Vec3>)>,
+        whole_scene: bool,
+    },
+    Cloud(PointCloud),
+}
+
+/// The solid's input points, its listed markers and the scan priority (most trusted first;
+/// `None` when all passes weigh the same). Runs in the background job.
+pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint>, Vec<scancraft_mesh::solid::markers::Marker>, Option<Vec<u8>>), String> {
+    use scancraft_mesh::solid::markers::{Marker, MarkerSource};
+    use scancraft_mesh::SolidPoint;
+    let ok = |p: Vec3, n: Vec3| p.is_finite() && n.is_finite() && n.length() > 1e-3;
+    match input {
+        SolidInput::Cloud(cloud) => Ok((
+            cloud
+                .points
+                .iter()
+                .map(|p| (Vec3::from_array(p.position), Vec3::from_array(p.normal)))
+                .filter(|(p, n)| ok(*p, *n))
+                .map(|(position, n)| SolidPoint { position, normal: n.normalize(), scan: 0 })
+                .collect(),
+            Vec::new(),
+            None,
+        )),
+        SolidInput::Passes { passes, whole_scene } => {
+            let mut points = Vec::new();
+            let mut markers = Vec::new();
+            for (scan, t, source, mask, _, map) in &passes {
+                let surfels = source.surfels()?;
+                let surfels = if whole_scene {
+                    surfels
+                } else {
+                    let oriented: Vec<(Vec3, Vec3)> = surfels.iter().map(|s| (s.0, s.1)).collect();
+                    isolation::mask_for(mask, &oriented).keep(surfels)
+                };
+                let m = t.to_mat4();
+                // A tracker marker's normal: the pass's own surface around it (the solid's
+                // marker stage selects the sticker's points by it, then refines it).
+                for (k, c) in map.iter().enumerate() {
+                    let n: Vec3 = surfels.iter().filter(|s| s.0.distance_squared(*c) < 9.0).map(|s| s.1).sum();
+                    if n.length() > 1e-3 {
+                        markers.push(Marker {
+                            id: format!("S{scan}-M{k}"),
+                            center: m.transform_point3(*c),
+                            normal: (t.rotation * n).normalize(),
+                            scan: Some(*scan),
+                            source: MarkerSource::List,
+                            radius_mm: 0.0,
+                            score: 0.0,
+                        });
+                    }
+                }
+                points.extend(surfels.into_iter().map(|(p, n, _)| (m.transform_point3(p), (t.rotation * n).normalize_or_zero())).filter(|(p, n)| ok(*p, *n)).map(|(position, normal)| SolidPoint { position, normal, scan: *scan }));
+            }
+            let weights: Vec<f32> = passes.iter().map(|p| p.4).collect();
+            let priority = (weights.iter().any(|w| (w - weights[0]).abs() > 1e-6)).then(|| {
+                let mut order: Vec<(u8, f32)> = passes.iter().map(|p| (p.0, p.4)).collect();
+                order.sort_by(|a, b| b.1.total_cmp(&a.1));
+                order.into_iter().map(|o| o.0).collect()
+            });
+            Ok((points, markers, priority))
+        }
+    }
+}
+
 /// A pass read from a project (opened or added), shown by `layer`.
 fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
     ScanPass {
@@ -284,6 +355,23 @@ impl ScanCraftApp {
             p.meta.weight = weight.clamp(0.1, 10.0);
             self.next_generation += 1;
         }
+    }
+
+    /// Make Solid's input (see [`SolidInput`]): the included, placed passes, as Merge takes them.
+    pub(super) fn solid_input(&self) -> SolidInput {
+        let placed: Vec<&ScanPass> = self.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).collect();
+        if placed.is_empty() {
+            return SolidInput::Cloud(self.working_cloud());
+        }
+        let passes = placed
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let map = self.marker_maps.get(&p.id).map(|m| m.iter().map(|(c, _)| Vec3::from_array(*c)).collect()).unwrap_or_default();
+                ((i + 1).min(255) as u8, p.meta.transform, p.source(), p.mask.clone(), p.meta.weight, map)
+            })
+            .collect();
+        SolidInput::Passes { passes, whole_scene: self.settings.whole_scene }
     }
 
     pub(crate) fn pass_name(&self, id: u32) -> String {

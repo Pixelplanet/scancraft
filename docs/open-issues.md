@@ -277,7 +277,8 @@ current one is empty. Closing a tab with unsaved changes asks Save / Discard cha
 tab); quitting with unsaved tabs asks Quit without saving / Cancel. Previews, highlights and
 outlines no longer mark a project as changed (`preview_generation`). Add Project from another open tab:
 done 2026-11-25 (right-click the other tab → Add Passes to …; its passes are rebuilt from their
-keyframes, so the two projects never share a tracker). Not done: Save All on quit. Tests: `new_project_opens_a_tab_and_keeps_the_open_one`,
+keyframes, so the two projects never share a tracker). Save All on quit: done 2026-11-25 (the quit question saves every changed project into its
+folder, then quits; disabled, with the reason, while a changed project has never been saved). Tests: `new_project_opens_a_tab_and_keeps_the_open_one`,
 `closing_a_tab_with_unsaved_changes_asks_first`, `save_and_close_closes_only_after_saving`,
 `tabs_cannot_switch_while_a_job_runs`, `previews_do_not_mark_the_project_changed`.
 

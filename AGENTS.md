@@ -329,3 +329,7 @@ laser model are not built.
   additions optional); imported passes named after the file stem or, for generic export names,
   their folder; Add Passes from another open tab (tab context menu); history entries in Title
   Case. merge-and-ai.md "Known gaps" updated.
+- 2026-11-25 (second PC, branch `agent/solid-inputs`) — Make Solid takes the placed passes as
+  separate scans with merge-weight priority, optional sharp top pass and the tracker's marker maps
+  as listed markers (was: one anonymous cloud). Save All in the quit question. Script steps
+  `open:DIR` and `apply`.

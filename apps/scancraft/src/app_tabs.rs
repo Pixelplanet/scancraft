@@ -304,6 +304,43 @@ impl ScanCraftApp {
         });
     }
 
+    /// Projects with unsaved changes that have never been saved (no folder): Save All cannot
+    /// save those without asking where.
+    pub fn dirty_without_folder(&self) -> Vec<String> {
+        self.tab_labels().into_iter().filter(|t| t.dirty && t.path.is_none()).map(|t| t.name).collect()
+    }
+
+    /// The quit dialog's Save All: saves every project with unsaved changes into its folder, one
+    /// after another (each in its own tab), then closes the window. Stops at the first failure.
+    pub fn save_all_then_quit(&mut self) {
+        if !self.dirty_without_folder().is_empty() || self.tabs_blocked().is_some() {
+            return;
+        }
+        self.close_prompt = None;
+        let queue: std::collections::VecDeque<usize> = self.tab_labels().iter().enumerate().filter(|(_, t)| t.dirty).map(|(i, _)| i).collect();
+        self.save_all_queue = Some(queue);
+        self.save_next_for_quit();
+    }
+
+    /// Saves the next project of the Save All queue, or quits when none is left.
+    pub(super) fn save_next_for_quit(&mut self) {
+        let Some(queue) = self.save_all_queue.as_mut() else { return };
+        let Some(i) = queue.pop_front() else {
+            self.save_all_queue = None;
+            self.quit_confirmed = true;
+            self.close_window = true;
+            return;
+        };
+        self.switch_tab(i);
+        match self.project.path.clone() {
+            Some(path) => self.save_project(path),
+            None => {
+                self.save_all_queue = None;
+                self.say(Tone::Error, format!("{} has no folder yet: save it from its tab first", self.project.name));
+            }
+        }
+    }
+
     /// Whether any open project has unsaved changes.
     pub fn any_dirty(&self) -> bool {
         self.tab_labels().iter().any(|t| t.dirty)

@@ -110,6 +110,10 @@ impl eframe::App for ScanCraft {
         }
         crate::ui_ai::ai_pack_modal(&mut self.app, &ctx);
         ui_shell::close_prompt(&mut self.app, &ctx);
+        // Save All on quit has saved everything.
+        if std::mem::take(&mut self.app.close_window) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
         ui_shell::app_bar(&mut self.app, ui);
         ui_shell::status_bar(&mut self.app, ui);
         ui_viewport::central(&mut self.app, ui);
