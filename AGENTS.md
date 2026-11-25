@@ -288,3 +288,10 @@ laser model are not built.
   project changed. Script steps `newtab`, `tab:N`, `closetab:N` (`--auto`). Parallel agents on
   `scancraft-mesh` (open-issues 2.2, then Make Solid) and a new `scancraft-segment` crate (SAM 2.1
   on ONNX Runtime).
+- 2026-11-25 (second PC, UI cleanup) — Open-issues 3.2 (`crates/scancraft-ui/src/kit`,
+  `apps/scancraft`): one button rule via `Actions`/`action_row`/`dialog_footer`, `Button::Danger`,
+  `confirm_modal`, `menu_item`, `close_button`, `note_with_tip`; wording glossary
+  `docs/architecture/ui-wording.md`; notes shortened to 1–2 lines with tooltips, Fill Holes form,
+  disabled buttons everywhere show their reason (`rb`, `edit_blocked`), tab strip ellipsises
+  96–220 pt with a chevron overflow menu. New `--auto` steps `tool`, `closetool`, `size`,
+  `rename`, `askquit`, `selectnode`, `rclick`, `hover` for screenshot checks.

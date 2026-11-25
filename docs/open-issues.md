@@ -298,6 +298,21 @@ What this means:
 
 ### 3.2 Confirm / Apply buttons are not in a consistent place
 
+**Done 2026-11-25** (`crates/scancraft-ui/src/kit`). One button-placement rule, shared widgets:
+`Button::Danger` for destructive commands, `Actions` + `action_row`/`dialog_footer` put the
+primary at the right edge, Cancel to its left, destructive apart at the left (`form.rs`);
+`confirm_modal` (the close/quit dialogs), `menu_item` (context menus, every disabled entry says
+why), `close_button` (the "close" icon instead of the missing "✕" glyph), `note_with_tip`.
+Wording is a written page: `docs/architecture/ui-wording.md` (glossary, Title Case commands, the
+three fixed disabled phrases). Rough edges fixed: long notes shortened to one or two lines with
+the detail on a tooltip, the Fill Holes form, every disabled ribbon and app-bar button now shows
+its reason (`rb` helper, `app.edit_blocked`), and the tab strip ellipsises names at 96–220 pt
+with a chevron overflow menu when they do not fit. New `--auto` script steps (`dev.rs`): `tool:`,
+`closetool`, `size:`, `rename:`, `askquit`, `selectnode:`, `rclick:`, `hover:` for UI screenshots.
+Not done: the camera-controls Reset link stays inline; Add Project from another open tab.
+Tests: `action_row_*`, `dialog_footer_insets_the_buttons_by_space_12`,
+`a_narrow_row_shrinks_the_destructive_button_without_overlap` (`scancraft-ui`).
+
 When a tool or dialog opens, its confirm button is sometimes on the left of the window and
 sometimes on the right.
 
