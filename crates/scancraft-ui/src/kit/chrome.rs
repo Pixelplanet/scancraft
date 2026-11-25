@@ -72,6 +72,13 @@ pub fn dropdown_indicator(painter: &Painter, rect: Rect, ink: Color32) {
     icons::paint_ink(painter, rect, "chevron", ink);
 }
 
+/// A small inline close (×) button painting the "close" icon — the "✕" glyph is not in the font.
+pub fn close_button(ui: &mut Ui, tip: &str) -> Response {
+    let t = Tokens::get();
+    let (rect, _) = ui.allocate_exact_size(vec2(t.form_close_size, t.form_close_size), Sense::hover());
+    icon_button_at(ui, rect, "close", tip, true)
+}
+
 /// A square icon button: hover fill, ink icon, tooltip (`icon_button_presentation`).
 pub fn icon_button_at(ui: &mut Ui, rect: Rect, icon: &str, label: &str, enabled: bool) -> Response {
     let t = Tokens::get();
@@ -140,12 +147,22 @@ pub fn dialog_header(ui: &mut Ui, icon: &str, title: &str, closeable: bool) -> b
 
 /// One line of text, vertically centred and cut with an ellipsis to its rect (`text::paint_text`).
 pub fn paint_text(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32) {
+    paint_text_at(painter, rect, text, font, color, false);
+}
+
+/// [`paint_text`] centred horizontally in `rect` (button labels).
+pub fn paint_text_centered(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32) {
+    paint_text_at(painter, rect, text, font, color, true);
+}
+
+fn paint_text_at(painter: &Painter, rect: Rect, text: &str, font: FontId, color: Color32, centred: bool) {
     let mut job = egui::text::LayoutJob::simple(text.to_string(), font, color, rect.width().max(0.0));
     job.wrap.max_rows = 1;
     job.wrap.break_anywhere = true;
     job.wrap.overflow_character = Some('\u{2026}');
     let galley = painter.layout_job(job);
-    painter.with_clip_rect(painter.clip_rect().intersect(rect.expand(1.0))).galley(pos2(rect.left(), rect.center().y - galley.size().y / 2.0), galley, color);
+    let x = if centred { rect.center().x - galley.size().x / 2.0 } else { rect.left() };
+    painter.with_clip_rect(painter.clip_rect().intersect(rect.expand(1.0))).galley(pos2(x, rect.center().y - galley.size().y / 2.0), galley, color);
 }
 
 /// Centred text pixel-snapped at `at` (`toolbar::ribbon_galley`).
@@ -259,4 +276,31 @@ pub fn status_message(painter: &Painter, bar: Rect, max_right: f32, text: &str, 
 /// Text anchored at `pos` with the given alignment in the theme's body font.
 pub fn label_at(painter: &Painter, pos: Pos2, align: Align2, text: &str, size: f32, color: Color32) -> Rect {
     painter.text(pos, align, text, FontId::proportional(size), color)
+}
+
+/// A modal asking for a decision: a `dialog_header` with the icon and a close ×, the message in
+/// body text, then the action buttons in a `dialog_footer`. Header ×, a click outside the modal
+/// and Esc all answer `Choice::Cancel`.
+pub fn confirm_modal(ctx: &egui::Context, id: egui::Id, icon: &str, title: &str, message: &str, actions: &super::form::Actions) -> Option<super::form::Choice> {
+    use super::form::Choice;
+    let t = Tokens::get();
+    let mut choice = None;
+    let modal = egui::Modal::new(id).frame(Frame::NONE.fill(t.dialog_footer).corner_radius(t.radius_xl)).show(ctx, |ui| {
+        ui.set_width(420.0);
+        Frame::NONE.fill(t.dialog_bg).corner_radius(egui::CornerRadius { nw: t.radius_xl, ne: t.radius_xl, sw: 0, se: 0 }).show(ui, |ui| {
+            if dialog_header(ui, icon, title, true) {
+                choice = Some(Choice::Cancel);
+            }
+            Frame::NONE.inner_margin(egui::Margin::symmetric(t.space_12 as i8, t.space_10 as i8)).show(ui, |ui| {
+                ui.add(egui::Label::new(egui::RichText::new(message).size(t.font_body).color(t.form_ink)).wrap());
+            });
+        });
+        if let Some(c) = super::form::dialog_footer(ui, actions).choice {
+            choice = Some(c);
+        }
+    });
+    if modal.should_close() && choice.is_none() {
+        choice = Some(Choice::Cancel);
+    }
+    choice
 }

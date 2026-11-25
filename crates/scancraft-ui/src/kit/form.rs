@@ -5,7 +5,7 @@
 //! (`paint_box`, `checkbox_indeterminate`), `fields.rs` (`slider`, `dropdown`) and
 //! `actions.rs` (`button_widget`).
 
-use super::chrome::{dropdown_indicator, paint_text};
+use super::chrome::{dropdown_indicator, paint_text, paint_text_centered};
 use crate::fonts;
 use crate::theme::Tokens;
 use egui::{Rect, Response, RichText, Sense, Ui, pos2, vec2};
@@ -251,39 +251,65 @@ pub enum Button {
     Normal,
     Primary,
     Ghost,
+    /// Destructive commands: red ink and border, filled red on hover.
+    Danger,
+}
+
+fn label_width(ui: &Ui, label: &str) -> f32 {
+    let t = Tokens::get();
+    ui.painter().layout_no_wrap(label.to_string(), egui::FontId::proportional(t.font_label), t.form_ink).size().x
+}
+
+/// Paints a button's face into `rect`: fill, border and the centred label (ellipsised).
+fn paint_button(ui: &Ui, rect: Rect, label: &str, kind: Button, enabled: bool, hovered: bool) {
+    let t = Tokens::get();
+    let hovered = enabled && hovered;
+    let (fill, border, ink) = if !enabled {
+        (t.control_fill, egui::Stroke::new(1.0, t.control_border), t.form_dim)
+    } else {
+        match kind {
+            Button::Primary => (t.form_primary_fill, egui::Stroke::NONE, t.on_accent),
+            Button::Ghost => (egui::Color32::TRANSPARENT, egui::Stroke::NONE, t.form_ink),
+            Button::Normal => (t.control_fill, egui::Stroke::new(1.0, if hovered { t.form_primary.gamma_multiply(0.7) } else { t.control_border }), t.form_ink),
+            Button::Danger => (
+                if hovered { t.form_error_fill } else { t.control_fill },
+                egui::Stroke::new(1.0, t.form_error.gamma_multiply(if hovered { 0.9 } else { 0.6 })),
+                t.form_error,
+            ),
+        }
+    };
+    if fill != egui::Color32::TRANSPARENT || border != egui::Stroke::NONE {
+        ui.painter().rect(rect, t.control_radius, fill, border, egui::StrokeKind::Inside);
+    }
+    paint_text_centered(ui.painter(), rect.shrink2(vec2(t.space_8, 0.0)), label, egui::FontId::proportional(t.font_label), ink);
+}
+
+/// Interacts with a fixed `rect` as a button and paints it (`button_widget`).
+fn button_at(ui: &mut Ui, rect: Rect, label: &str, kind: Button, enabled: bool) -> Response {
+    let enabled = enabled && ui.is_enabled();
+    let id = ui.make_persistent_id(("kit_button", rect.min.x.to_bits(), rect.min.y.to_bits(), label));
+    let response = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
+    paint_button(ui, rect, label, kind, enabled, response.hovered());
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
+    if enabled && response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
 }
 
 /// The kit button (`button_widget`).
 pub fn button(ui: &mut Ui, label: &str, kind: Button, enabled: bool) -> Response {
     let t = Tokens::get();
-    let text = RichText::new(label).size(t.font_label);
-    let widget = match kind {
-        Button::Primary => egui::Button::new(text.color(t.on_accent)).fill(t.form_primary_fill).stroke(egui::Stroke::NONE),
-        Button::Ghost => egui::Button::new(text).frame(false),
-        Button::Normal => egui::Button::new(text.color(t.form_ink)).fill(t.control_fill).stroke(t.control_border_stroke(t.control_border)),
-    }
-    .corner_radius(t.control_radius)
-    .min_size(vec2(t.space_24 * 2.5, t.form_button_height));
-    let response = ui.add_enabled(enabled, widget);
-    if enabled {
-        response.on_hover_cursor(egui::CursorIcon::PointingHand)
-    } else {
-        response
-    }
+    let width = (label_width(ui, label) + 2.0 * ui.spacing().button_padding.x).max(t.space_24 * 2.5);
+    let (rect, _) = ui.allocate_exact_size(vec2(width, t.form_button_height), Sense::hover());
+    button_at(ui, rect, label, kind, enabled)
 }
 
-/// A full-width button (used for actions inside a section).
+/// A full-width button (used for actions inside a section); its label is centred.
 pub fn wide_button(ui: &mut Ui, label: &str, kind: Button, enabled: bool) -> Response {
     let t = Tokens::get();
-    let text = RichText::new(label).size(t.font_label);
-    let widget = match kind {
-        Button::Primary => egui::Button::new(text.color(t.on_accent)).fill(t.form_primary_fill).stroke(egui::Stroke::NONE),
-        Button::Ghost => egui::Button::new(text).frame(false),
-        Button::Normal => egui::Button::new(text.color(t.form_ink)).fill(t.control_fill).stroke(t.control_border_stroke(t.control_border)),
-    }
-    .corner_radius(t.control_radius)
-    .min_size(vec2(ui.available_width(), t.form_button_height));
-    ui.add_enabled(enabled, widget)
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.form_button_height), Sense::hover());
+    button_at(ui, rect, label, kind, enabled)
 }
 
 /// A read-only value in a row, drawn in a field-shaped well (SolidCraft's selection field look),
@@ -360,9 +386,39 @@ pub fn dropdown_with_reasons(ui: &mut Ui, id: impl egui::AsIdSalt, selected: &mu
 }
 
 /// A dim, wrapping note under the controls (`Text::Note`).
-pub fn note(ui: &mut Ui, text: &str) {
+pub fn note(ui: &mut Ui, text: &str) -> Response {
     let t = Tokens::get();
-    ui.add(egui::Label::new(RichText::new(text).size(t.font_small).color(t.text_dim)).wrap());
+    ui.add(egui::Label::new(RichText::new(text).size(t.font_small).color(t.text_dim)).wrap())
+}
+
+/// [`note`] that carries a tooltip; a dim marker after the text shows there is one (the "ⓘ"
+/// glyph when the font has it, else the help icon when the icon set does, else no marker). The
+/// marker is painted at the end of the last text row, so it never lands on a line of its own.
+pub fn note_with_tip(ui: &mut Ui, text: &str, tip: &str) -> Response {
+    let t = Tokens::get();
+    let font = egui::FontId::proportional(t.font_small);
+    let info_glyph = ui.ctx().fonts_mut(|f| f.has_glyph(&font, '\u{24D8}'));
+    let help_icon = !info_glyph && crate::icons::exists("help");
+    if !info_glyph && !help_icon {
+        return note(ui, text).on_hover_text(tip);
+    }
+    let marker_w = t.space_4 + if help_icon { t.font_small + 2.0 } else { t.font_small };
+    let wrap = (ui.available_width() - marker_w).max(40.0);
+    let galley = ui.painter().layout(text.to_string(), font.clone(), t.text_dim, wrap);
+    let height = galley.size().y.max(t.font_small + 2.0);
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
+    ui.painter().galley(rect.min, galley.clone(), t.text_dim);
+    if let Some(row) = galley.rows.last() {
+        let x = rect.left() + row.rect_without_leading_space().right() + t.space_4;
+        let y = rect.top() + row.pos.y + row.size.y / 2.0;
+        if info_glyph {
+            ui.painter().text(pos2(x, y), egui::Align2::LEFT_CENTER, "\u{24D8}", font, t.text_dim);
+        } else {
+            let size = t.font_small + 2.0;
+            crate::icons::paint_ink(ui.painter(), Rect::from_center_size(pos2(x + size / 2.0, y), vec2(size, size)), "help", t.text_dim);
+        }
+    }
+    response.on_hover_text(tip)
 }
 
 /// A coloured one-line status message with a dot (`status_line`).
@@ -374,24 +430,219 @@ pub fn status_line(ui: &mut Ui, text: &str, color: egui::Color32) {
     ui.painter().galley(pos2(rect.left() + t.space_14, rect.top()), galley, color);
 }
 
-/// The card's footer: the dialog-footer fill, Cancel and the primary action at the right.
-/// Returns (cancel, ok).
-pub fn dialog_footer(ui: &mut Ui, ok: &str, ok_enabled: bool, cancel: Option<&str>) -> (bool, bool) {
+/// An entry in a context menu: closes the menu and returns true when clicked; a disabled entry
+/// shows `disabled_reason` on hover; `Button::Danger` draws the label in the error ink.
+pub fn menu_item(ui: &mut Ui, label: &str, kind: Button, enabled: bool, disabled_reason: &str) -> bool {
+    let t = Tokens::get();
+    let text = match kind {
+        Button::Danger => RichText::new(label).color(t.form_error),
+        _ => RichText::new(label),
+    };
+    let response = ui.add_enabled(enabled, egui::Button::new(text));
+    let response = if disabled_reason.is_empty() { response } else { response.on_disabled_hover_text(disabled_reason) };
+    if response.clicked() {
+        ui.close();
+        true
+    } else {
+        false
+    }
+}
+
+/// The buttons a card or dialog offers for a decision.
+#[derive(Clone, Copy)]
+pub struct Actions<'a> {
+    /// Label and enabled flag of the primary action at the bottom right.
+    pub primary: Option<(&'a str, bool)>,
+    /// Hover text for the primary, shown also when it is disabled (the blocked reason).
+    pub primary_tip: Option<&'a str>,
+    /// The button directly left of the primary: Cancel, or a secondary command.
+    pub cancel: Option<&'a str>,
+    /// The cancel button's enabled flag (default true).
+    pub cancel_enabled: bool,
+    /// A destructive action apart at the left (`Button::Danger`).
+    pub destructive: Option<(&'a str, bool)>,
+}
+
+impl<'a> Default for Actions<'a> {
+    fn default() -> Self {
+        Self { primary: None, primary_tip: None, cancel: None, cancel_enabled: true, destructive: None }
+    }
+}
+
+/// Which action button was clicked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Choice {
+    Primary,
+    Cancel,
+    Destructive,
+}
+
+/// The buttons [`action_row`] / [`dialog_footer`] drew, and the click if any.
+pub struct ActionsResponse {
+    pub choice: Option<Choice>,
+    pub primary: Option<Response>,
+    pub cancel: Option<Response>,
+    pub destructive: Option<Response>,
+}
+
+/// The action buttons inside `rect`: the destructive one at the left edge, the primary at the
+/// right edge, cancel directly left of it with a `space_6` gap. When the row is too narrow the
+/// primary and cancel keep their place and the destructive button shrinks (never overlaps).
+fn actions_in(ui: &mut Ui, rect: Rect, actions: &Actions) -> ActionsResponse {
+    let t = Tokens::get();
+    let mut out = ActionsResponse { choice: None, primary: None, cancel: None, destructive: None };
+    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+    let y = rect.center().y - t.form_button_height / 2.0;
+    let width = |ui: &Ui, label: &str| (label_width(ui, label) + 2.0 * t.space_16).max(t.space_24 * 2.5);
+    let mut right = rect.right();
+    if let Some((label, enabled)) = actions.primary {
+        let w = width(&child, label).min(rect.width());
+        let r = Rect::from_min_size(pos2(right - w, y), vec2(w, t.form_button_height));
+        right = r.left() - t.space_6;
+        let resp = button_at(&mut child, r, label, Button::Primary, enabled);
+        let resp = match actions.primary_tip {
+            Some(tip) => resp.on_hover_text(tip),
+            None => resp,
+        };
+        if resp.clicked() {
+            out.choice = Some(Choice::Primary);
+        }
+        out.primary = Some(resp);
+    }
+    if let Some(label) = actions.cancel {
+        let w = width(&child, label).min(rect.width());
+        let r = Rect::from_min_size(pos2((right - w).max(rect.left()), y), vec2(w, t.form_button_height));
+        right = r.left() - t.space_6;
+        let resp = button_at(&mut child, r, label, Button::Normal, actions.cancel_enabled);
+        if resp.clicked() {
+            out.choice = Some(Choice::Cancel);
+        }
+        out.cancel = Some(resp);
+    }
+    if let Some((label, enabled)) = actions.destructive {
+        let w = width(&child, label).min(right.max(rect.left()) - rect.left());
+        if w > 4.0 {
+            let r = Rect::from_min_size(pos2(rect.left(), y), vec2(w, t.form_button_height));
+            let resp = button_at(&mut child, r, label, Button::Danger, enabled);
+            if resp.clicked() {
+                out.choice = Some(Choice::Destructive);
+            }
+            out.destructive = Some(resp);
+        }
+    }
+    out
+}
+
+/// One row of action buttons in a panel body, full available width, `form_button_height` high.
+pub fn action_row(ui: &mut Ui, actions: &Actions) -> ActionsResponse {
+    let t = Tokens::get();
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.form_button_height), Sense::hover());
+    actions_in(ui, rect, actions)
+}
+
+/// A card or dialog's footer band: `form_footer_height` high, the row vertically centred, inset
+/// `space_12` left and right.
+pub fn dialog_footer(ui: &mut Ui, actions: &Actions) -> ActionsResponse {
     let t = Tokens::get();
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), t.form_footer_height), Sense::hover());
-    let mut cancelled = false;
-    let mut accepted = false;
-    let button_h = t.form_button_height;
-    let y = rect.center().y - button_h / 2.0;
-    let ok_width = ui.painter().layout_no_wrap(ok.to_string(), egui::FontId::proportional(t.font_label), t.on_accent).size().x + 2.0 * t.space_16;
-    let ok_rect = Rect::from_min_size(pos2(rect.right() - t.space_12 - ok_width, y), vec2(ok_width, button_h));
-    let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-    let r = child.put(ok_rect, |ui: &mut Ui| button(ui, ok, Button::Primary, ok_enabled));
-    accepted |= r.clicked();
-    if let Some(cancel) = cancel {
-        let w = child.painter().layout_no_wrap(cancel.to_string(), egui::FontId::proportional(t.font_label), t.form_ink).size().x + 2.0 * t.space_16;
-        let c_rect = Rect::from_min_size(pos2(ok_rect.left() - t.space_6 - w, y), vec2(w, button_h));
-        cancelled |= child.put(c_rect, |ui: &mut Ui| button(ui, cancel, Button::Normal, true)).clicked();
+    actions_in(ui, rect.shrink2(vec2(t.space_12, 0.0)), actions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Runs `add` in a fresh headless context and returns the layout row plus what it produced.
+    fn run<R>(add: impl FnMut(&mut Ui) -> R) -> (Rect, R) {
+        let ctx = egui::Context::default();
+        let mut add = add;
+        let mut out = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let row = Rect::from_min_size(ui.cursor().min, vec2(ui.available_width(), Tokens::get().form_footer_height));
+            out = Some((row, add(ui)));
+        });
+        out.unwrap()
     }
-    (cancelled, accepted)
+
+    #[test]
+    fn action_row_places_primary_right_cancel_left_of_it_destructive_at_the_edge() {
+        let t = Tokens::get();
+        let (row, r) = run(|ui| {
+            action_row(
+                ui,
+                &Actions {
+                    primary: Some(("Apply", true)),
+                    cancel: Some("Cancel"),
+                    destructive: Some(("Delete", true)),
+                    ..Default::default()
+                },
+            )
+        });
+        let primary = r.primary.unwrap();
+        let cancel = r.cancel.unwrap();
+        let destructive = r.destructive.unwrap();
+        assert_eq!(primary.rect.right(), row.right());
+        assert_eq!(cancel.rect.right(), primary.rect.left() - t.space_6);
+        assert_eq!(destructive.rect.left(), row.left());
+        assert_eq!(primary.rect.height(), cancel.rect.height());
+        assert_eq!(primary.rect.height(), destructive.rect.height());
+    }
+
+    #[test]
+    fn action_row_without_primary_puts_cancel_at_the_right_edge() {
+        let (row, r) = run(|ui| action_row(ui, &Actions { cancel: Some("Cancel"), ..Default::default() }));
+        assert_eq!(r.cancel.unwrap().rect.right(), row.right());
+    }
+
+    #[test]
+    fn action_row_without_primary_allows_a_destructive_only_dialog() {
+        let (row, r) = run(|ui| {
+            action_row(ui, &Actions { cancel: Some("Cancel"), destructive: Some(("Quit Without Saving", true)), ..Default::default() })
+        });
+        assert_eq!(r.cancel.unwrap().rect.right(), row.right());
+        assert_eq!(r.destructive.unwrap().rect.left(), row.left());
+    }
+
+    #[test]
+    fn dialog_footer_insets_the_buttons_by_space_12() {
+        let t = Tokens::get();
+        let (row, r) = run(|ui| {
+            dialog_footer(
+                ui,
+                &Actions {
+                    primary: Some(("Save", true)),
+                    cancel: Some("Cancel"),
+                    destructive: Some(("Discard Changes", true)),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(r.primary.unwrap().rect.right(), row.right() - t.space_12);
+        assert_eq!(r.destructive.unwrap().rect.left(), row.left() + t.space_12);
+        assert_eq!(row.height(), t.form_footer_height);
+    }
+
+    #[test]
+    fn a_narrow_row_shrinks_the_destructive_button_without_overlap() {
+        let t = Tokens::get();
+        let (_, r) = run(|ui| {
+            let narrow = ui.available_width() * 0.35;
+            let (rect, _) = ui.allocate_exact_size(vec2(narrow, t.form_button_height), Sense::hover());
+            actions_in(
+                ui,
+                rect,
+                &Actions {
+                    primary: Some(("Save", true)),
+                    cancel: Some("Cancel"),
+                    destructive: Some(("Discard Changes", true)),
+                    ..Default::default()
+                },
+            )
+        });
+        let primary = r.primary.unwrap();
+        let cancel = r.cancel.unwrap();
+        let destructive = r.destructive.unwrap();
+        assert_eq!(cancel.rect.right(), primary.rect.left() - t.space_6);
+        assert!(destructive.rect.right() <= cancel.rect.left() - t.space_6 + 0.01, "destructive overlapped cancel");
+    }
 }
