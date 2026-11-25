@@ -267,3 +267,11 @@ laser model are not built.
   boundary loops (old mesher 110), roughness 2.14° → 1.64° (old 2.65°). Three new tests.
   `mesh_project` prints loop sizes and takes `--zoom U,V,S`. Work in a shared checkout with
   another agent: use `git worktree` for your own changes.
+- 2026-11-25 (second PC, mesher, later) — Mesh stage has a **Make Solid** tool (`Tool::MakeSolid`,
+  ribbon group Create): `scancraft-mesh::solid::build_solid` on the working points as an undoable
+  background job whose result becomes the mesh; settings cell size (0.4 mm) and marker removal.
+  All points go in as one scan (no scan priority / sharp scans, no listed markers yet). On the
+  two-pass shell project `solid_ply` takes 18 s and gives a watertight solid (wall 3.16 mm, 241
+  holes filled, 7 marker sites). App test
+  `make_solid_replaces_the_mesh_with_a_closed_solid_and_undo_takes_it_back`; not clicked through
+  in the app.

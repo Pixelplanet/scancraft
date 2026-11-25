@@ -62,6 +62,8 @@ pub enum Tool {
     Decimate,
     /// Close holes in the mesh up to a size.
     FillHoles,
+    /// A closed, watertight solid of a thin-walled part, built from the points.
+    MakeSolid,
     Export(ExportFormat),
     /// Split view for picking corresponding points on a pass and the project model.
     PointPairs(u32),
@@ -88,6 +90,7 @@ impl Tool {
             Tool::Smooth => "Smooth",
             Tool::Decimate => "Decimate",
             Tool::FillHoles => "Fill Holes",
+            Tool::MakeSolid => "Make Solid",
             Tool::Export(_) => "Export",
         }
     }
@@ -104,6 +107,7 @@ impl Tool {
             Tool::Smooth => "surface",
             Tool::Decimate => "reach",
             Tool::FillHoles => "patch",
+            Tool::MakeSolid => "body",
             Tool::Export(_) => "export",
             Tool::PointPairs(_) => "point",
             Tool::SaveProject => "save",
@@ -115,7 +119,7 @@ impl Tool {
             Tool::ConnectIp | Tool::SaveProject => Stage::Connect,
             Tool::PointPairs(_) => Stage::Align,
             Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject => Stage::Clean,
-            Tool::Reconstruct | Tool::Smooth | Tool::Decimate | Tool::FillHoles => Stage::Mesh,
+            Tool::Reconstruct | Tool::Smooth | Tool::Decimate | Tool::FillHoles | Tool::MakeSolid => Stage::Mesh,
             Tool::Export(_) => Stage::Export,
         }
     }

@@ -393,7 +393,10 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         Stage::Mesh => vec![
             RibbonGroup {
                 label: "Create",
-                buttons: vec![RibbonButton { id: "reconstruct", icon: "mesh_body", label: "Reconstruct", enabled: app.tool_blocked(Tool::Reconstruct).is_none(), pressed: pressed(Tool::Reconstruct), tip: reason(app.tool_blocked(Tool::Reconstruct), "Build a smooth surface from the points") }],
+                buttons: vec![
+                    RibbonButton { id: "reconstruct", icon: "mesh_body", label: "Reconstruct", enabled: app.tool_blocked(Tool::Reconstruct).is_none(), pressed: pressed(Tool::Reconstruct), tip: reason(app.tool_blocked(Tool::Reconstruct), "Build a smooth surface from the points") },
+                    RibbonButton { id: "make_solid", icon: "body", label: "Make Solid", enabled: app.tool_blocked(Tool::MakeSolid).is_none(), pressed: pressed(Tool::MakeSolid), tip: reason(app.tool_blocked(Tool::MakeSolid), "Build a closed, watertight solid of a thin-walled part") },
+                ],
             },
             RibbonGroup {
                 label: "Refine",
@@ -491,6 +494,7 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
         "smooth" => app.open_tool(Tool::Smooth),
         "decimate" => app.open_tool(Tool::Decimate),
         "fill_holes" => app.open_tool(Tool::FillHoles),
+        "make_solid" => app.open_tool(Tool::MakeSolid),
         "delete_mesh" => app.discard_mesh(),
         "export_ply_cloud" => app.open_tool(Tool::Export(ExportFormat::PlyCloud)),
         "export_ply_mesh" => app.open_tool(Tool::Export(ExportFormat::PlyMesh)),

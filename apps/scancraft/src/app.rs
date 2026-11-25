@@ -106,6 +106,9 @@ pub struct Settings {
     /// border of an open scan) stays open.
     pub fill_max_mm: f32,
     pub fill_keep_largest: bool,
+    /// Make Solid: grid spacing of the solve and whether marker stickers are found and removed.
+    pub solid_cell_mm: f32,
+    pub solid_remove_markers: bool,
     pub decimate_ratio: f32,
     pub export_path: String,
     pub export_format: ExportFormat,
@@ -143,6 +146,8 @@ impl Default for Settings {
             smooth_keep_edges: 0.7,
             fill_max_mm: 60.0,
             fill_keep_largest: true,
+            solid_cell_mm: 0.4,
+            solid_remove_markers: true,
             decimate_ratio: 0.5,
             export_path: "scan.ply".to_string(),
             export_format: ExportFormat::PlyCloud,
@@ -1480,7 +1485,7 @@ impl ScanCraftApp {
                     None
                 }
             }
-            Tool::Reconstruct => (self.working_len() == 0).then_some("No points to work on: scan first"),
+            Tool::Reconstruct | Tool::MakeSolid => (self.working_len() == 0).then_some("No points to work on: scan first"),
             Tool::IsolateObject => {
                 if let Some(why) = self.isolate_blocked() {
                     Some(why)
@@ -1992,6 +1997,40 @@ impl ScanCraftApp {
                     JobResult::Mesh { mesh, analysis, message }
                 });
             }
+            Tool::MakeSolid => {
+                let input = self.working_cloud();
+                let config = scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() };
+                self.spawn_undoable("Making the solid", "Make solid", move || {
+                    let points: Vec<scancraft_mesh::SolidPoint> = input
+                        .points
+                        .iter()
+                        .filter_map(|p| {
+                            let (position, normal) = (glam::Vec3::from_array(p.position), glam::Vec3::from_array(p.normal));
+                            (position.is_finite() && normal.is_finite() && normal.length() > 1e-3).then(|| scancraft_mesh::SolidPoint { position, normal: normal.normalize(), scan: 0 })
+                        })
+                        .collect();
+                    if points.len() < 100 {
+                        return JobResult::Failed("Make Solid needs points with normals: merge the scans first".into());
+                    }
+                    let solid = scancraft_mesh::build_solid(&points, &[], &config);
+                    if solid.mesh.triangles.is_empty() {
+                        return JobResult::Failed("No solid could be built from these points; try a larger cell size".into());
+                    }
+                    let analysis = Mesher::analyze(&solid.mesh);
+                    let r = &solid.report;
+                    let message = format!(
+                        "Solid of {} triangles, wall {:.1} mm · {} hole{} filled, {} marker{} removed · {}",
+                        thousands(analysis.triangle_count),
+                        r.wall_median_mm,
+                        r.holes_filled,
+                        if r.holes_filled == 1 { "" } else { "s" },
+                        r.marker_sites.len(),
+                        if r.marker_sites.len() == 1 { "" } else { "s" },
+                        if analysis.is_watertight { "watertight" } else { "not watertight: check the open edges" }
+                    );
+                    JobResult::Mesh { mesh: solid.mesh, analysis, message }
+                });
+            }
             Tool::Decimate => {
                 let Some(mesh) = self.mesh.as_ref().map(|m| m.mesh.clone()) else { return };
                 let ratio = s.decimate_ratio;
@@ -2289,6 +2328,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(app.busy.is_none(), "the job did not finish");
+    }
+
+    #[test]
+    fn make_solid_replaces_the_mesh_with_a_closed_solid_and_undo_takes_it_back() {
+        // Both faces of a spherical cap with a 3 mm wall, normals out of the material.
+        let mut points = Vec::new();
+        for (r, sign) in [(30.0f32, 1.0f32), (27.0, -1.0)] {
+            let n = (4.0 * std::f32::consts::PI * r * r / 0.25) as usize;
+            for i in 0..n {
+                let z = 1.0 - 2.0 * (i as f32 + 0.5) / n as f32;
+                if z < 0.5 {
+                    break;
+                }
+                let phi = i as f32 * 2.399_963;
+                let d = glam::Vec3::new((1.0 - z * z).sqrt() * phi.cos(), (1.0 - z * z).sqrt() * phi.sin(), z);
+                points.push(Point3D { position: (d * r).to_array(), normal: (d * sign).to_array(), ..Point3D::new([0.0; 3]) });
+            }
+        }
+        let mut app = app();
+        add_pass(&mut app, 1, AlignState::Reference);
+        let g = app.generation();
+        app.passes[0].layer = CloudLayer::new(PointCloud::from_points(points), g);
+        app.settings.solid_cell_mm = 0.5;
+        assert!(app.tool_blocked(Tool::MakeSolid).is_none());
+        app.run_tool(Tool::MakeSolid);
+        // (Longer than `finish_job` waits: the solve shares the thread pool with the other tests.)
+        let t0 = Instant::now();
+        while app.busy.is_some() && t0.elapsed() < Duration::from_secs(180) {
+            app.poll_jobs();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let mesh = app.mesh.as_ref().expect("Make Solid gives a mesh");
+        assert!(mesh.analysis.is_watertight, "{:?} · {:?}", mesh.analysis, app.current_toast());
+        assert!(mesh.analysis.signed_volume_mm3 > 5_000.0, "{:?}", mesh.analysis);
+        app.undo();
+        assert!(app.mesh.is_none());
     }
 
     #[test]

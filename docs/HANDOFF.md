@@ -35,8 +35,9 @@ solid-model commit:
   tool (`holes.rs`, Liepa: minimum-weight triangulation, refinement, fairing by sparse Cholesky).
   Measured on the user's two-pass shell scan with `examples/mesh_project.rs` (rebuilds a saved
   project's merge, meshes, prints roughness / holes, renders PNGs); numbers in merge-and-ai.md §7.
-- **Next:** wire `scancraft-mesh::solid` (`build_solid`) into the Mesh stage as a separate
-  "Make Solid" step for watertight parts, next to Reconstruct / Smooth / Fill Holes; test the new
+- **Done 2026-11-25:** `scancraft-mesh::solid` (`build_solid`) is in the Mesh stage as the
+  "Make Solid" tool, next to Reconstruct (it takes the points, not the mesh). **Next:** pass the
+  scan each point came from (scan priority, sharp scans) and the project's markers to it; test the new
   Mesh tools by hand in the app (they were checked on renders and tests, not clicked through).
 
 **Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,

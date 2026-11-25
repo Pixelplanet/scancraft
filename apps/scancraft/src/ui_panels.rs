@@ -561,6 +561,7 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     Tool::SaveProject => "Save",
                     Tool::IsolateObject => "Keep object",
                     Tool::FillHoles => "Fill",
+                    Tool::MakeSolid => "Make solid",
                     _ => "OK",
                 };
                 let ok_enabled = blocked.is_none() && (tool != Tool::ConnectIp || app.ip_valid()) && (!matches!(tool, Tool::PointPairs(_)) || app.picked_pairs().len() >= 3);
@@ -683,6 +684,15 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             kit::note(ui, "Smooths flat and curved areas while keeping edges and ribs (Keep edges high), or rounds everything like a plain smoothing filter (Keep edges low). Folded spots from bad scan data are relaxed first.");
         }
         Tool::FillHoles => fill_holes_form(app, ui),
+        Tool::MakeSolid => {
+            let points = app.working_len();
+            let source = app.working_source();
+            let s = &mut app.settings;
+            kit::row(ui, "Source", |ui| kit::value_field(ui, &format!("{source} · {} points", thousands(points)), true));
+            kit::slider_row(ui, "Cell size", &mut s.solid_cell_mm, 0.25..=1.5, 2, "mm");
+            kit::checkbox(ui, "Find and remove marker stickers", &mut s.solid_remove_markers);
+            kit::note(ui, "Builds a closed, watertight solid of a thin-walled part from the points, for printing or CAD: both faces of the wall, the rim between them, enclosed holes filled and the unscanned side of the wall completed at the measured thickness. The wall should be at least 6 cells thick. It replaces the mesh (undoable) and takes longer than Reconstruct.");
+        }
         Tool::Decimate => {
             let tris = app.mesh.as_ref().map(|m| m.analysis.triangle_count);
             let s = &mut app.settings;
