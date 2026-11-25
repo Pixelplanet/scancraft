@@ -174,6 +174,66 @@ detail 4 that drops to 1 212.
 
 ### 2.2 What it looks like
 
+**Fixed 2026-11-25 (second PC), as far as it can be checked there.** The three Revo scans and
+`E:\Claude\eval` are on the original PC; the second PC has the two-pass shell project (the one
+with pen marks) and a synthetic relief. **Still to do on the original PC:** run `mesh_project`
+on the three-scan project and look at the moulded lettering.
+
+Causes, each measured (synthetic relief = four ribs 0.3–1 mm high, 1–1.5 mm wide, and a ring on
+a noisy plane, 0.5 mm pitch; test `implicit_surface_keeps_small_relief_without_pits`):
+
+1. **Holes and pinholes: corners beyond the support radius.** A cell the surface crosses has
+   corners up to √3 cells from it; next to a step (the flank of a letter has no points on it)
+   they are further than `h` from every point, stayed unknown, and the cell was skipped. The
+   synthetic relief had 356 open edges inside, all along the flanks of the 0.8 and 1 mm ribs.
+   The tangential cut-off is *not* the cause (switching it off changed 356 to 354). Fix:
+   `Field::eval_corner` evaluates such corners with a kernel 1.5× and 2.25× as wide. → 0.
+2. **Pits and spikes: radii in units of a spacing that was too small.** "Spacing" was the median
+   nearest-neighbour distance: 0.39 mm for a 0.5 mm pitch with ±0.15 mm jitter, 0.51 mm on the
+   real merge whose density is one point per 0.65 mm square. The normal refit (2.5 × spacing)
+   then fits a plane to about 9–12 points, tilts at every step, and the stray filter and the
+   robust weights throw the relief out (pits 0.73 mm, spikes 0.38 mm; with either the robust
+   weights or the stray filter alone the pits stay, with a refit radius of 3.3 spacings they go).
+   Fix: `point_spacing` measures the pitch from the point density. Pits 0.06 mm, spikes 0.10 mm,
+   rib tops at 101 % of their height (76 % after the app's 4 smoothing passes; old mesher 87 %
+   with a plain area 1.4× as rough).
+3. **Flaps and torn patches on the real scan: a second, sparse layer.** At the pen marks the
+   merge has scatters of points 0.7–1.6 mm *behind* the continuous surface, facing either way
+   (in a 50 mm window: 7 907 surface points, 540 behind it facing the same way, 1 343 facing
+   away). They are not relief; the old mesher blends them into raised "ropes". Here they sat
+   inside the support radius and the field switched layer from corner to corner. Fix:
+   `dense_layers` drops points whose own sheet has at most 0.6 times as many points as the
+   layer right above or below them (both faces of a thin wall and relief stay; test
+   `implicit_surface_drops_a_sparse_layer_behind_the_surface`). A few small spots remain in the
+   pen-mark area, where the second layer is as dense as the surface.
+4. **Pinholes: the side test.** The side of a thin wall was the nearest point's normal; one
+   tilted normal shut out the surface around it. Without the side test 87 → 51 pinholes. Fix:
+   the points about as near as the nearest decide together when they agree (52).
+5. **Stair-stepped open edges:** marching cubes only meshes fully known cells, and nothing
+   moved the rim afterwards (the old mesher's Laplacian smoothing did). Fix: `round_open_edges`
+   (rim vertices towards the middle of their rim neighbours, at most 0.6 cell). Rim waviness
+   on a patch at 20° to the grid 0.24 → below 0.1 mm (`implicit_surface_has_round_open_edges`).
+
+Not causes: the projection clamp (no effect on holes or pits), the robust weights' scales.
+
+Two-pass shell project, app defaults (0.7 mm, 4 smoothing passes), `mesh_project`:
+
+| | Old (`--method legacy`) | New before | New after |
+| --- | --- | --- | --- |
+| Boundary loops (of up to 8 edges) | 110 (52) | 381 | **123 (58)** |
+| Roughness, mean / p90 | 2.65° / 5.78° | 2.14° / 3.98° | **1.64° / 3.40°** |
+| Vertex to scan points, median / p95 | 0.277 / 0.573 mm | 0.271 / 0.489 mm | 0.273 / 0.523 mm |
+| Points dropped before meshing | – | 3 518 | 5 403 |
+| Time (reconstruct + smooth) | 0.1 s | 0.9 s | 1.3 s |
+
+At 1.0 mm cells and 2 smoothing passes: 179 loops (119 pinholes) against the old mesher's 85
+(45). The support radius on this project is now 1.94 mm instead of 1.52 mm (same `detail` 3, the
+spacing is measured differently); `--detail 2.35` gives the old radius, with about 150 loops and 1.8°.
+The moulded pad in this scan (8 mm across, 0.25–0.3 mm high, flat) comes out as a flat pad; the
+ring-with-bars the old mesher shows there is its grain, not the part.
+
+The list below is the state before these fixes.
+
 - **Better:** large plain areas. The old mesher's woven grain and scaly patches are gone,
   and the fit to the points is closer.
 - **Worse: small raised detail.** The moulded lettering inside the shell is readable with

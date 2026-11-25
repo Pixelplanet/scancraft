@@ -9,6 +9,8 @@
 //!   --pitch MM       merge pitch (default 0.5, the app's default for imported scans)
 //!   --method NAME    "legacy" (the app's reconstruction) or "rimls" (default)
 //!   --detail X       rimls: support radius in point spacings (default 3.0)
+//!   --zoom U,V[,S]   centre of the close-up in view 1 as fractions of its half-width (right,
+//!                    up), and the close-up's own half-width as such a fraction (default 0.15)
 //! ```
 //!
 //! The merged model is rebuilt from each pass's cleaned (or imported) surface and its transform
@@ -205,7 +207,12 @@ fn roughness(mesh: &Mesh) -> (f32, f32, usize) {
         }
     }
     let keys: Vec<u32> = parent.keys().copied().collect();
-    let loops: std::collections::HashSet<u32> = keys.into_iter().map(|k| find(&mut parent, k)).collect();
+    let mut loops: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for k in keys {
+        *loops.entry(find(&mut parent, k)).or_default() += 1;
+    }
+    let sizes = |lo: usize, hi: usize| loops.values().filter(|n| **n >= lo && **n <= hi).count();
+    println!("boundary loops by edge count: {} of up to 8 (pinholes), {} of 9-40, {} of 41-200, {} larger", sizes(0, 8), sizes(9, 40), sizes(41, 200), sizes(201, usize::MAX));
     angles.sort_by(|a, b| a.total_cmp(b));
     let mean = angles.iter().sum::<f32>() / angles.len().max(1) as f32;
     (mean, angles.get(angles.len() * 9 / 10).copied().unwrap_or(0.0), loops.len())
@@ -371,8 +378,12 @@ fn main() {
         render(&mesh, c, *v, ext, 1400, false).save(a.out.join(format!("{tag}_view{}.png", k + 1))).unwrap();
     }
     // A close-up of the area around the point nearest the centre along the view direction.
-    // --zoom U,V: centre of the close-up in view 1, as fractions of the half-width (right, up).
+    // --zoom U,V[,S]: centre of the close-up in view 1, as fractions of the half-width (right,
+    // up), and its own half-width as such a fraction (default 0.15).
     let zoom = std::env::args().skip_while(|x| x != "--zoom").nth(1).map(|z| z.split(',').map(|v| v.parse::<f32>().unwrap()).collect::<Vec<_>>()).unwrap_or(vec![0.3, 0.0]);
-    render(&mesh, c + axes[0] * ext * zoom[0] + axes[1] * ext * zoom[1], views[0], ext * 0.15, 1000, true).save(a.out.join(format!("{tag}_zoom.png"))).unwrap();
+    let zc = c + axes[0] * ext * zoom[0] + axes[1] * ext * zoom[1];
+    println!("zoom: centre {zc:?}, right {:?}, up {:?}, half-width {:.1} mm", axes[0], axes[1], ext * zoom.get(2).copied().unwrap_or(0.15));
+    let zs = zoom.get(2).copied().unwrap_or(0.15);
+    render(&mesh, zc, views[0], ext * zs, 1000, true).save(a.out.join(format!("{tag}_zoom.png"))).unwrap();
     let _ = (Quat::IDENTITY, Point3D::default());
 }

@@ -322,3 +322,191 @@ fn implicit_surface_drops_stray_points_up_to_the_support_radius() {
     let worst = mesh.vertices.iter().filter(|v| v.position[0] > 2.0 && v.position[0] < 38.0 && v.position[1] > 2.0 && v.position[1] < 38.0).map(|v| v.position[2].abs()).fold(0.0f32, f32::max);
     assert!(worst < 0.08, "a bump of {worst} mm is left where a stray point was");
 }
+
+/// Raised strokes on a plane, as moulded lettering: four ribs (0.3–1 mm high, 1–1.5 mm wide)
+/// and a ring. Returns (distance to the stroke's centre line, top half-width, height) of the
+/// nearest stroke.
+fn relief_stroke(x: f32, y: f32) -> (f32, f32, f32) {
+    let ribs = [(8.0f32, 0.75f32, 0.3f32), (14.0, 0.6, 0.5), (20.0, 0.5, 0.8), (26.0, 0.5, 1.0)];
+    let mut best = (f32::MAX, 0.0, 0.0);
+    for (cx, half, h) in ribs {
+        let d = Vec3::new(x - cx, y - y.clamp(6.0, 24.0), 0.0).length();
+        if d - half < best.0 - best.1 {
+            best = (d, half, h);
+        }
+    }
+    let ring = ((Vec3::new(x - 34.0, y - 15.0, 0.0).length()) - 3.0).abs();
+    if ring - 0.5 < best.0 - best.1 {
+        best = (ring, 0.5, 0.5);
+    }
+    best
+}
+
+/// Height of the relief at (x, y): flat tops, flanks 0.3 mm wide.
+fn relief_height(x: f32, y: f32) -> f32 {
+    let (d, half, h) = relief_stroke(x, y);
+    h * ((half + 0.3 - d) / 0.3).clamp(0.0, 1.0)
+}
+
+/// The relief sampled like a scan from above: 0.5 mm spacing with lateral jitter, ±0.05 mm
+/// height noise, normals 10° off.
+fn relief_cloud() -> PointCloud {
+    let mut c = PointCloud::new();
+    for i in 0..=84usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            let (x, y) = (i as f32 * 0.5 + jitter(idx, 11, 0.15), j as f32 * 0.5 + jitter(idx, 12, 0.15));
+            let e = 0.05;
+            let n = Vec3::new(-(relief_height(x + e, y) - relief_height(x - e, y)) / (2.0 * e), -(relief_height(x, y + e) - relief_height(x, y - e)) / (2.0 * e), 1.0);
+            c.push(pt(Vec3::new(x, y, relief_height(x, y)), n));
+        }
+    }
+    let mut c = noisy(c, 0.0, 10.0);
+    for (i, p) in c.points.iter_mut().enumerate() {
+        p.position[2] += jitter(i, 13, 0.05);
+    }
+    c
+}
+
+/// What a mesh of [`relief_cloud`] looks like, in numbers.
+#[derive(Debug)]
+struct ReliefReport {
+    /// Open edges away from the border of the patch: holes.
+    inner_open_edges: usize,
+    /// Mean height on the flat top of each stroke as a fraction of its true height (worst one).
+    worst_top_fraction: f32,
+    /// Furthest a vertex lies below / above every true height within 0.5 mm of it (mm).
+    deepest_pit: f32,
+    highest_spike: f32,
+    /// RMS height on the plain area, 2.5 mm and more from any stroke (mm).
+    plain_rms: f32,
+}
+
+fn relief_report(mesh: &Mesh) -> ReliefReport {
+    let inside = |p: [f32; 3]| p[0] > 2.5 && p[0] < 39.5 && p[1] > 2.5 && p[1] < 27.5;
+    let inner_open_edges = open_edges(mesh).into_iter().filter(|&(a, b)| inside(mesh.vertices[a as usize].position) && inside(mesh.vertices[b as usize].position)).count();
+    let mut tops: std::collections::HashMap<u32, (f32, u32)> = std::collections::HashMap::new();
+    let (mut pit, mut spike, mut plain, mut plain_n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
+    for v in mesh.vertices.iter().filter(|v| inside(v.position)) {
+        let [x, y, z] = v.position;
+        let (d, half, h) = relief_stroke(x, y);
+        if d < half * 0.5 {
+            let e = tops.entry((h * 1000.0) as u32 + (x > 30.0) as u32).or_default();
+            e.0 += z / h;
+            e.1 += 1;
+        }
+        if d > half + 2.8 {
+            plain += z * z;
+            plain_n += 1;
+        }
+        let (mut lo, mut hi) = (f32::MAX, f32::MIN);
+        for k in 0..25 {
+            let hh = relief_height(x + ((k % 5) as f32 - 2.0) * 0.25, y + ((k / 5) as f32 - 2.0) * 0.25);
+            lo = lo.min(hh);
+            hi = hi.max(hh);
+        }
+        pit = pit.max(lo - z);
+        spike = spike.max(z - hi);
+    }
+    ReliefReport {
+        inner_open_edges,
+        worst_top_fraction: tops.values().map(|(s, n)| s / *n as f32).fold(f32::MAX, f32::min),
+        deepest_pit: pit,
+        highest_spike: spike,
+        plain_rms: (plain / plain_n.max(1) as f32).sqrt(),
+    }
+}
+
+#[test]
+fn implicit_surface_keeps_small_relief_without_pits() {
+    let cloud = relief_cloud();
+    // The app's defaults: 0.7 mm cells, then 4 smoothing passes at Keep edges 0.7.
+    let (mut mesh, stats) = crate::implicit::reconstruct(&cloud, &crate::SurfaceConfig::default());
+    let raw = relief_report(&mesh);
+    crate::FeatureSmoother { iterations: 4, sigma_normal: 0.5144, ..Default::default() }.smooth(&mut mesh);
+    let r = relief_report(&mesh);
+    // Before the fixes: 356 open edges inside, pits of 0.59 mm and spikes of 0.38 mm (raw).
+    assert_eq!(raw.inner_open_edges + r.inner_open_edges, 0, "holes in the relief: {raw:?} {stats:?}");
+    assert!(raw.worst_top_fraction > 0.9 && r.worst_top_fraction > 0.7, "relief flattened: {raw:?} {r:?}");
+    assert!(raw.deepest_pit < 0.12 && raw.highest_spike < 0.15, "pits or spikes: {raw:?}");
+    assert!(r.deepest_pit < 0.2 && r.highest_spike < 0.15, "pits or spikes after smoothing: {r:?}");
+    assert!(raw.plain_rms < 0.02 && r.plain_rms < 0.01, "plain area rough: {raw:?} {r:?}");
+    // The old mesher, for reference: it keeps the relief too, on a rougher plain area.
+    let old = relief_report(&MarchingCubes::new(0.7).reconstruct(&cloud));
+    assert!(raw.plain_rms < old.plain_rms, "{raw:?} against the old mesher's {old:?}");
+}
+
+/// Open edges with both ends inside the rectangle (3..37, 3..27) of the xy plane: holes.
+fn inner_open_edges(mesh: &Mesh) -> usize {
+    let inside = |p: [f32; 3]| p[0] > 3.0 && p[0] < 37.0 && p[1] > 3.0 && p[1] < 27.0;
+    open_edges(mesh).into_iter().filter(|&(a, b)| inside(mesh.vertices[a as usize].position) && inside(mesh.vertices[b as usize].position)).count()
+}
+
+fn open_edges(mesh: &Mesh) -> Vec<(u32, u32)> {
+    let mut edges: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
+    for t in &mesh.triangles {
+        let [a, b, c] = t.indices;
+        for (u, v) in [(a, b), (b, c), (c, a)] {
+            *edges.entry((u.min(v), u.max(v))).or_default() += 1;
+        }
+    }
+    edges.into_iter().filter(|(_, n)| *n == 1).map(|(k, _)| k).collect()
+}
+
+#[test]
+fn implicit_surface_drops_a_sparse_layer_behind_the_surface() {
+    // A noisy plane (0.5 mm pitch) and, along three strokes, a thin scatter of points 1 mm
+    // behind it, facing either way: what ink marks look like in a merged scan. They sit inside
+    // the support radius and used to tear the plane into flaps and holes.
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            c.push(pt(Vec3::new(i as f32 * 0.5 + jitter(idx, 21, 0.1), j as f32 * 0.5 + jitter(idx, 22, 0.1), jitter(idx, 23, 0.04)), Vec3::Z));
+        }
+    }
+    let plane = c.len();
+    for s in 0..3usize {
+        for k in 0..90usize {
+            let idx = 9000 + s * 100 + k;
+            let (x, y) = (8.0 + 0.27 * k as f32, 8.0 + 7.0 * s as f32 + jitter(idx, 24, 0.9));
+            let n = if k % 3 == 0 { Vec3::Z } else { Vec3::new(jitter(idx, 25, 0.5), jitter(idx, 26, 0.5), -1.0) };
+            c.push(pt(Vec3::new(x, y, -1.0 + jitter(idx, 27, 0.25)), n));
+        }
+    }
+    let strays = c.len() - plane;
+    let (mesh, stats) = crate::implicit::reconstruct(&noisy(c, 0.0, 10.0), &crate::SurfaceConfig::default());
+    assert!(stats.removed_outliers >= strays * 9 / 10 && stats.removed_outliers < strays + 60, "{} of {strays} stray points removed: {stats:?}", stats.removed_outliers);
+    let worst = mesh.vertices.iter().filter(|v| v.position[0] > 3.0 && v.position[0] < 37.0 && v.position[1] > 3.0 && v.position[1] < 27.0).map(|v| v.position[2].abs()).fold(0.0f32, f32::max);
+    assert!(worst < 0.12, "the surface is {worst} mm off the plane where the stray layer was");
+    assert_eq!(inner_open_edges(&mesh), 0, "holes where the stray layer was");
+}
+
+#[test]
+fn implicit_surface_has_round_open_edges() {
+    // A flat patch whose sides run at 20° to the voxel grid: its rim must be a line, not stairs
+    // one cell high.
+    let (s, co) = 20f32.to_radians().sin_cos();
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=80usize {
+            let (x, y) = (i as f32 * 0.5, j as f32 * 0.5);
+            c.push(pt(Vec3::new(co * x - s * y, s * x + co * y, jitter(i * 81 + j, 31, 0.03)), Vec3::Z));
+        }
+    }
+    let (mesh, _) = crate::implicit::reconstruct(&c, &crate::SurfaceConfig::default());
+    // Rim vertices along the side y' = 0 (patch coordinates), away from the corners: their
+    // distance from that side, less its mean, is the waviness of the rim.
+    let d: Vec<f32> = open_edges(&mesh)
+        .into_iter()
+        .filter_map(|(a, _)| {
+            let p = mesh.vertices[a as usize].position;
+            let (x, y) = (co * p[0] + s * p[1], -s * p[0] + co * p[1]);
+            (x > 5.0 && x < 35.0 && y < 3.0).then_some(y)
+        })
+        .collect();
+    assert!(d.len() > 30, "{} rim vertices", d.len());
+    let mean = d.iter().sum::<f32>() / d.len() as f32;
+    let rms = (d.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / d.len() as f32).sqrt();
+    assert!(rms < 0.1, "the rim wanders {rms} mm around its line (stairs of a 0.7 mm cell: 0.2 mm)");
+}

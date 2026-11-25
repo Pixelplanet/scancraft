@@ -256,3 +256,14 @@ laser model are not built.
   (`HoleFiller::blend_rings`, default 2) to remove the crease at stair-stepped rims; the direct
   fairing solve now covers holes up to 1.5 M new vertices (open-issues 1.7: a 1 193 mm hole fills
   in 28 s). `mesh_project` close-ups use a grazing light and take `--fill MM --blend N`.
+- 2026-11-25 (second PC, mesher) — Open-issues 2.2 (`scancraft-mesh/src/implicit.rs`), measured
+  on a synthetic relief and the two-pass shell project (the three Revo scans are on the original
+  PC: check the moulded lettering there). Causes: grid corners beyond the support radius stayed
+  unknown (holes along every step: wider kernel for those, `eval_corner`); "spacing" was the
+  nearest-neighbour distance, below the real pitch, so the normal refit used ~10 points and relief
+  was thrown out as outliers (`point_spacing` now from density); sparse second layers behind the
+  surface at pen marks (`dense_layers`); the thin-wall side test trusted one normal (vote);
+  rims followed the voxel grid (`round_open_edges`). Two-pass project at app defaults: 381 → 123
+  boundary loops (old mesher 110), roughness 2.14° → 1.64° (old 2.65°). Three new tests.
+  `mesh_project` prints loop sizes and takes `--zoom U,V,S`. Work in a shared checkout with
+  another agent: use `git worktree` for your own changes.

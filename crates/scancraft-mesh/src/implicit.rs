@@ -7,19 +7,24 @@
 //! narrow plane-distance average turns all three into bumps, and marching cubes adds its own
 //! faceting on top. Here:
 //!
-//! 1. Each point's normal is smoothed with its neighbours of similar orientation (bilateral in
-//!    normal space), which removes normal noise without rounding edges.
+//! 1. Sparse layers of points stacked on a denser one (ink marks, glints) are dropped. Each
+//!    point's normal is re-fitted from the positions around it and smoothed with its neighbours
+//!    of similar orientation (bilateral in normal space), which removes normal noise without
+//!    rounding edges; then single points far off the surface their neighbours define go.
 //! 2. The field at `x` is the RIMLS potential over all points within the support radius `h`
 //!    (a multiple of the point spacing, the "detail" setting), iterated with robust weights that
 //!    discount points whose plane disagrees with the local fit (sharp edges, a stray pass) or whose
 //!    normal disagrees with the field's gradient. Points facing the other way than the nearest
 //!    point never take part, so the two sides of a thin wall stay apart.
 //! 3. Corners far from every point along the surface stay unknown, so open scans give open
-//!    patches (filled later on request by [`crate::holes`]) instead of invented sheets.
+//!    patches (filled later on request by [`crate::holes`]) instead of invented sheets. Corners
+//!    further than `h` from every point but beside the surface get a wider kernel: left
+//!    unknown they would punch holes into steps and relief.
 //! 4. Marching cubes on the known cells, welded by grid edge.
 //! 5. Every vertex is projected onto the implicit surface along its gradient, which removes the
 //!    cell-sized faceting of marching cubes; the vertex normal is the field gradient there.
-//! 6. Tiny disconnected fragments are dropped.
+//! 6. Tiny disconnected fragments are dropped and the open edges, which follow the voxel grid
+//!    in stairs, are rounded.
 //!
 //! Normal convention as in [`crate::marching_cubes`]: normals face away from the interior.
 
@@ -135,6 +140,9 @@ struct Field<'a> {
     /// A corner is known only if some point lies within this distance of it along that point's
     /// tangent plane.
     tangential: f32,
+    /// The side of a thin wall is the common normal of the points within this distance beyond
+    /// the nearest one.
+    side_vote: f32,
 }
 
 impl Field<'_> {
@@ -149,13 +157,26 @@ impl Field<'_> {
     /// own normal for the side test) would pull the measured offset of a stray point towards 0,
     /// the more so the further off it is.
     fn eval_excluding(&self, x: Vec3, check_tangential: bool, skip: usize) -> Option<(f32, Vec3)> {
-        let h2 = self.h * self.h;
+        self.eval_within(x, check_tangential, skip, self.h)
+    }
+
+    /// The field at a grid corner. A cell the surface crosses has corners up to √3 cells from
+    /// it, and where the surface steps (the flank of a raised letter, sampled only at its foot
+    /// and its top) further than that from every point: beyond the support radius. Such a corner
+    /// only has to tell marching cubes which side it is on, so it is evaluated with a wider
+    /// kernel instead of being left unknown, which would cut a hole into the surface.
+    fn eval_corner(&self, x: Vec3) -> Option<(f32, Vec3)> {
+        [1.0, 1.5, 2.25].iter().find_map(|s| self.eval_within(x, true, usize::MAX, self.h * s))
+    }
+
+    fn eval_within(&self, x: Vec3, check_tangential: bool, skip: usize, h: f32) -> Option<(f32, Vec3)> {
+        let h2 = h * h;
         let g = self.grid;
-        // Nearest point: its normal decides which side of a thin wall `x` belongs to.
+        // Which side of a thin wall `x` belongs to: the nearest point's.
         let mut nearest = (f32::MAX, Vec3::ZERO);
         let mut tangential_min = f32::MAX;
         let mut idx: smallvec_like::Buf = smallvec_like::Buf::new();
-        g.around(x, self.h, |i| {
+        g.around(x, h, |i| {
             let d = x - g.p[i];
             let d2 = d.length_squared();
             if d2 < h2 && i != skip {
@@ -172,7 +193,25 @@ impl Field<'_> {
         if idx.len() < 3 || (check_tangential && tangential_min > self.tangential * self.tangential) {
             return None;
         }
-        let side = nearest.1;
+        // Its normal alone is a poor judge on real scans: one tilted normal (a steep flank, a
+        // stray point) shuts out the surface around it, the field there comes from a point or
+        // two, and the cell gets a pinhole. So the points about as near as the nearest one
+        // decide together when they agree; between the faces of a thin wall they do not, and
+        // the nearest point decides alone.
+        let mut side = nearest.1;
+        {
+            let reach = nearest.0.sqrt() + self.side_vote;
+            let (mut sum, mut count) = (Vec3::ZERO, 0u32);
+            for &i in idx.as_slice() {
+                if (x - g.p[i as usize]).length_squared() <= reach * reach {
+                    sum += g.n[i as usize];
+                    count += 1;
+                }
+            }
+            if sum.length() > 0.6 * count as f32 {
+                side = sum.normalize();
+            }
+        }
         let mut f = 0.0f32;
         let mut grad = Vec3::ZERO;
         let inv_h2 = 1.0 / h2;
@@ -259,9 +298,41 @@ mod smallvec_like {
     }
 }
 
-/// Median nearest-neighbour distance over a sample of the grid's points.
+/// The sampling pitch: the side of the square each point stands for on its surface, median over
+/// a sample of the grid's points. Measured from the number of points on the same side of the
+/// surface within a few nearest-neighbour distances, not from the nearest-neighbour distance
+/// itself: that one is the pitch on a regular grid (a merged scan), but well below it on
+/// irregular samples (0.39 for a 0.5 mm grid jittered by ±0.15 mm), and every radius here is a
+/// multiple of the spacing.
 fn point_spacing(grid: &PointGrid) -> f32 {
     let step = (grid.p.len() / 5000).max(1);
+    let nearest = nearest_neighbour_distance(grid, step);
+    let r = 4.0 * nearest;
+    let mut d: Vec<f32> = (0..grid.p.len())
+        .into_par_iter()
+        .step_by(step)
+        .map(|i| {
+            let (x, n) = (grid.p[i], grid.n[i]);
+            let mut count = 0u32;
+            grid.around(x, r, |j| {
+                if grid.p[j].distance_squared(x) < r * r && grid.n[j].dot(n) > 0.0 {
+                    count += 1;
+                }
+            });
+            (std::f32::consts::PI * r * r / count.max(1) as f32).sqrt()
+        })
+        .collect();
+    if d.is_empty() {
+        return nearest;
+    }
+    let mid = d.len() / 2;
+    d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
+    // Never above the nearest-neighbour figure by more than the two can differ on real samples.
+    d[mid].clamp(nearest, 2.0 * nearest)
+}
+
+/// Median nearest-neighbour distance over every `step`-th point of the grid.
+fn nearest_neighbour_distance(grid: &PointGrid, step: usize) -> f32 {
     let mut d: Vec<f32> = (0..grid.p.len())
         .into_par_iter()
         .step_by(step)
@@ -342,6 +413,77 @@ fn refit_normals(grid: &mut PointGrid, radius: f32) {
     grid.n = new;
 }
 
+/// Marks the points of a sparse layer stacked on a denser one. Dark ink, glints and edges of
+/// depth frames leave thin scatters of points a millimetre in front of or behind the surface,
+/// facing either way. They sit inside the support radius of the real surface: the field then
+/// switches between the two layers from corner to corner, which tears the surface into flaps,
+/// pits and holes. A point goes when, within `radius` along the surface, the sheet it lies on
+/// has at most `STRAY_LAYER_RATIO` as many points as the layer right above or below it within
+/// `reach`. Both faces of a thin wall are equally dense and stay; so does relief, whose points
+/// have the rest of the surface beside them, not above or below. Returns one flag per point: keep.
+fn dense_layers(grid: &PointGrid, radius: f32, reach: f32, spacing: f32) -> Vec<bool> {
+    const STRAY_LAYER_RATIO: f32 = 0.6;
+    let mut keep = vec![true; grid.p.len()];
+    for _ in 0..2 {
+        let next: Vec<bool> = (0..grid.p.len())
+            .into_par_iter()
+            .map(|i| {
+                if !keep[i] {
+                    return false;
+                }
+                let (x, n) = (grid.p[i], grid.n[i]);
+                // The direction the layers here are stacked along: the common axis of the
+                // normals around, whichever way they face. Not the point's own normal: a stray
+                // point's normal is often tilted far off, and so is that of a point on a steep
+                // flank, for which the top and the foot of the step are no layers.
+                let mut axis = n;
+                for _ in 0..2 {
+                    let mut sum = Vec3::ZERO;
+                    grid.around(x, reach, |j| {
+                        if keep[j] && grid.p[j].distance_squared(x) < reach * reach {
+                            sum += grid.n[j] * grid.n[j].dot(axis).signum();
+                        }
+                    });
+                    axis = sum.normalize_or(n);
+                }
+                // What is stacked in front of (0) and behind (1) the point: count and summed
+                // offset along the surface.
+                let (mut own, mut other) = (0u32, [(0u32, Vec3::ZERO); 2]);
+                grid.around(x, reach, |j| {
+                    if !keep[j] {
+                        return;
+                    }
+                    let d = grid.p[j] - x;
+                    let s = d.dot(axis);
+                    let lateral2 = d.length_squared() - s * s;
+                    if lateral2 > radius * radius || s.abs() > reach {
+                        return;
+                    }
+                    // The same sheet: near the tangent plane (slopes up to 1:2 count) and
+                    // facing the same way.
+                    if s.abs() < (0.4 * spacing).max(0.5 * lateral2.max(0.0).sqrt()) && grid.n[j].dot(n) > 0.3 {
+                        own += 1;
+                    } else if s.abs() > 0.6 * spacing {
+                        let o = &mut other[(s < 0.0) as usize];
+                        o.0 += 1;
+                        o.1 += d - axis * s;
+                    }
+                });
+                let (count, offset) = if other[0].0 >= other[1].0 { other[0] } else { other[1] };
+                // A layer right above or below surrounds the point's position; the foot or the
+                // top of a step next to it lies to one side (a half disc: 0.42 radius off).
+                let stacked = count >= 4 && (offset / count as f32).length() < 0.35 * radius;
+                !(stacked && own as f32 <= STRAY_LAYER_RATIO * count as f32)
+            })
+            .collect();
+        if next == keep {
+            break;
+        }
+        keep = next;
+    }
+    keep
+}
+
 /// Smooths normals with neighbours of similar orientation (bilateral in normal space), keeping
 /// creases: a neighbour across an edge (normals > ~40° apart) barely counts.
 fn smooth_normals(grid: &mut PointGrid, radius: f32) {
@@ -367,6 +509,49 @@ fn smooth_normals(grid: &mut PointGrid, radius: f32) {
         })
         .collect();
     grid.n = new;
+}
+
+/// Rounds the open edges. Marching cubes only meshes cells whose corners are all known, so the
+/// rim of an open surface follows the voxel grid in cell-sized stairs, and a small hole is a
+/// square. Every rim vertex is moved towards the middle of its two neighbours along the rim (a
+/// few passes), never more than `max_move` in total, which turns the stairs into the line they
+/// approximate without moving the rim as a whole.
+fn round_open_edges(vertices: &mut [Point3D], tris: &[[u32; 3]], max_move: f32) {
+    let mut directed: HashMap<(u32, u32), ()> = HashMap::with_capacity(tris.len() * 3);
+    for t in tris {
+        for k in 0..3 {
+            directed.insert((t[k], t[(k + 1) % 3]), ());
+        }
+    }
+    // Rim edge a -> b: next[a] = b, prev[b] = a. A vertex where two rims touch is left alone.
+    let (mut next, mut prev): (HashMap<u32, u32>, HashMap<u32, u32>) = (HashMap::new(), HashMap::new());
+    let mut shared: Vec<u32> = Vec::new();
+    for &(a, b) in directed.keys() {
+        if !directed.contains_key(&(b, a)) {
+            if next.insert(a, b).is_some() {
+                shared.push(a);
+            }
+            if prev.insert(b, a).is_some() {
+                shared.push(b);
+            }
+        }
+    }
+    let rim: Vec<(u32, u32, u32)> = next.iter().filter(|(a, _)| !shared.contains(a)).filter_map(|(&a, &b)| prev.get(&a).map(|&p| (a, p, b))).collect();
+    let start: Vec<Vec3> = rim.iter().map(|r| Vec3::from_array(vertices[r.0 as usize].position)).collect();
+    for _ in 0..4 {
+        let moved: Vec<Vec3> = rim
+            .iter()
+            .zip(&start)
+            .map(|(&(a, p, b), &s)| {
+                let at = |i: u32| Vec3::from_array(vertices[i as usize].position);
+                let target = at(a) + 0.5 * ((at(p) + at(b)) * 0.5 - at(a));
+                s + (target - s).clamp_length_max(max_move)
+            })
+            .collect();
+        for (r, m) in rim.iter().zip(moved) {
+            vertices[r.0 as usize].position = m.to_array();
+        }
+    }
 }
 
 /// Reconstructs a welded triangle mesh from an oriented point cloud (see the module docs).
@@ -402,8 +587,16 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
     let h = (config.detail * spacing).max(1.5 * config.cell_mm).max(1e-3);
     stats.support_radius_mm = h;
     let mut grid = PointGrid::new(pts, h);
+    if config.outlier_sigma > 0.0 {
+        let keep = dense_layers(&grid, 1.5 * spacing, 1.25 * h, spacing);
+        let kept: Vec<(Vec3, Vec3, f32)> = (0..grid.p.len()).filter(|&i| keep[i]).map(|i| (grid.p[i], grid.n[i], grid.w[i])).collect();
+        stats.removed_outliers = grid.p.len() - kept.len();
+        if stats.removed_outliers > 0 {
+            grid = PointGrid::new(kept, h);
+        }
+    }
     if config.refit_normals {
-        refit_normals(&mut grid, (2.5 * spacing).min(h));
+        refit_normals(&mut grid, 2.5 * spacing);
     }
     for _ in 0..config.normal_passes {
         smooth_normals(&mut grid, h * 0.75);
@@ -411,7 +604,7 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
     // Points far off the surface their neighbours agree on (dark ink, glints: scattered depth)
     // fold the mesh into small tunnels; drop them and refit.
     if config.outlier_sigma > 0.0 {
-        let probe = Field { grid: &grid, h, sigma_r: 0.5 * h, sigma_n: 0.8, iterations: config.robust_iterations, tangential: f32::MAX };
+        let probe = Field { grid: &grid, h, sigma_r: 0.5 * h, sigma_n: 0.8, iterations: config.robust_iterations, tangential: f32::MAX, side_vote: spacing };
         let offs: Vec<f32> = grid.p.par_iter().enumerate().map(|(i, &p)| probe.eval_excluding(p, false, i).map_or(f32::MAX, |(f, _)| f.abs())).collect();
         let mut sorted: Vec<f32> = offs.iter().copied().filter(|v| v.is_finite() && *v < f32::MAX).collect();
         if sorted.len() > 100 {
@@ -420,8 +613,9 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
             // 1.4826 × median |offset| estimates the standard deviation of the noise.
             let limit = (config.outlier_sigma * 1.4826 * sorted[mid]).max(0.25 * spacing);
             let keep: Vec<(Vec3, Vec3, f32)> = (0..grid.p.len()).filter(|&i| offs[i] <= limit).map(|i| (grid.p[i], grid.n[i], grid.w[i])).collect();
-            stats.removed_outliers = grid.p.len() - keep.len();
-            if stats.removed_outliers > 0 {
+            let removed = grid.p.len() - keep.len();
+            stats.removed_outliers += removed;
+            if removed > 0 {
                 grid = PointGrid::new(keep, h);
             }
         }
@@ -433,6 +627,7 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
         sigma_n: 0.8,
         iterations: config.robust_iterations,
         tangential: (1.5 * spacing).max(1.3 * config.cell_mm),
+        side_vote: spacing,
     };
 
     // ---- corners to evaluate: around every point, within the band a crossing cell can need.
@@ -449,7 +644,7 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
     corners.par_sort_unstable_by_key(|k| (k.x, k.y, k.z));
     corners.dedup();
     stats.evaluated_corners = corners.len();
-    let values: Vec<f32> = corners.par_iter().map(|k| field.eval(k.as_vec3() * c, true).map_or(f32::NAN, |(f, _)| f)).collect();
+    let values: Vec<f32> = corners.par_iter().map(|k| field.eval_corner(k.as_vec3() * c).map_or(f32::NAN, |(f, _)| f)).collect();
     stats.known_corners = values.iter().filter(|v| !v.is_nan()).count();
     let lookup: HashMap<IVec3, f32> = corners.into_iter().zip(values).filter(|(_, v)| !v.is_nan()).collect();
 
@@ -567,6 +762,8 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
             Point3D { position: p.to_array(), normal: n.to_array(), color, confidence: 1.0 }
         })
         .collect();
+    let mut vertices = vertices;
+    round_open_edges(&mut vertices, &tris, 0.6 * c);
     let triangles = tris.into_iter().map(|t| Triangle::new(t[0], t[1], t[2])).collect();
     let mut mesh = Mesh::from_geometry(vertices, triangles);
     mesh.update_bbox();
