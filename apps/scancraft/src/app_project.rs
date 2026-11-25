@@ -377,7 +377,7 @@ impl ScanCraftApp {
     fn preview_layers(&mut self, poses: &[(u32, Transform)]) -> Vec<(u32, CloudLayer)> {
         let mut layers = Vec::new();
         for (id, pose) in poses {
-            let g = self.generation();
+            let g = self.preview_generation();
             let colour = self.pass_colour(*id);
             let Some(p) = self.passes.iter().find(|p| p.id == *id) else { continue };
             let delta = scancraft_align::compose(pose, &p.meta.transform.inverse());
@@ -523,7 +523,7 @@ impl ScanCraftApp {
     }
 
     pub(super) fn show_preview(&mut self, pass: u32, method: AlignMethod, alignment: Alignment, check: Option<AlignCheck>, message: String) {
-        let g = self.generation();
+        let g = self.preview_generation();
         let colour = self.pass_colour(pass);
         let Some(p) = self.passes.iter().find(|p| p.id == pass) else { return };
         let delta = scancraft_align::compose(&alignment.transform, &p.meta.transform.inverse());
@@ -720,28 +720,6 @@ impl ScanCraftApp {
 
     // ------------------------------------------------------------------ project files
 
-    pub fn new_project(&mut self) {
-        if !self.can_edit() {
-            return;
-        }
-        if self.has_geometry() {
-            self.history.push(self.snapshot("New project"));
-        }
-        self.passes.clear();
-        self.merged = None;
-        self.mesh = None;
-        self.clear_previews();
-        self.picking = None;
-        self.object_picking = None;
-        self.selection = None;
-        self.highlight = None;
-        self.next_pass_id = 1;
-        self.framed_radius = 0.0;
-        self.project = ProjectInfo { saved_generation: self.next_generation, ..ProjectInfo::default() };
-        self.settings.project_path = super::default_project_path();
-        self.say(Tone::Normal, "New project");
-    }
-
     pub fn save_project(&mut self, dir: PathBuf) {
         if self.tool_blocked(Tool::SaveProject).is_some() || dir.as_os_str().is_empty() {
             self.say(Tone::Error, "Enter a folder for the project");
@@ -807,8 +785,9 @@ impl ScanCraftApp {
     }
 
     pub(super) fn install_project(&mut self, opened: OpenedProject) {
+        // Opens into a new tab unless the current one is empty: nothing is replaced.
         if self.has_geometry() {
-            self.history.push(self.snapshot("Open project"));
+            self.new_tab();
         }
         self.clear_previews();
         self.picking = None;

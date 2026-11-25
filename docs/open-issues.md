@@ -263,6 +263,19 @@ The list below is the state before these fixes.
 
 ### 3.1 New Project throws away the open project without asking
 
+**Done 2026-11-25** (`apps/scancraft/src/app_tabs.rs`). Several projects open as tabs in the app
+bar (name, a dot for unsaved changes, ×). The active project stays in the app's fields and the
+others are parked in `ProjectTab`s; switching swaps them and is only allowed while nothing runs
+(no job, capture, file dialog or queued import), so a job's result always lands in its own tab.
+History is per tab. New Project opens a new tab; Open Project opens into a new tab unless the
+current one is empty. Closing a tab with unsaved changes asks Save / Discard changes / Cancel
+(Save without a folder opens Save Project and closes after it worked; a failed save keeps the
+tab); quitting with unsaved tabs asks Quit without saving / Cancel. Previews, highlights and
+outlines no longer mark a project as changed (`preview_generation`). Not done: Add Project from
+another open tab, Save All on quit. Tests: `new_project_opens_a_tab_and_keeps_the_open_one`,
+`closing_a_tab_with_unsaved_changes_asks_first`, `save_and_close_closes_only_after_saving`,
+`tabs_cannot_switch_while_a_job_runs`, `previews_do_not_mark_the_project_changed`.
+
 **Now:** clicking *New project* (`ui_shell.rs:42` → `new_project`, `app_project.rs:712`)
 clears everything at once, with no confirmation. The work can be got back only with Undo
 (it pushes a snapshot), which the user does not expect. The current ribbon tab stays

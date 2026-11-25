@@ -4,7 +4,7 @@ use eframe::egui::{self, Rect, pos2, vec2};
 use scancraft_ui::kit::{self, RibbonButton, RibbonGroup};
 use scancraft_ui::{Tokens, fonts};
 
-use crate::app::{Capture, ScanCraftApp, Tone};
+use crate::app::{Capture, ClosePrompt, ScanCraftApp, Tone};
 use crate::file_picker::PickPurpose;
 use crate::model::{ExportFormat, Node, Stage, Tool, thousands};
 
@@ -39,8 +39,8 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         // Project files.
         x += 22.0;
         let new = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, new, "new", "New project", app.can_edit()).clicked() {
-            app.new_project();
+        if kit::app_bar_button(ui, new, "new", "New project (in a new tab)", app.tabs_blocked().is_none()).clicked() {
+            app.new_tab();
         }
         x += 32.0;
         let open = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
@@ -71,21 +71,9 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         }
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
-        // The project tab, as SolidCraft's document tab: name, and a dot while it has unsaved changes.
-        let name = app.project.name.clone();
-        let dirty = app.dirty();
-        let galley = ui.painter().layout_no_wrap(name, fonts::semibold(t.font_label), t.app_bar_text);
-        let tab = Rect::from_min_size(pos2(x + 10.0, r.center().y - 13.0), vec2(galley.size().x + if dirty { 34.0 } else { 24.0 }, 26.0));
-        ui.painter().rect_filled(tab, t.radius_sm, t.app_bar.lerp_to_gamma(egui::Color32::WHITE, 0.08));
-        ui.painter().galley(pos2(tab.left() + 12.0, tab.center().y - galley.size().y / 2.0), galley, t.app_bar_text);
-        if dirty {
-            ui.painter().circle_filled(pos2(tab.right() - 12.0, tab.center().y), 3.0, t.app_bar_text);
-        }
-        let tip = match &app.project.path {
-            Some(p) => format!("{}{}", p.display(), if dirty { " · unsaved changes" } else { "" }),
-            None => "Not saved yet".to_string(),
-        };
-        ui.interact(tab, ui.id().with("project_tab"), egui::Sense::hover()).on_hover_text(tip);
+        // The project tabs, as SolidCraft's document tabs: name, a dot while it has unsaved
+        // changes, a close button; the pill on the right limits how wide they may get.
+        project_tabs(app, ui, r, x + 10.0, r.right() - 220.0);
         // Connection pill at the right.
         let (dot, text) = match &app.connection {
             Some(c) => (t.agent_ok, format!("{} connected", c.short_name())),
@@ -102,6 +90,146 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
             app.tool = None;
         }
     });
+}
+
+/// The tab strip between `left` and `right`: click a tab to switch to it, × to close it (asks
+/// first if it has unsaved changes). Tabs share the width evenly when it runs out.
+fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32, right: f32) {
+    let t = Tokens::get();
+    let labels = app.tab_labels();
+    let blocked = app.tabs_blocked();
+    let (gap, close_w, dot_w, pad) = (4.0, 18.0, 12.0, 12.0);
+    let font = fonts::semibold(t.font_label);
+    let natural: Vec<f32> = labels.iter().map(|l| ui.painter().layout_no_wrap(l.name.clone(), font.clone(), t.app_bar_text).size().x + pad + dot_w + close_w + 6.0).collect();
+    let room = (right - left).max(80.0);
+    let total: f32 = natural.iter().sum::<f32>() + gap * labels.len().saturating_sub(1) as f32;
+    let cap = if total > room { (room - gap * labels.len().saturating_sub(1) as f32) / labels.len().max(1) as f32 } else { f32::MAX };
+    let mut x = left;
+    let mut switch_to = None;
+    let mut close = None;
+    for (i, (l, w)) in labels.iter().zip(&natural).enumerate() {
+        let w = w.min(cap).max(close_w + pad + 24.0);
+        let tab = Rect::from_min_size(pos2(x, bar.center().y - 13.0), vec2(w, 26.0));
+        x += w + gap;
+        let resp = ui.interact(tab, ui.id().with(("project_tab", i)), egui::Sense::click());
+        let fill = if l.active {
+            t.app_bar.lerp_to_gamma(egui::Color32::WHITE, 0.14)
+        } else if resp.hovered() {
+            t.app_bar_hover_button
+        } else {
+            t.app_bar.lerp_to_gamma(egui::Color32::WHITE, 0.04)
+        };
+        ui.painter().rect_filled(tab, t.radius_sm, fill);
+        let ink = if l.active { t.app_bar_text } else { t.app_bar_text.gamma_multiply(0.7) };
+        let text_room = (w - pad - dot_w - close_w - 6.0).max(10.0);
+        let galley = ui.painter().layout(l.name.clone(), font.clone(), ink, text_room);
+        let clip = Rect::from_min_size(pos2(tab.left() + pad, tab.top()), vec2(text_room, tab.height()));
+        ui.painter().with_clip_rect(clip).galley(pos2(tab.left() + pad, tab.center().y - galley.size().y.min(16.0) / 2.0), galley, ink);
+        if l.dirty {
+            ui.painter().circle_filled(pos2(tab.right() - close_w - dot_w / 2.0 - 2.0, tab.center().y), 3.0, ink);
+        }
+        let close_rect = Rect::from_center_size(pos2(tab.right() - close_w / 2.0 - 3.0, tab.center().y), vec2(close_w - 2.0, close_w - 2.0));
+        let close_resp = ui.interact(close_rect, ui.id().with(("project_tab_close", i)), egui::Sense::click());
+        if close_resp.hovered() {
+            ui.painter().rect_filled(close_rect, t.radius_sm, t.app_bar.lerp_to_gamma(egui::Color32::WHITE, 0.2));
+        }
+        let c = close_rect.center();
+        let s = 3.5;
+        let stroke = egui::Stroke::new(1.3, ink);
+        ui.painter().line_segment([pos2(c.x - s, c.y - s), pos2(c.x + s, c.y + s)], stroke);
+        ui.painter().line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], stroke);
+        let state = match &l.path {
+            Some(p) => format!("{}{}", p.display(), if l.dirty { " · unsaved changes" } else { "" }),
+            None if l.dirty => "Not saved yet · unsaved changes".to_string(),
+            None => "Not saved yet".to_string(),
+        };
+        let tip = match blocked {
+            Some(why) if !l.active => format!("{}\n{state}\n{why}", l.name),
+            _ => format!("{}\n{state}", l.name),
+        };
+        if close_resp.on_hover_text(if l.dirty { "Close (asks to save first)" } else { "Close" }).clicked() {
+            close = Some(i);
+        } else if resp.on_hover_text(tip).clicked() {
+            switch_to = Some(i);
+        }
+    }
+    if let Some(i) = close {
+        app.request_close_tab(i);
+    } else if let Some(i) = switch_to {
+        app.switch_tab(i);
+    }
+}
+
+/// The Save / Discard / Cancel question for closing a tab or quitting with unsaved changes.
+/// Button order as everywhere: the primary action at the bottom right, Cancel to its left, the
+/// destructive one apart at the left.
+pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    let Some(prompt) = app.close_prompt else { return };
+    let t = Tokens::get();
+    let (title, message, primary) = match prompt {
+        ClosePrompt::Tab => (
+            "Close project",
+            format!("{} has unsaved changes. Save them before closing?", app.project.name),
+            Some(if app.project.path.is_some() { "Save" } else { "Save…" }),
+        ),
+        ClosePrompt::Quit => {
+            let names = app.dirty_names();
+            (
+                "Quit ScanCraft",
+                format!("Unsaved changes in {}. Quit anyway? Save each project from its tab first to keep them.", names.join(", ")),
+                None,
+            )
+        }
+    };
+    let discard = match prompt {
+        ClosePrompt::Tab => "Discard changes",
+        ClosePrompt::Quit => "Quit without saving",
+    };
+    let mut choice = None;
+    let modal = egui::Modal::new(egui::Id::new("close_prompt")).frame(egui::Frame::NONE.fill(t.dialog_footer).corner_radius(t.radius_xl)).show(ctx, |ui| {
+        ui.set_width(420.0);
+        egui::Frame::NONE.fill(t.dialog_bg).corner_radius(egui::CornerRadius { nw: t.radius_xl, ne: t.radius_xl, sw: 0, se: 0 }).show(ui, |ui| {
+            if kit::dialog_header(ui, "", title, true) {
+                choice = Some("cancel");
+            }
+            egui::Frame::NONE.inner_margin(egui::Margin::symmetric(t.space_12 as i8, t.space_10 as i8)).show(ui, |ui| {
+                kit::note(ui, &message);
+            });
+        });
+        ui.horizontal(|ui| {
+            ui.add_space(t.space_12);
+            if kit::button(ui, discard, kit::Button::Normal, true).clicked() {
+                choice = Some("discard");
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.add_space(t.space_12);
+                if let Some(p) = primary {
+                    if kit::button(ui, p, kit::Button::Primary, true).clicked() {
+                        choice = Some("save");
+                    }
+                    ui.add_space(t.space_6);
+                }
+                if kit::button(ui, "Cancel", kit::Button::Normal, true).clicked() {
+                    choice = Some("cancel");
+                }
+            });
+        });
+        ui.add_space(t.space_10);
+    });
+    if modal.should_close() && choice.is_none() {
+        choice = Some("cancel");
+    }
+    match (prompt, choice) {
+        (_, Some("cancel")) => app.close_prompt = None,
+        (ClosePrompt::Tab, Some("save")) => app.save_then_close(),
+        (ClosePrompt::Tab, Some("discard")) => app.close_active_tab(),
+        (ClosePrompt::Quit, Some("discard")) => {
+            app.close_prompt = None;
+            app.quit_confirmed = true;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        _ => {}
+    }
 }
 
 /// The status bar along the bottom (`status_bar::paint`): the message at the left; tracking,

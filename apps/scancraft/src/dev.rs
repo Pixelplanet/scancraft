@@ -208,7 +208,22 @@ impl Script {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
                 self.waiting_for_shot = Some(arg.to_string());
             }
-            "quit" => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+            "newtab" => app.new_tab(),
+            "tab" => {
+                if let Ok(i) = arg.parse() {
+                    app.switch_tab(i);
+                }
+            }
+            "closetab" => {
+                if let Ok(i) = arg.parse() {
+                    app.request_close_tab(i);
+                }
+            }
+            "quit" => {
+                // A script never waits for the unsaved-changes question.
+                app.quit_confirmed = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+            }
             other => eprintln!("auto: unknown step {other}"),
         }
     }

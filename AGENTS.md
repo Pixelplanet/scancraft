@@ -275,3 +275,8 @@ laser model are not built.
   holes filled, 7 marker sites). App test
   `make_solid_replaces_the_mesh_with_a_closed_solid_and_undo_takes_it_back`; not clicked through
   in the app.
+- 2026-11-25 (second PC, later) — Project tabs (open-issues 3.1, `app_tabs.rs`): New / Open in a
+  new tab, close and quit ask Save / Discard / Cancel, per-tab history; previews no longer mark a
+  project changed. Script steps `newtab`, `tab:N`, `closetab:N` (`--auto`). Parallel agents on
+  `scancraft-mesh` (open-issues 2.2, then Make Solid) and a new `scancraft-segment` crate (SAM 2.1
+  on ONNX Runtime).

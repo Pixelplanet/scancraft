@@ -26,6 +26,9 @@ use crate::worker::{self, WorkerConfig};
 
 #[path = "app_project.rs"]
 mod project_ops;
+#[path = "app_tabs.rs"]
+mod tab_ops;
+pub use tab_ops::{ClosePrompt, ProjectTab};
 
 /// Live capture state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,10 +179,15 @@ fn smoother(strength: usize, keep_edges: f32) -> scancraft_mesh::FeatureSmoother
 }
 
 fn default_project_path() -> String {
+    default_project_path_for(&ProjectInfo::default().name)
+}
+
+/// Where a project called `name` is saved unless the user picks another folder.
+fn default_project_path_for(name: &str) -> String {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
-        .map(|h| std::path::Path::new(&h).join("Documents").join("ScanCraft").join("Untitled project").display().to_string())
-        .unwrap_or_else(|_| "Untitled project".to_string())
+        .map(|h| std::path::Path::new(&h).join("Documents").join("ScanCraft").join(name).display().to_string())
+        .unwrap_or_else(|_| name.to_string())
 }
 
 /// A candidate alignment shown before it is accepted.
@@ -279,10 +287,22 @@ pub struct ScanCraftApp {
     pub active_pass: Option<u32>,
     next_pass_id: u32,
     next_generation: u64,
+    /// Generations of preview layers (see `preview_generation`), far above any geometry one.
+    next_preview: u64,
     pub merged: Option<MergedLayer>,
     pub mesh: Option<MeshLayer>,
     /// Fill Holes: the current mesh's holes.
     pub holes: Option<HolePreview>,
+    /// Open projects; the active one's slot holds a placeholder (its state is in the fields
+    /// above). See `app_tabs.rs`.
+    pub tabs: Vec<ProjectTab>,
+    pub active_tab: usize,
+    /// A Save / Discard / Cancel question waiting for an answer.
+    pub close_prompt: Option<ClosePrompt>,
+    /// Close the active tab once the save that was started for it succeeds.
+    pending_close: bool,
+    /// The user chose to quit without saving: the next close request goes through.
+    pub quit_confirmed: bool,
     pub history: History,
     pub settings: Settings,
     pub project: ProjectInfo,
@@ -400,8 +420,14 @@ impl ScanCraftApp {
             active_pass: None,
             next_pass_id: 1,
             next_generation: 1,
+            next_preview: 1 << 56,
             merged: None,
             holes: None,
+            tabs: vec![ProjectTab::empty(String::new())],
+            active_tab: 0,
+            close_prompt: None,
+            pending_close: false,
+            quit_confirmed: false,
             mesh: None,
             history: History::default(),
             settings: Settings::default(),
@@ -463,6 +489,14 @@ impl ScanCraftApp {
     fn generation(&mut self) -> u64 {
         self.next_generation += 1;
         self.next_generation
+    }
+
+    /// A layer generation for something only shown, not part of the project (previews,
+    /// highlights, outlines): unique like [`generation`](Self::generation) but it does not mark
+    /// the project as changed.
+    pub(crate) fn preview_generation(&mut self) -> u64 {
+        self.next_preview += 1;
+        self.next_preview
     }
 
     pub fn say(&mut self, tone: Tone, message: impl Into<String>) {
@@ -1374,7 +1408,7 @@ impl ScanCraftApp {
         let colour = scancraft_core::ColorRgba::new(colour[0], colour[1], colour[2], 255);
         let points: Vec<_> = project::place(kf.world_points(), &p.meta.transform).into_iter().map(|p| p.with_color(colour)).collect();
         drop(tracker);
-        let g = self.generation();
+        let g = self.preview_generation();
         self.highlight = Some(Highlight { pass, frame, discarded: is_discarded, layer: CloudLayer::new(PointCloud::from_points(points), g) });
     }
 
@@ -1547,6 +1581,10 @@ impl ScanCraftApp {
 
     /// Closes the open tool's card and whatever it was showing.
     pub fn close_tool(&mut self) {
+        // Cancelling Save Project also cancels the close it was opened for.
+        if self.tool == Some(Tool::SaveProject) {
+            self.pending_close = false;
+        }
         self.tool = None;
         self.picking = None;
         self.object_picking = None;
@@ -1728,7 +1766,7 @@ impl ScanCraftApp {
                 }
             }
         }
-        let g = self.generation();
+        let g = self.preview_generation();
         if let Some(h) = self.holes.as_mut() {
             h.outline = Some((key, CloudLayer::new(PointCloud::from_points(points), g)));
         }
@@ -1817,7 +1855,7 @@ impl ScanCraftApp {
         if input.is_empty() {
             return false;
         }
-        let g = self.generation();
+        let g = self.preview_generation();
         self.object_picking = Some(ObjectPicking::new(input, g, target));
         self.segment_picks();
         true
@@ -2195,7 +2233,7 @@ impl ScanCraftApp {
                 JobResult::AlignedAll(outcome) => self.show_align_all(*outcome),
                 JobResult::Refined(outcome) => self.show_refinement(*outcome),
                 JobResult::Isolated { segmentation, picks } => {
-                    let g = self.generation();
+                    let g = self.preview_generation();
                     if let Some(o) = self.object_picking.as_mut() {
                         let kept = segmentation.count(scancraft_fusion::SegmentLabel::Object);
                         let total = o.input.len();
@@ -2225,12 +2263,19 @@ impl ScanCraftApp {
                     self.project.saved_generation = self.next_generation;
                     self.tool = None;
                     self.say(Tone::Success, message);
+                    if std::mem::take(&mut self.pending_close) {
+                        self.close_active_tab();
+                    }
                 }
                 JobResult::Opened(opened) => self.install_project(*opened),
                 JobResult::Imported(scan) => self.install_imported(*scan),
                 JobResult::AddedProject { name, passes } => self.install_added(name, passes),
                 JobResult::Exported(message) => self.say(Tone::Success, message),
-                JobResult::Failed(message) => self.say(Tone::Error, message),
+                JobResult::Failed(message) => {
+                    // A failed save must not close the tab it was for.
+                    self.pending_close = false;
+                    self.say(Tone::Error, message)
+                }
             }
         }
     }
@@ -2720,6 +2765,87 @@ mod tests {
         app.passes[0].edit = Some(Arc::new(PointCloud::from_points(block)));
         let tracker: SharedTracker = Arc::new(std::sync::Mutex::new(scancraft_slam::Tracker::new()));
         assert!(app.seed_tracker(&tracker), "a cleaned pass gave no starting model");
+    }
+
+    #[test]
+    fn new_project_opens_a_tab_and_keeps_the_open_one() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.project.name = "Bracket".into();
+        let points = app.passes[0].layer.len();
+        assert!(app.dirty(), "an unsaved scan is a change");
+        app.new_tab();
+        assert_eq!(app.tabs.len(), 2);
+        assert_eq!(app.active_tab, 1);
+        assert!(app.passes.is_empty() && !app.dirty() && app.history.undo_label().is_none(), "the new tab is empty");
+        assert_ne!(app.project.name, "Bracket");
+        let labels = app.tab_labels();
+        assert!(labels[0].name == "Bracket" && labels[0].dirty && !labels[0].active);
+        // Back to the first tab: its scan, history and unsaved state are all there.
+        app.switch_tab(0);
+        assert_eq!(app.passes.len(), 1);
+        assert_eq!(app.passes[0].layer.len(), points);
+        assert!(app.dirty() && app.project.name == "Bracket");
+    }
+
+    #[test]
+    fn closing_a_tab_with_unsaved_changes_asks_first() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.new_tab();
+        // The empty tab closes at once.
+        app.request_close_tab(1);
+        assert_eq!(app.tabs.len(), 1);
+        assert!(app.close_prompt.is_none() && app.passes.len() == 1);
+        // The one with a scan asks; Cancel keeps it, Discard closes it.
+        app.request_close_tab(0);
+        assert_eq!(app.close_prompt, Some(ClosePrompt::Tab));
+        app.close_prompt = None;
+        assert_eq!(app.passes.len(), 1);
+        app.request_close_tab(0);
+        app.close_active_tab();
+        assert!(app.passes.is_empty() && app.tabs.len() == 1, "the last tab leaves an empty project");
+        assert!(!app.any_dirty());
+    }
+
+    #[test]
+    fn save_and_close_closes_only_after_saving() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.new_tab();
+        app.switch_tab(0);
+        let dir = temp_dir("tab-save");
+        app.project.path = Some(dir.clone());
+        app.request_close_tab(0);
+        app.save_then_close();
+        finish_job(&mut app);
+        assert!(dir.join(scancraft_io::project::PROJECT_FILE).is_file(), "saved");
+        assert_eq!(app.tabs.len(), 1, "closed after the save");
+        assert!(app.passes.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tabs_cannot_switch_while_a_job_runs() {
+        let mut app = app();
+        app.new_tab();
+        app.busy = Some("Merging".into());
+        app.switch_tab(0);
+        assert_eq!(app.active_tab, 1);
+        app.busy = None;
+        app.switch_tab(0);
+        assert_eq!(app.active_tab, 0);
+    }
+
+    #[test]
+    fn previews_do_not_mark_the_project_changed() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.project.saved_generation = app.next_generation;
+        assert!(!app.dirty());
+        let _ = app.preview_generation();
+        app.refresh_holes();
+        assert!(!app.dirty(), "showing something is not a change");
     }
 
     #[test]

@@ -99,6 +99,12 @@ impl eframe::App for ScanCraft {
         if let Some(script) = self.script.as_mut().filter(|s| s.active()) {
             script.tick(&mut self.app, &ctx);
         }
+        // Quitting with unsaved projects asks first.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.app.quit_confirmed && self.app.any_dirty() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.app.close_prompt = Some(app::ClosePrompt::Quit);
+        }
+        ui_shell::close_prompt(&mut self.app, &ctx);
         ui_shell::app_bar(&mut self.app, ui);
         ui_shell::status_bar(&mut self.app, ui);
         ui_viewport::central(&mut self.app, ui);
