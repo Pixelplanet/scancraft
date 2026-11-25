@@ -3623,6 +3623,157 @@ mod tests {
         assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
     }
 
+    #[test]
+    fn opened_project_with_rgb_keyframes_rebuilds_for_ai_segment() {
+        let dir = temp_dir("ai_scene_open").join("desk-scene");
+        let bp = scancraft_core::BackProjection::new(150.0, 420.0);
+        let mut pts = Vec::new();
+        let mut kfs = Vec::new();
+        for i in 0..3u64 {
+            let yaw = (i as f32) * 0.4;
+            let frame = scancraft_driver::mock::MockDevice::render_synthetic_frame(160, 128, yaw, i * 100);
+            let cam = frame.color.camera.clone().unwrap();
+            let cloud = frame.depth.to_point_cloud_with(&bp);
+            let mat = frame.sensor_pose.to_mat4();
+            for mut p in cloud.points {
+                p.position = mat.transform_point3(Vec3::from(p.position)).to_array();
+                p.normal = (frame.sensor_pose.rotation * Vec3::from(p.normal)).normalize_or_zero().to_array();
+                pts.push(p);
+            }
+            kfs.push(scancraft_color::RgbKeyframe::new(i, &frame.color, cam, frame.sensor_pose, 80.0, i).unwrap());
+        }
+        let fused = scancraft_fusion::VoxelFilter::new(1.5).filter(&PointCloud::from_points(pts));
+        let pass = crate::project::StoredPass {
+            id: 1,
+            name: "Desk Scene".into(),
+            frames: 3,
+            visible: true,
+            meta: crate::project::PassMeta {
+                alignment: AlignState::Reference,
+                origin: crate::project::PassOrigin::File { source: "synthetic-desk-scene".into() },
+                ..crate::project::PassMeta::new(scancraft_driver::ScanConfig::default(), None, PassStart::Moved)
+            },
+            keyframes: Vec::new(),
+            surface: Some(Arc::new(fused)),
+            edit: None,
+            rgb_keyframes: kfs,
+            mask: None,
+        };
+        let stored = crate::project::StoredProject {
+            name: "desk-scene".into(),
+            reference: Some(1),
+            next_pass_id: 2,
+            passes: vec![pass],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        crate::project::save(&dir, &stored).unwrap();
+
+        let mut app = app();
+        app.open_project(dir.clone());
+        finish_job(&mut app);
+        assert_eq!(app.passes.len(), 1);
+        assert!(app.passes[0].is_fixed());
+        assert_eq!(app.passes[0].rgb_keyframes.len(), 3);
+        let input = Arc::new(app.passes[0].source().editable().unwrap());
+        let picking = crate::ai_segment::AiPicking::from_pass(
+            app.passes[0].id,
+            app.passes[0].name.clone(),
+            input,
+            app.passes[0].meta.transform,
+            &app.passes[0].rgb_keyframes,
+        )
+        .unwrap();
+        assert_eq!(picking.keyframes.len(), 3);
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
+    #[test]
+    #[ignore = "requires SAM 2.1 models + ONNX Runtime DirectML/CPU binaries"]
+    fn sam21_isolates_vase_in_multi_object_desk_scene() {
+        let dir = temp_dir("ai_scene_sam21").join("desk-scene");
+        let bp = scancraft_core::BackProjection::new(150.0, 420.0);
+        let mut pts = Vec::new();
+        let mut kfs = Vec::new();
+        let views = 18usize;
+        for i in 0..views {
+            let yaw = (i as f32) * std::f32::consts::TAU / (views as f32);
+            let frame = scancraft_driver::mock::MockDevice::render_synthetic_frame(640, 512, yaw, (i as u64) * 100);
+            let cam = frame.color.camera.clone().unwrap();
+            let cloud = frame.depth.to_point_cloud_with(&bp);
+            let mat = frame.sensor_pose.to_mat4();
+            for mut p in cloud.points {
+                p.position = mat.transform_point3(Vec3::from(p.position)).to_array();
+                p.normal = (frame.sensor_pose.rotation * Vec3::from(p.normal)).normalize_or_zero().to_array();
+                pts.push(p);
+            }
+            kfs.push(scancraft_color::RgbKeyframe::new(i as u64, &frame.color, cam, frame.sensor_pose, 80.0, i as u64).unwrap());
+        }
+        let fused = scancraft_fusion::VoxelFilter::new(1.0).filter(&PointCloud::from_points(pts));
+        let pass = crate::project::StoredPass {
+            id: 1,
+            name: "Desk Scene".into(),
+            frames: views as u64,
+            visible: true,
+            meta: crate::project::PassMeta {
+                alignment: AlignState::Reference,
+                origin: crate::project::PassOrigin::File { source: "synthetic-desk-scene".into() },
+                ..crate::project::PassMeta::new(scancraft_driver::ScanConfig::default(), None, PassStart::Moved)
+            },
+            keyframes: Vec::new(),
+            surface: Some(Arc::new(fused)),
+            edit: None,
+            rgb_keyframes: kfs,
+            mask: None,
+        };
+        crate::project::save(
+            &dir,
+            &crate::project::StoredProject {
+                name: "desk-scene".into(),
+                reference: Some(1),
+                next_pass_id: 2,
+                passes: vec![pass],
+                merged: None,
+                cleaned: None,
+                mesh: None,
+                settings: serde_json::json!({}),
+            },
+        )
+        .unwrap();
+
+        let mut app = app();
+        app.refresh_ai_status();
+        assert!(app.ai_status.ready, "AI Pack must be installed: {:?}", app.ai_status);
+        app.open_project(dir.clone());
+        finish_job(&mut app);
+
+        let total = app.passes[0].layer.len();
+        let (px, _) = app.passes[0].rgb_keyframes[0].project_world(Vec3::new(0.0, -30.0, 55.0)).unwrap();
+        app.open_tool(Tool::AiSegment);
+        app.add_ai_pick(crate::ai_segment::ImagePick { x: px.x, y: px.y, positive: true });
+        finish_job(&mut app);
+        app.propagate_ai_segment();
+        finish_job(&mut app);
+        app.run_tool(Tool::AiSegment);
+
+        let kept = &app.passes[0].layer.cloud.points;
+        let canister_hits = kept.iter().filter(|p| (p.position[0] - 66.0).hypot(p.position[1] - 14.0) < 22.0 && p.position[2] > 5.0).count();
+        let block_hits = kept.iter().filter(|p| (p.position[0] + 62.0).hypot(p.position[1] + 14.0) < 22.0 && p.position[2] > 5.0).count();
+        let turntable_hits = kept.iter().filter(|p| p.position[2].abs() < 2.0 && p.position[0].hypot(p.position[1]) > 48.0).count();
+        eprintln!(
+            "SAM 2.1 desk scene: kept={} / {} (canister_hits={canister_hits}, block_hits={block_hits}, turntable_hits={turntable_hits})",
+            kept.len(),
+            total
+        );
+        assert!(kept.len() > 20_000 && kept.len() < total / 2, "kept {} of {total}", kept.len());
+        assert!(canister_hits < 50, "cobalt canister leaked {canister_hits} pts");
+        assert!(block_hits < 500, "sage block leaked {block_hits} pts");
+        assert!(turntable_hits < 50, "turntable leaked {turntable_hits} pts");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
+    }
+
     // ------------------------------------------------------------------ orientation
 
     /// A rigid `Transform` from a rotation and a translation.

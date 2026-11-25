@@ -379,3 +379,14 @@ laser model are not built.
   `512-mem2-fp32` (124–128 ms) and `512-mem4-fp32` (144–159 ms) also pass both sequences. Wired live
   capture (`worker.rs` + `ai_pack.rs` + `ui_ai.rs`) to `load_fastest_variant` while keeping 1024 px for
   post-scan `Tool::AiSegment`; release files staged under `%LOCALAPPDATA%\ScanCraft\ai\release-staging\`.
+- 2026-11-25 (second PC, branch `agent/ai-test-scene`) — Multi-object AI segmentation test scene &
+  deferred live-AI todo: upgraded `MockDevice` (`crates/scancraft-driver/src/mock.rs`) to raycast a
+  synchronized Depth + IR + calibrated RGB turntable desk scene (terracotta fluted vase, cobalt-blue
+  canister, sage-green block on a ringed `z = 0` platter, including `rgb_image` in `start_preview`);
+  added `apps/scancraft/examples/make_ai_test_project.rs` to generate a ready-to-open `.scancraft`
+  project outside the repo (`%LOCALAPPDATA%\ScanCraft\ai\test-projects\ai-desk-scene`, 201 452 fused
+  points at 0.8 mm + 18 calibrated `640×512` RGB keyframes); logged deferred live-AI Scan-stage
+  improvements (pre-capture gating, hold on lost mask, reset/exclude controls) as §3.4 in
+  `docs/open-issues.md`. Verified `scancraft-driver` (3), `e2e_pipeline_test` (1), `scancraft` (79),
+  and `#[ignore]` `sam21_isolates_vase_in_multi_object_desk_scene` (1 click keeps 37 093 / 132 060
+  vase points with 0 turntable, 1 canister, and 262 block boundary points).

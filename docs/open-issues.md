@@ -369,3 +369,11 @@ What this needs:
 - Show the current position.
 - Decide whether alignment / transform changes and view changes appear in the timeline. The
   user's words: every action that modified the point cloud.
+
+### 3.4 Live AI masking in Scan stage: pre-capture gating, lost-track hold, and controls
+
+Deferred follow-up to `agent/sam-fast` (after the multi-object test scene in `agent/ai-test-scene`). Live SAM 2.1 depth masking already exists under **Scan -> AI Mask (Experimental)** (`worker.rs`, `ui_ai.rs`, `ui_viewport.rs`), but three gaps remain before it guarantees zero unwanted background points during live scanning:
+
+- **Pre-capture gating / Live Preview prompting:** `preview_worker` does not accept SAM 2.1 clicks yet, and hitting **Start Capture** starts fusing immediately while `latest_ai` is still `None`, so background points are recorded until the user clicks the object in the Colour inset. Gate recording or allow clicking/locking the object mask in Live Preview first.
+- **Hold on lost mask:** in `worker.rs`, if SAM 2.1 loses tracking or dips below `min_iou`, the worker falls back to passing the unmasked depth frame through instead of holding/skipping fusion for that frame, letting background points leak in.
+- **Discoverability and live controls:** surface the live AI toggle more prominently when enabled, add a **Reset mask** button, and support Shift/right-click **Exclude** points in the live Colour view.
