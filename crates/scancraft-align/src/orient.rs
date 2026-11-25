@@ -238,15 +238,62 @@ fn boundary_samples(samples: &[Oriented], index: &Index, radius: f32, gap_deg: f
     out
 }
 
+/// What the open-rim search saw, for diagnosing why a rim was or was not found (see
+/// [`rim_report`]): every check's numbers plus which one rejected the candidate.
+#[derive(Clone, Debug)]
+pub struct RimReport {
+    /// Samples the search ran on (the voxel grid).
+    pub samples: usize,
+    /// Voxel size the samples were taken at, mm.
+    pub voxel_mm: f32,
+    /// Boundary samples found (angular gap in the tangent plane).
+    pub boundary: usize,
+    /// Plane tolerance for inliers and the one-sidedness test, mm.
+    pub tolerance_mm: f32,
+    /// Boundary samples on the best plane found.
+    pub inliers: usize,
+    /// Their share of all boundary samples.
+    pub share: f32,
+    /// RMS distance of the inliers from the best plane, mm.
+    pub rms_mm: f32,
+    /// All samples more than `tolerance_mm` on each side of the plane (before its normal is
+    /// oriented towards the part).
+    pub sides: (usize, usize),
+    /// In-plane spread of the inliers along the two plane axes, mm.
+    pub spread_mm: [f32; 2],
+    /// The part's extent the spreads are compared with, mm.
+    pub extent_mm: f32,
+    /// Which check rejected the rim: "few boundary samples", "share", "one-sided", "spread".
+    pub rejected_by: Option<&'static str>,
+    /// The rim when every check passed.
+    pub rim: Option<Rim>,
+}
+
 /// The open rim: a RANSAC plane through the boundary samples is a rim when it holds at least
-/// half of them (and at least 60), they spread over half the part's extent in two
+/// 30 % of them (and at least 60 — interior holes and ragged scan borders are boundary
+/// samples too and dilute the share), they spread over half the part's extent in two
 /// directions, and nearly all samples lie on one side of it. Its normal points to the part.
-fn find_rim(samples: &[Oriented], index: &Index, extent: f32, voxel: f32, config: &OrientConfig) -> Option<Rim> {
+fn rim_search(samples: &[Oriented], index: &Index, extent: f32, voxel: f32, config: &OrientConfig) -> RimReport {
     let boundary = boundary_samples(samples, index, config.rim_neighbours * voxel, config.gap_deg);
-    if boundary.len() < 60 {
-        return None;
-    }
     let tol = (2.0 * voxel).max(0.005 * extent);
+    let mut report = RimReport {
+        samples: samples.len(),
+        voxel_mm: voxel,
+        boundary: boundary.len(),
+        tolerance_mm: tol,
+        inliers: 0,
+        share: 0.0,
+        rms_mm: 0.0,
+        sides: (0, 0),
+        spread_mm: [0.0; 2],
+        extent_mm: extent,
+        rejected_by: None,
+        rim: None,
+    };
+    if boundary.len() < 60 {
+        report.rejected_by = Some("few boundary samples");
+        return report;
+    }
     let mut rng = Rng::new(71053);
     let mut best: Option<(Plane, Vec<usize>)> = None;
     for _ in 0..300 {
@@ -265,31 +312,61 @@ fn find_rim(samples: &[Oriented], index: &Index, extent: f32, voxel: f32, config
             best = Some((pl, inliers));
         }
     }
-    let (mut pl, inliers) = best?;
-    if inliers.len() < 60 || inliers.len() * 2 < boundary.len() {
-        return None;
-    }
+    let Some((mut pl, inliers)) = best else { return report };
+    report.inliers = inliers.len();
+    report.share = inliers.len() as f32 / boundary.len() as f32;
+    report.rms_mm = (inliers.iter().map(|&i| pl.distance(samples[i].0).powi(2)).sum::<f32>() / inliers.len() as f32).sqrt();
     // Nearly all samples on one side; orient the normal so they are on its +side.
     let below = samples.iter().filter(|(p, _)| pl.distance(*p) < -tol).count();
     let above = samples.iter().filter(|(p, _)| pl.distance(*p) > tol).count();
-    // Nearly all samples on ONE side: the minority side keeps under ~3 %.
+    report.sides = (below, above);
+    // Spread over half the extent in two directions within the plane.
+    let un = if below > above { -pl.normal } else { pl.normal };
+    let u = if un.x.abs() < un.y.abs() { un.cross(Vec3::X) } else { un.cross(Vec3::Y) }.normalize();
+    let v = un.cross(u);
+    let extent_in = |d: Vec3| inliers.iter().map(|&i| samples[i].0.dot(d)).fold((f32::MAX, f32::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
+    let (a, b) = (extent_in(u), extent_in(v));
+    report.spread_mm = [a.1 - a.0, b.1 - b.0];
+    // The checks, in order: share, one-sidedness (the minority side keeps under ~3 %), spread.
+    if inliers.len() < 60 || inliers.len() * 10 < boundary.len() * 3 {
+        report.rejected_by = Some("share");
+        return report;
+    }
     if below.min(above) * 33 > samples.len() {
-        return None;
+        report.rejected_by = Some("one-sided");
+        return report;
     }
     if below > above {
         pl.normal = -pl.normal;
         pl.d = -pl.d;
     }
-    // Spread over half the extent in two directions within the plane.
-    let u = if pl.normal.x.abs() < pl.normal.y.abs() { pl.normal.cross(Vec3::X) } else { pl.normal.cross(Vec3::Y) }.normalize();
-    let v = pl.normal.cross(u);
-    let extent_in = |d: Vec3| inliers.iter().map(|&i| samples[i].0.dot(d)).fold((f32::MAX, f32::MIN), |(lo, hi), t| (lo.min(t), hi.max(t)));
-    let (a, b) = (extent_in(u), extent_in(v));
-    if (a.1 - a.0) < 0.5 * extent || (b.1 - b.0) < 0.5 * extent {
+    if report.spread_mm[0] < 0.5 * extent || report.spread_mm[1] < 0.5 * extent {
+        report.rejected_by = Some("spread");
+        return report;
+    }
+    report.rim = Some(Rim { plane: pl, points: inliers.len(), rms_mm: report.rms_mm, share: report.share });
+    report
+}
+
+fn find_rim(samples: &[Oriented], index: &Index, extent: f32, voxel: f32, config: &OrientConfig) -> Option<Rim> {
+    rim_search(samples, index, extent, voxel, config).rim
+}
+
+/// Runs the open-rim search [`auto_orient`] does (same code path) and reports what it saw:
+/// for diagnosing why a part did or did not stand on its rim. None for fewer than
+/// `config.min_points` points.
+pub fn rim_report(points: &[Oriented], config: &OrientConfig) -> Option<RimReport> {
+    if points.len() < config.min_points {
         return None;
     }
-    let rms_mm = (inliers.iter().map(|&i| pl.distance(samples[i].0).powi(2)).sum::<f32>() / inliers.len() as f32).sqrt();
-    Some(Rim { plane: pl, points: inliers.len(), rms_mm, share: inliers.len() as f32 / boundary.len() as f32 })
+    let extent = crate::cloud::extent(points);
+    if extent < 1e-3 {
+        return None;
+    }
+    let voxel = extent / config.voxel_div;
+    let samples = downsample(points, voxel);
+    let index = Index::new(samples.iter().map(|p| p.0).collect());
+    Some(rim_search(&samples, &index, extent, voxel, config))
 }
 
 /// Auto-orients a part to its own faces: returns the `new <- old` transform that sits it
@@ -555,6 +632,43 @@ mod tests {
         assert_eq!(result2.up_source, UpSource::Rim);
         let dz2 = flipped.iter().take(outside.len()).map(|&(p, _)| p).sum::<Vec3>() / outside.len() as f32;
         assert!(result2.transform.transform_point3(dz2).z > 0.0, "dome down after flip");
+    }
+
+    #[test]
+    fn a_shell_part_with_holes_in_the_dome_still_stands_on_its_rim() {
+        // Hole borders are boundary samples like the rim and dilute its share (real scans
+        // look like this): the rim must still be found when it holds well under half.
+        let (outside, inside) = synthetic::shell_part(0.9, 3.0);
+        let (a, b, c) = (synthetic::SHELL_AXES.x, synthetic::SHELL_AXES.y, synthetic::SHELL_AXES.z);
+        let dome = |phi_deg: f32, theta_deg: f32| {
+            let (p, t) = (phi_deg.to_radians(), theta_deg.to_radians());
+            Vec3::new(a * p.cos() * t.cos(), b * p.cos() * t.sin(), c * p.sin())
+        };
+        let mut holes = Vec::new();
+        for k in 0..8 {
+            holes.push(dome(35.0, k as f32 * 45.0));
+            holes.push(dome(60.0, k as f32 * 45.0 + 22.5));
+        }
+        for k in 0..4 {
+            holes.push(dome(80.0, k as f32 * 90.0 + 45.0));
+        }
+        let r = 12.0;
+        let kept_out: Vec<Oriented> = outside.iter().copied().filter(|(p, _)| holes.iter().all(|h| p.distance(*h) > r)).collect();
+        let kept_in: Vec<Oriented> = inside.iter().copied().filter(|(p, _)| holes.iter().all(|h| p.distance(*h) > r)).collect();
+        let mut part: Vec<Oriented> = kept_out.iter().chain(kept_in.iter()).copied().collect();
+        let tilt = rigid(Quat::from_rotation_y(0.45) * Quat::from_rotation_x(-0.3) * Quat::from_rotation_z(0.2), Vec3::new(60.0, -40.0, 150.0));
+        part = moved(&part, &tilt);
+        let report = rim_report(&part, &OrientConfig::default()).expect("a report");
+        eprintln!("holed shell: {} samples, {} boundary, {} rim inliers (share {:.2}), rms {:.2} mm, rejected {:?}", report.samples, report.boundary, report.inliers, report.share, report.rms_mm, report.rejected_by);
+        let result = auto_orient(&part, &OrientConfig::default()).expect("oriented");
+        let rim = result.rim.as_ref().expect("a rim under the hole borders");
+        eprintln!("  up {:?} {}, rim plane n {} d {:.2}", result.up_source, result.up, rim.plane.normal, rim.plane.d);
+        assert_eq!(result.up_source, UpSource::Rim);
+        let rn = result.transform.rotation * rim.plane.normal;
+        assert!(rn.angle_between(Vec3::Z).to_degrees() < 1.0, "rim normal {rn}");
+        // The dome is above the rim still.
+        let dz = part.iter().take(kept_out.len()).map(|&(p, _)| p).sum::<Vec3>() / kept_out.len() as f32;
+        assert!(result.transform.transform_point3(dz).z > 0.0);
     }
 
     #[test]

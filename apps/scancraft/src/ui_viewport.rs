@@ -50,9 +50,6 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         frame.body = [t.body.r() as f32 / 255.0, t.body.g() as f32 / 255.0, t.body.b() as f32 / 255.0];
         frame.edge = [t.body_edge.r() as f32 / 255.0, t.body_edge.g() as f32 / 255.0, t.body_edge.b() as f32 / 255.0, 1.0];
         let bbox = app.data_bbox();
-        if let Some(b) = &bbox {
-            frame.height_range = [b.min.z, b.max.z.max(b.min.z + 1.0)];
-        }
         // Passes drawn where a proposal would put them instead of where they are.
         let mut previewed: Vec<u32> = app.align_preview.as_ref().map(|a| a.pass).into_iter().collect();
         if let Some(pp) = &app.poses_preview {
@@ -67,18 +64,34 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         let datuming = app.tool == Some(crate::model::Tool::Datums) && app.datum_picking.is_some();
         let scaling = matches!(app.tool, Some(crate::model::Tool::Scale(_))) && app.scale_picking.is_some();
         let exclusive = app.orient_preview.is_some() || datuming || scaling;
+        // An orientation tool shows its own layer in another frame: the grid and the height
+        // ramp follow it, not the project's (old-frame) data.
+        let shown_bbox = if let Some(o) = &app.orient_preview {
+            Some(o.layer.cloud.bbox)
+        } else if datuming {
+            app.datum_picking.as_ref().map(|d| d.layer.cloud.bbox)
+        } else if scaling {
+            app.scale_picking.as_ref().map(|s| s.layer.cloud.bbox)
+        } else {
+            bbox
+        };
+        if let Some(b) = &shown_bbox {
+            frame.height_range = [b.min.z, b.max.z.max(b.min.z + 1.0)];
+        }
         if let Some(o) = &app.orient_preview {
-            frame.point_shading = PointShading::Vertex;
+            // Lit like the model normally is, so the proposal can be judged.
+            frame.point_shading = app.point_shading;
             frame.points.push(PointLayer { generation: o.layer.generation, points: Arc::clone(&o.layer.gpu), overlay: false });
         } else if datuming {
+            // The datum tints bake light into the colours, so they keep their own colours.
             frame.point_shading = PointShading::Vertex;
             if let Some(d) = &app.datum_picking {
                 frame.points.push(PointLayer { generation: d.layer.generation, points: Arc::clone(&d.layer.gpu), overlay: false });
             }
         } else if scaling {
-            let target = app.scale_picking.as_ref().map(|s| s.pass);
-            if let Some(p) = app.passes.iter().find(|p| Some(p.id) == target) {
-                frame.points.push(PointLayer { generation: p.layer.generation, points: Arc::clone(&p.layer.gpu), overlay: false });
+            frame.point_shading = app.point_shading;
+            if let Some(s) = &app.scale_picking {
+                frame.points.push(PointLayer { generation: s.layer.generation, points: Arc::clone(&s.layer.gpu), overlay: false });
             }
         } else if isolating {
             frame.point_shading = PointShading::Vertex;
@@ -142,7 +155,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
             frame.mesh = Some(GpuMeshLayer { generation: m.generation, mesh: Arc::clone(&m.gpu), faces: true, edges: app.show_edges });
         }
         if app.show_grid {
-            frame.grid = Some(GridSpec::around(bbox.as_ref(), rgba(t.grid, 255), rgba(t.grid_major, 255), rgba(t.axis_x.gamma_multiply(0.7), 255), rgba(t.axis_y.gamma_multiply(0.7), 255)));
+            frame.grid = Some(GridSpec::around(shown_bbox.as_ref(), rgba(t.grid, 255), rgba(t.grid_major, 255), rgba(t.axis_x.gamma_multiply(0.7), 255), rgba(t.axis_y.gamma_multiply(0.7), 255)));
         }
         let cards = Cards::new(view);
         let picking = app.picking.is_some() && matches!(app.tool, Some(crate::model::Tool::PointPairs(_)));

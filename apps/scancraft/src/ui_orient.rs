@@ -21,6 +21,9 @@ pub fn orient_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     kit::row(ui, "Main axis", |ui| kit::value_text(ui, if preview.result.axis.is_some() { "found" } else { "—" }, preview.result.axis.is_none()));
     let rim = preview.result.rim.as_ref().map(|r| format!("{} points · {:.2} mm", r.points, r.rms_mm)).unwrap_or_else(|| "—".to_string());
     kit::row(ui, "Rim", |ui| kit::value_text(ui, &rim, preview.result.rim.is_none()));
+    if preview.result.faces.len() <= 1 && preview.result.axis.is_none() && preview.result.rim.is_none() {
+        kit::status_line(ui, "Little to go on: check the result, or use Datums", t.warning);
+    }
     ui.add_space(t.space_4);
     kit::note_with_tip(
         ui,
@@ -106,7 +109,7 @@ pub fn datums_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     if let Some((radius, rms, _n, onto, flip)) = axis {
         kit::row(ui, "Axis", |ui| {
             ui.horizontal(|ui| {
-                kit::value_text(ui, &format!("⌀ {:.2} mm · {:.2} mm RMS", radius * 2.0, rms), false);
+                kit::value_text(ui, &format!("Dia. {:.2} mm · {:.2} mm RMS", radius * 2.0, rms), false);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if kit::close_button(ui, "Remove the axis").clicked() {
                         remove = Some(DatumKind::Axis);

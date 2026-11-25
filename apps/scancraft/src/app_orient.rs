@@ -14,7 +14,7 @@ use scancraft_align::{
     compose, datum_frame, scale_from_lengths,
 };
 use scancraft_core::{BoundingBox, Point3D, PointCloud, Transform};
-use scancraft_render::GpuPoint;
+use scancraft_render::{CameraPreset, GpuPoint};
 
 use super::{Capture, ScanCraftApp, Tone};
 use crate::model::{CloudLayer, JobResult, MergedLayer, MeshLayer, Node, Stage, Tool, tinted_points};
@@ -82,18 +82,36 @@ pub struct ScalePicking {
     /// Click candidates: a spread of the pass's layer points, in the frame the layer is drawn
     /// in (its own for an unaligned pass, the project's for a placed one).
     pub targets: Arc<Vec<Vec3>>,
+    /// The pass drawn while the tool is open: a copy, so imported points whose file had no
+    /// normals get estimated ones (the stored [0, 0, 1] placeholders shade flat).
+    pub layer: CloudLayer,
 }
 
 /// The project-frame points orientation tools work on: the merged model's when there is one,
 /// else every placed pass's layer points (both are already placed). None when there are none.
+/// Points loaded from a file without normals carry [0, 0, 1] everywhere (a saved merged.ply
+/// has none): auto-orient's evidence, the datum fits' normal gates and lit shading all need
+/// real ones, so estimate them then. An in-session merge keeps its own.
+fn with_real_normals(mut points: Vec<Point3D>) -> Vec<Point3D> {
+    let missing = points.iter().filter(|p| p.normal == [0.0, 0.0, 1.0] || p.normal == [0.0; 3]).count();
+    if points.is_empty() || missing * 20 <= points.len() * 19 {
+        return points;
+    }
+    let positions: Vec<[f32; 3]> = points.iter().map(|p| p.position).collect();
+    for (p, n) in points.iter_mut().zip(scancraft_io::normals::estimate_normals(&positions, &scancraft_io::NormalEstimation::default())) {
+        p.normal = n;
+    }
+    points
+}
+
 fn orient_points(app: &ScanCraftApp) -> Option<(&'static str, Vec<Point3D>)> {
     if let Some(m) = &app.merged {
         if m.layer.len() > 0 {
-            return Some(("Merged model", m.layer.cloud.points.clone()));
+            return Some(("Merged model", with_real_normals(m.layer.cloud.points.clone())));
         }
     }
     let points: Vec<Point3D> = app.passes.iter().filter(|p| p.meta.alignment.is_placed()).flat_map(|p| p.layer.cloud.points.iter().copied()).collect();
-    (!points.is_empty()).then_some(("Scan passes", points))
+    (!points.is_empty()).then_some(("Scan passes", with_real_normals(points)))
 }
 
 fn oriented(p: &(Vec3, Vec3)) -> Point3D {
@@ -275,17 +293,20 @@ impl ScanCraftApp {
         let sample: Vec<Point3D> = points.into_iter().step_by(stride).collect();
         let g = self.preview_generation();
         let layer = CloudLayer::new(PointCloud::from_points(project::place(sample, &result.transform)), g);
+        // With at most one face direction and no axis or rim the evidence is thin: warn.
+        let weak = result.faces.len() <= 1 && result.axis.is_none() && result.rim.is_none();
         self.clear_previews();
         self.close_tool();
         let bbox = layer.cloud.bbox;
         self.orient_preview = Some(OrientPreview { result, source, layer });
         self.stage = Stage::Align;
         // The preview shows the model where it would sit: frame the camera on that, not on
-        // where the data still is.
+        // where the data still is, and look at the floor from the usual angle.
         if !bbox.is_empty() {
             self.camera.fit_bounding_box(&bbox);
+            self.camera.set_view_preset(CameraPreset::Isometric);
         }
-        self.say(Tone::Success, format!("Found an orientation from the {up} · check it, then Accept"));
+        self.say(if weak { Tone::Warning } else { Tone::Success }, format!("Found an orientation from the {up} · check it, then Accept"));
     }
 
     /// Accepts the proposed orientation: the whole project moves into it (undoable).
@@ -637,7 +658,10 @@ impl ScanCraftApp {
         let Some(p) = self.passes.iter().find(|p| p.id == id) else { return false };
         let stride = (p.layer.len() / 150_000).max(1);
         let targets = Arc::new(p.layer.cloud.points.iter().step_by(stride).map(|p| Vec3::from(p.position)).collect());
-        self.scale_picking = Some(ScalePicking { pass: id, pairs: Vec::new(), targets });
+        let points = with_real_normals(p.layer.cloud.points.clone());
+        let g = self.preview_generation();
+        let layer = CloudLayer::new(PointCloud::from_points(points), g);
+        self.scale_picking = Some(ScalePicking { pass: id, pairs: Vec::new(), targets, layer });
         true
     }
 

@@ -57,7 +57,7 @@ pub use graph::{align_all, ComposedEdge, CycleCheck, EdgeState, GraphConfig, Gra
 pub use markers::{align_markers, Marker, MarkerAlignment, MarkerPlacement};
 pub use merge::{merge, MergeConfig, MergeInput, MergeResult};
 pub use horn::{fit_pairs, PairFit, PairSpread};
-pub use orient::{auto_orient, AutoOrient, FaceDirection, OrientConfig, Rim, UpSource};
+pub use orient::{auto_orient, rim_report, AutoOrient, FaceDirection, OrientConfig, Rim, RimReport, UpSource};
 pub use pairs::align_point_pairs;
 pub use quality::{evaluate, Quality, Shell, Verdict};
 pub use refine::{refine_global, refine_shell, RefineConfig, RefineEdge, RefineInput, RefineResult, ShellConfig, ShellFit};
