@@ -295,3 +295,30 @@ fn implicit_surface_of_an_open_patch_stays_open_and_on_the_data() {
     assert!(max_distance_to_cloud(&mesh, &cloud) < 1.0);
     assert!(a.surface_area_mm2 > 1600.0 && a.surface_area_mm2 < 2200.0, "{a:?}");
 }
+
+#[test]
+fn implicit_surface_drops_stray_points_up_to_the_support_radius() {
+    // A noisy plane (0.4 mm spacing, ±0.05 mm) with single stray points 0.3–1.4 mm above it, the
+    // range where counting a point in its own neighbourhood used to hide the far ones.
+    let mut c = PointCloud::new();
+    let k = 100;
+    for i in 0..=k {
+        for j in 0..=k {
+            let idx = (i * (k + 1) + j) as usize;
+            c.push(pt(Vec3::new(i as f32 * 0.4, j as f32 * 0.4, jitter(idx, 7, 0.05)), Vec3::Z));
+        }
+    }
+    let mut strays = 0;
+    for (n, off) in [0.3f32, 0.5, 0.7, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4].iter().enumerate() {
+        for m in 0..6 {
+            let (x, y) = (4.0 + 5.0 * m as f32 + 0.13, 4.0 + 3.5 * n as f32 + 0.17);
+            c.push(pt(Vec3::new(x, y, *off), Vec3::Z));
+            strays += 1;
+        }
+    }
+    let cfg = crate::SurfaceConfig { cell_mm: 0.5, detail: 3.75, ..Default::default() };
+    let (mesh, stats) = crate::implicit::reconstruct(&c, &cfg);
+    assert!(stats.removed_outliers >= strays, "{} of {strays} strays removed: {stats:?}", stats.removed_outliers);
+    let worst = mesh.vertices.iter().filter(|v| v.position[0] > 2.0 && v.position[0] < 38.0 && v.position[1] > 2.0 && v.position[1] < 38.0).map(|v| v.position[2].abs()).fold(0.0f32, f32::max);
+    assert!(worst < 0.08, "a bump of {worst} mm is left where a stray point was");
+}

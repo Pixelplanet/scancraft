@@ -497,7 +497,20 @@ impl ScanCraftApp {
     /// holds it. Returns whether anything was dropped. (Each pass's cleaning is in its own frame
     /// and moves with it.)
     pub fn invalidate_derived(&mut self, reason: &str) -> bool {
-        let dropped: Vec<&str> = [self.mesh.is_some().then_some("mesh")].into_iter().flatten().collect();
+        self.invalidate_results(reason, false)
+    }
+
+    /// [`invalidate_derived`](Self::invalidate_derived), and with `merged` also the merged
+    /// model (named in the same message).
+    fn invalidate_results(&mut self, reason: &str, merged: bool) -> bool {
+        let merged = merged && self.merged.is_some();
+        let dropped: Vec<&str> = [merged.then_some("merged model"), self.mesh.is_some().then_some("mesh")].into_iter().flatten().collect();
+        if merged {
+            self.merged = None;
+            if self.selection == Some(Node::Merged) {
+                self.selection = None;
+            }
+        }
         self.mesh = None;
         // An open Isolate Object tool works on a copy of the old points, placed as they were.
         if self.object_picking.take().is_some() && self.tool == Some(Tool::IsolateObject) {
@@ -910,8 +923,13 @@ impl ScanCraftApp {
                             let mut meta = PassMeta::new(scan_config.clone(), device, if first { PassStart::Moved } else { self.next_start });
                             meta.alignment = if first {
                                 AlignState::Reference
-                            } else if meta.start == PassStart::SamePosition && self.seed_tracker(&tracker) {
-                                AlignState::Locating
+                            } else if meta.start == PassStart::SamePosition {
+                                if self.seed_tracker(&tracker) {
+                                    AlignState::Locating
+                                } else {
+                                    self.show_toast("Same Position: the placed passes could not be loaded as a starting model; this pass starts unaligned (Align All places it afterwards)");
+                                    AlignState::Unaligned
+                                }
                             } else {
                                 AlignState::Unaligned
                             };
@@ -1643,7 +1661,13 @@ impl ScanCraftApp {
 
     /// Puts Clean results in place: each pass gets its cleaned surface, the merged model its new
     /// cloud. Shown and hidden stay as they were.
+    ///
+    /// Results made from the old surfaces go (the caller has pushed the undo snapshot that still
+    /// holds them): the merged model when a pass it was made from changed, and the mesh in any
+    /// case (it was made from the passes or from the merged model before this cleaning).
     fn apply_cleaned(&mut self, passes: Vec<(u32, PointCloud)>, merged: Option<PointCloud>) {
+        let changed: Vec<u32> = passes.iter().map(|(id, _)| *id).collect();
+        self.invalidate_after_cleaning(&changed, "Cleaning changed the scans");
         for (id, own) in passes {
             let g = self.generation();
             let Some(p) = self.passes.iter_mut().find(|p| p.id == id) else { continue };
@@ -1705,6 +1729,13 @@ impl ScanCraftApp {
         }
     }
 
+    /// Drops what was made from the passes in `changed` before they changed: the merged model if
+    /// it contains one of them, and the mesh.
+    fn invalidate_after_cleaning(&mut self, changed: &[u32], reason: &str) {
+        let merged_stale = self.merged.as_ref().is_some_and(|m| changed.iter().any(|id| m.passes.contains(id)));
+        self.invalidate_results(reason, merged_stale);
+    }
+
     /// Whether any shown pass has been cleaned (Reset Cleaning has something to do).
     pub fn can_reset_cleaning(&self) -> bool {
         self.passes.iter().any(|p| p.layer.visible && p.is_cleaned())
@@ -1738,11 +1769,15 @@ impl ScanCraftApp {
             };
             let g = self.generation();
             let p = &mut self.passes[i];
+            let visible = p.layer.visible;
             p.layer = CloudLayer::new(PointCloud::from_points(project::place(own, &p.meta.transform)), g);
+            p.layer.visible = visible;
             p.mask = isolation::new_cache();
             p.tinted = None;
             names.push(p.name.clone());
         }
+        let reset: Vec<u32> = self.passes.iter().filter(|p| ids.contains(&p.id) && names.contains(&p.name)).map(|p| p.id).collect();
+        self.invalidate_after_cleaning(&reset, "Reset Cleaning changed the scans");
         self.say(Tone::Normal, format!("Reset the cleaning of {}", names.join(", ")));
     }
 
@@ -2539,6 +2574,77 @@ mod tests {
         app.passes[1].layer.visible = false;
         app.reset_cleaning();
         assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
+    }
+
+    /// Two imported scans, a merged model made from both and a mesh.
+    fn merged_and_meshed() -> ScanCraftApp {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        let g = app.generation();
+        app.merged = Some(MergedLayer::new(PointCloud::from_points(table_and_block()), g, vec![1, 2], "Merged".into()));
+        let mesh = Mesh::default();
+        let analysis = Mesher::analyze(&mesh);
+        app.mesh = Some(MeshLayer::new(mesh, analysis, g + 1));
+        app
+    }
+
+    #[test]
+    fn cleaning_a_pass_drops_the_merged_model_and_mesh_made_from_it() {
+        let mut app = merged_and_meshed();
+        app.merged.as_mut().unwrap().layer.visible = false;
+        app.passes[1].layer.visible = false;
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        assert!(app.passes[0].is_cleaned());
+        assert!(app.merged.is_none() && app.mesh.is_none(), "results made before the cleaning are still there");
+        assert!(app.current_toast().is_some_and(|t| t.contains("merged model") && t.contains("Undo")));
+        app.undo();
+        assert!(app.merged.is_some() && app.mesh.is_some() && !app.passes[0].is_cleaned(), "Undo brings them back");
+        // Reset Cleaning changes the pass again: the results made from the cleaned pass go too.
+        app.redo();
+        assert!(app.passes[0].is_cleaned() && app.merged.is_none());
+        let g = app.generation();
+        app.merged = Some(MergedLayer::new(PointCloud::from_points(table_and_block()), g, vec![1, 2], "Merged".into()));
+        app.reset_cleaning_of(&[1]);
+        assert!(!app.passes[0].is_cleaned() && app.merged.is_none());
+        assert!(!app.passes[1].layer.visible, "Reset Cleaning showed a hidden pass");
+    }
+
+    #[test]
+    fn cleaning_only_the_merged_model_keeps_it_and_drops_the_mesh() {
+        let mut app = merged_and_meshed();
+        for p in &mut app.passes {
+            p.layer.visible = false;
+        }
+        assert_eq!(app.clean_targets(), vec![CleanTarget::Merged]);
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        let m = app.merged.as_ref().expect("the cleaned merged model stays");
+        assert!(m.layer.len() < table_and_block().len());
+        assert!(app.mesh.is_none(), "the mesh was made from the merged model before it was cleaned");
+    }
+
+    #[test]
+    fn a_cleaned_pass_is_not_dropped_from_a_merge_it_is_not_in() {
+        let mut app = merged_and_meshed();
+        app.merged.as_mut().unwrap().passes = vec![2];
+        app.merged.as_mut().unwrap().layer.visible = false;
+        app.passes[1].layer.visible = false;
+        app.run_tool(Tool::RemovePlane);
+        finish_job(&mut app);
+        assert!(app.merged.is_some(), "the merged model does not contain the cleaned pass");
+    }
+
+    #[test]
+    fn a_cleaned_pass_seeds_a_same_position_pass() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        // Cleaned: only the block is left.
+        let block: Vec<Point3D> = table_and_block().into_iter().filter(|p| p.position[2] > 0.5).collect();
+        app.passes[0].edit = Some(Arc::new(PointCloud::from_points(block)));
+        let tracker: SharedTracker = Arc::new(std::sync::Mutex::new(scancraft_slam::Tracker::new()));
+        assert!(app.seed_tracker(&tracker), "a cleaned pass gave no starting model");
     }
 
     #[test]

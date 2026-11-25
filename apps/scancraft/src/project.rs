@@ -337,9 +337,14 @@ pub fn seed_from(passes: &[(Transform, &Tracker)]) -> (Vec<(Vec3, Vec3)>, Vec<Se
     for (t, tracker) in passes {
         let m = t.to_mat4();
         points.extend(tracker.fused_surfels().iter().map(|s| (m.transform_point3(s.position), t.rotation * s.normal)));
-        views.extend(tracker.keyframes().iter().filter(|k| !k.discarded).map(|k| SeedView { pose: scancraft_align::compose(t, &k.pose), imu: k.imu(), centroid: k.centroid() }));
+        views.extend(seed_views(t, tracker));
     }
     (points, views)
+}
+
+/// A pass's kept keyframes as seed views in the project frame.
+pub fn seed_views(t: &Transform, tracker: &Tracker) -> Vec<SeedView> {
+    tracker.keyframes().iter().filter(|k| !k.discarded).map(|k| SeedView { pose: scancraft_align::compose(t, &k.pose), imu: k.imu(), centroid: k.centroid() }).collect()
 }
 
 // ---------------------------------------------------------------------- persistence

@@ -1,8 +1,8 @@
 # Open issues and requested features (2026-11-24)
 
 Collected after merging branch `feature/clean-per-pass-meshing` into `main` (commit 3151b3d:
-per-pass cleaning, meshing rework, Fill Holes, file dialogs). Nothing on this list is fixed
-yet. Sections 1 and 2 come from a review and a measurement run on the original PC. Section 3
+per-pass cleaning, meshing rework, Fill Holes, file dialogs). **Fixed on 2026-11-25: 1.1, 1.2,
+1.3 and 1.6** (marked below); the rest is open. Sections 1 and 2 come from a review and a measurement run on the original PC. Section 3
 is what the user found by hand in the app. Line numbers refer to commit 3151b3d.
 
 Suggested order for the next session: bugs 1.1 and 1.2 first (small, and they corrupt
@@ -14,6 +14,14 @@ Three reviewers read the merged commit, and each finding was then checked by a s
 that tried to refute it. Only the findings that survived are listed.
 
 ### 1.1 Cleaning or resetting a pass leaves the merged model and the mesh stale (high)
+
+**Fixed 2026-11-25.** `apply_cleaned` and `reset_cleaning_of` call `invalidate_after_cleaning`:
+the merged model goes when it contains a changed pass, the mesh goes in any case, one toast
+names both and Undo restores them; cleaning only the merged model keeps it and drops the mesh.
+Reset Cleaning also keeps a hidden pass hidden now. Tests:
+`cleaning_a_pass_drops_the_merged_model_and_mesh_made_from_it`,
+`cleaning_only_the_merged_model_keeps_it_and_drops_the_mesh`,
+`a_cleaned_pass_is_not_dropped_from_a_merge_it_is_not_in`.
 
 `apply_cleaned` (`apps/scancraft/src/app.rs:1646`) and `reset_cleaning_of` (`app.rs:1720`)
 replace a pass's surface. Neither one sets `self.merged = None`, and neither calls
@@ -35,6 +43,11 @@ replace a pass's surface. Neither one sets `self.merged = None`, and neither cal
 
 ### 1.2 A cleaned pass is ignored when the next pass starts at "Same Position" (medium)
 
+**Fixed 2026-11-25.** `seed_tracker` has an `Edited` arm: the cleaned surface as points, and for
+a captured pass its kept keyframes as views (`project::seed_views`; cleaning removes points but
+does not move the pass, so the poses hold). If seeding fails, a toast now says the pass starts
+unaligned. Test: `a_cleaned_pass_seeds_a_same_position_pass`.
+
 `seed_tracker` (`app_project.rs:162-179`) builds the seed model only from
 `PassSource::Tracked` (line 164) and `PassSource::Fixed` (line 174). The commit added
 `PassSource::Edited`, which `ScanPass::source()` (`model.rs:296`) returns for every cleaned
@@ -49,6 +62,12 @@ pass, and `seed_tracker` was not updated.
   keyframes for views, if those are still valid for the cleaned surface.
 
 ### 1.3 Stray-point filter in the new mesher keeps points far off the surface (medium)
+
+**Fixed 2026-11-25.** The filter evaluates leave-one-out (`Field::eval_excluding`). Test
+`implicit_surface_drops_stray_points_up_to_the_support_radius` (strays 0.3–1.4 mm above a noisy
+plane): 54 of 54 removed, 20 of 54 before the fix. On the two-pass shell project at app defaults
+3 518 points are removed instead of 819 and boundary loops drop 395 → 381; the crumpled spots at
+the pen marks remain, so 2.2 is still open.
 
 `implicit.rs:407` measures each point's offset with `probe.eval(p, false)`, which includes
 the point itself in its own neighbourhood.
@@ -91,6 +110,8 @@ now** (8 GB is a normal amount for a 3D-scanning machine). If it is fixed later,
 per block or per cell instead of collecting everything.
 
 ### 1.6 `mesh_project` example does not use the app's defaults (low)
+
+**Fixed 2026-11-25:** defaults are now cell 0.7, smooth 4, sigma 0.5144 (the app's).
 
 The header of `crates/scancraft-mesh/examples/mesh_project.rs` says cell 1.0 and smooth 2 are
 "the app's default". The app now uses:

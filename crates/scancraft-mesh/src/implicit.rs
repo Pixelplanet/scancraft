@@ -141,6 +141,14 @@ impl Field<'_> {
     /// (value, gradient) at `x`, or `None` where the surface is not defined (no points around, or
     /// all of them far off along their tangent planes).
     fn eval(&self, x: Vec3, check_tangential: bool) -> Option<(f32, Vec3)> {
+        self.eval_excluding(x, check_tangential, usize::MAX)
+    }
+
+    /// [`eval`](Self::eval) without the point at grid index `skip`: a point's own offset from
+    /// the surface its neighbours define. Counting the point itself (offset 0, full weight, its
+    /// own normal for the side test) would pull the measured offset of a stray point towards 0,
+    /// the more so the further off it is.
+    fn eval_excluding(&self, x: Vec3, check_tangential: bool, skip: usize) -> Option<(f32, Vec3)> {
         let h2 = self.h * self.h;
         let g = self.grid;
         // Nearest point: its normal decides which side of a thin wall `x` belongs to.
@@ -150,7 +158,7 @@ impl Field<'_> {
         g.around(x, self.h, |i| {
             let d = x - g.p[i];
             let d2 = d.length_squared();
-            if d2 < h2 {
+            if d2 < h2 && i != skip {
                 idx.push(i as u32);
                 if d2 < nearest.0 {
                     nearest = (d2, g.n[i]);
@@ -404,7 +412,7 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
     // fold the mesh into small tunnels; drop them and refit.
     if config.outlier_sigma > 0.0 {
         let probe = Field { grid: &grid, h, sigma_r: 0.5 * h, sigma_n: 0.8, iterations: config.robust_iterations, tangential: f32::MAX };
-        let offs: Vec<f32> = grid.p.par_iter().map(|&p| probe.eval(p, false).map_or(f32::MAX, |(f, _)| f.abs())).collect();
+        let offs: Vec<f32> = grid.p.par_iter().enumerate().map(|(i, &p)| probe.eval_excluding(p, false, i).map_or(f32::MAX, |(f, _)| f.abs())).collect();
         let mut sorted: Vec<f32> = offs.iter().copied().filter(|v| v.is_finite() && *v < f32::MAX).collect();
         if sorted.len() > 100 {
             let mid = sorted.len() / 2;

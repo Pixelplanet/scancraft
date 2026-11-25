@@ -2,8 +2,10 @@
 //!
 //! ```text
 //! cargo run --release -p scancraft-mesh --example mesh_project -- <project_dir> <out_dir> [options]
-//!   --cell MM        marching-cubes cell (default 1.0, the app's default)
-//!   --smooth N       smoothing iterations after reconstruction (default 2, the app's default)
+//!   --cell MM        marching-cubes cell (default 0.7, the app's default)
+//!   --smooth N       smoothing iterations after reconstruction (default 4, the app's default)
+//!   --sigma S        rimls: smoother edge-keeping scale (default 0.5144, the app's default:
+//!                    Keep edges 0.7)
 //!   --pitch MM       merge pitch (default 0.5, the app's default for imported scans)
 //!   --method NAME    "legacy" (the app's reconstruction) or "rimls" (default)
 //!   --detail X       rimls: support radius in point spacings (default 3.0)
@@ -41,8 +43,8 @@ fn args() -> Args {
     Args {
         project: PathBuf::from(&a[0]),
         out: PathBuf::from(&a[1]),
-        cell: value("--cell", "1.0").parse().unwrap(),
-        smooth: value("--smooth", "2").parse().unwrap(),
+        cell: value("--cell", "0.7").parse().unwrap(),
+        smooth: value("--smooth", "4").parse().unwrap(),
         pitch: value("--pitch", "0.5").parse().unwrap(),
         method: value("--method", "rimls"),
         detail: value("--detail", "3.0").parse().unwrap(),
@@ -325,7 +327,7 @@ fn main() {
         if a.method == "legacy" {
             Mesher::smooth(&mut mesh, a.smooth, 0.35);
         } else {
-            let sigma = std::env::args().skip_while(|x| x != "--sigma").nth(1).map(|v| v.parse().unwrap()).unwrap_or(0.35);
+            let sigma = std::env::args().skip_while(|x| x != "--sigma").nth(1).map(|v| v.parse().unwrap()).unwrap_or(0.5144);
             scancraft_mesh::FeatureSmoother { iterations: a.smooth, sigma_normal: sigma, ..Default::default() }.smooth(&mut mesh);
         }
     }

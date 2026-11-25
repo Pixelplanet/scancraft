@@ -248,3 +248,7 @@ laser model are not built.
   user's new requests (project tabs, button placement, history timeline) are in
   `docs/open-issues.md`. Nothing fixed yet. Commit author must be the GitHub noreply address on
   every machine.
+- 2026-11-25 (second PC) — Fixed open-issues 1.1 (cleaning drops stale merged model / mesh),
+  1.2 (cleaned passes seed Same Position), 1.3 (leave-one-out stray filter in `implicit.rs`)
+  and 1.6 (`mesh_project` defaults), with tests. Next per `docs/open-issues.md`: 3.1 (project
+  tabs, confirm before discarding), then 2.2 (mesher destroys small relief).

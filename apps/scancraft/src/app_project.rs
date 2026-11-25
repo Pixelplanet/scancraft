@@ -158,7 +158,9 @@ impl ScanCraftApp {
     // ------------------------------------------------------------------ same position
 
     /// Seeds a new pass's tracker with the placed passes, so it starts in the project frame.
-    /// Imported passes add their surface but no views.
+    /// Imported passes add their surface but no views. A cleaned pass adds its cleaned surface
+    /// and, if it was captured, its keyframes as views (cleaning removes points, it does not move
+    /// the pass, so the keyframe poses still hold).
     pub(super) fn seed_tracker(&self, tracker: &SharedTracker) -> bool {
         let sources = placed(self, None);
         let tracked: Vec<(Transform, &SharedTracker)> = sources.iter().filter_map(|(t, s, _)| if let PassSource::Tracked(tr) = s { Some((*t, tr)) } else { None }).collect();
@@ -167,12 +169,21 @@ impl ScanCraftApp {
             return false;
         }
         let refs: Vec<(Transform, &scancraft_slam::Tracker)> = guards.iter().map(|(t, g)| (*t, &**g)).collect();
-        let (mut points, views) = project::seed_from(&refs);
+        let (mut points, mut views) = project::seed_from(&refs);
         drop(refs);
         drop(guards);
+        let place = |t: &Transform, surface: &scancraft_core::PointCloud| project::fixed_cloud(surface).points.into_iter().map(move |(p, n)| (t.transform_point3(p), t.rotation * n)).collect::<Vec<_>>();
         for (t, source, _) in &sources {
-            if let PassSource::Fixed(surface) = source {
-                points.extend(project::fixed_cloud(surface).points.into_iter().map(|(p, n)| (t.transform_point3(p), t.rotation * n)));
+            match source {
+                PassSource::Fixed(surface) => points.extend(place(t, surface)),
+                PassSource::Edited { surface, tracker: own } => {
+                    points.extend(place(t, surface));
+                    if let Some(own) = own {
+                        let Ok(g) = own.try_lock() else { return false };
+                        views.extend(project::seed_views(t, &g));
+                    }
+                }
+                PassSource::Tracked(_) => {}
             }
         }
         tracker.lock().map(|mut t| t.seed_model(&points, &views)).unwrap_or(false)
