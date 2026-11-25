@@ -22,13 +22,58 @@ use std::path::Path;
 use eframe::egui;
 use glam::Vec3;
 use scancraft_align::synthetic;
-use scancraft_core::Transform;
+use scancraft_color::RgbKeyframe;
+use scancraft_core::{ColorCamera, ColorFrame, PinholeIntrinsics, RgbImage, Transform};
 use scancraft_driver::ScanConfig;
 use scancraft_slam::{KeyframeData, VoxelMap};
 
 use crate::app::{Capture, ClosePrompt, ScanCraftApp};
 use crate::model::{Node, Stage, Tool};
 use crate::project::{self, AlignState, PassMeta, PassStart, StoredPass, StoredProject};
+
+fn demo_rgb_keyframes(object_pose: &Transform, views: &[Transform]) -> Vec<RgbKeyframe> {
+    let w = 160u32;
+    let h = 120u32;
+    let cam = std::sync::Arc::new(ColorCamera {
+        width: w,
+        height: h,
+        intrinsics: PinholeIntrinsics { fx: 160.0, fy: 160.0, cx: w as f32 * 0.5, cy: h as f32 * 0.5 },
+        distortion: [0.0; 5],
+        rotation: glam::Mat3::IDENTITY,
+        translation: Vec3::new(-12.0, 0.0, 0.0),
+    });
+    let mut out = Vec::new();
+    for (i, pose) in views.iter().take(4).enumerate() {
+        let mut data = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let off = ((y * w + x) * 3) as usize;
+                let dx = x as f32 - w as f32 * 0.5;
+                let dy = y as f32 - h as f32 * 0.5;
+                if dx * dx / 900.0 + dy * dy / 1400.0 <= 1.0 {
+                    data[off] = 210;
+                    data[off + 1] = 115;
+                    data[off + 2] = 75;
+                } else {
+                    data[off] = 30;
+                    data[off + 1] = 38;
+                    data[off + 2] = 52;
+                }
+            }
+        }
+        let _ = object_pose;
+        let frame = ColorFrame {
+            image: RgbImage { width: w, height: h, channels: 3, data },
+            jpeg: None,
+            timestamp_ms: i as u64 * 100,
+            camera: Some(cam.clone()),
+        };
+        if let Some(kf) = RgbKeyframe::new(i as u64, &frame, cam.clone(), *pose, 40.0, i as u64) {
+            out.push(kf);
+        }
+    }
+    out
+}
 
 /// Keyframes of a pass seen from `views` (pass frame), with the object placed by `object_pose`.
 fn keyframes(object_pose: &Transform, views: &[Transform], seed: u64) -> Vec<KeyframeData> {
@@ -62,8 +107,8 @@ pub fn write_demo_project(dir: &Path) -> Result<(), String> {
         reference: Some(1),
         next_pass_id: 3,
         passes: vec![
-            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None, edit: None },
-            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None, edit: None },
+            StoredPass { id: 1, name: "Pass 1".into(), frames: 14, visible: true, meta: reference, keyframes: keyframes(&upright, &a_views, 1), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&upright, &a_views) },
+            StoredPass { id: 2, name: "Pass 2 (flipped)".into(), frames: 14, visible: true, meta: second, keyframes: keyframes(&flipped, &b_views, 2), surface: None, edit: None, rgb_keyframes: demo_rgb_keyframes(&flipped, &b_views) },
         ],
         merged: None,
         cleaned: None,
@@ -244,6 +289,25 @@ impl Script {
                 app.stage = Stage::Clean;
                 app.open_tool(Tool::IsolateObject);
             }
+            "onlypass" => {
+                if let Ok(id) = arg.parse::<u32>() {
+                    for p in &mut app.passes {
+                        p.layer.visible = p.id == id;
+                    }
+                    if let Some(m) = &mut app.merged {
+                        m.layer.visible = false;
+                    }
+                }
+            }
+            "aisegment" => {
+                app.stage = Stage::Clean;
+                app.open_tool(Tool::AiSegment);
+            }
+            "aipack" => {
+                app.refresh_ai_status();
+                app.ai_pack_modal = true;
+            }
+            "closeaipack" => app.ai_pack_modal = false,
             "keep" => app.run_tool(Tool::IsolateObject),
             "pairs" => {
                 if let Some(id) = app.align_target() {

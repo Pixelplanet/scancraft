@@ -361,6 +361,8 @@ pub struct StoredPass {
     pub surface: Option<Arc<PointCloud>>,
     /// The cleaned surface (own frame, observation counts in `confidence`), if cleaned.
     pub edit: Option<Arc<PointCloud>>,
+    /// Calibrated RGB keyframes recorded during this pass.
+    pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
 }
 
 /// What a project folder holds.
@@ -456,6 +458,84 @@ pub fn cleaned_counts_path(id: u32) -> String {
 /// (and open the pass uncleaned).
 const CLEANED_KEY: &str = "cleaned";
 
+/// Key in a pass's `scan_config` JSON naming its saved RGB keyframe manifest.
+const RGB_KEYFRAMES_KEY: &str = "rgb_keyframes";
+
+fn rgb_dir_rel(id: u32) -> String {
+    format!("{}/rgb", files::pass_dir(id))
+}
+
+fn rgb_manifest_rel(id: u32) -> String {
+    format!("{}/keyframes.json", rgb_dir_rel(id))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct RgbKeyframeManifestEntry {
+    id: u64,
+    timestamp_ms: u64,
+    jpeg_file: String,
+    width: u32,
+    height: u32,
+    camera: scancraft_core::ColorCamera,
+    sensor_pose: Transform,
+    camera_pose: Transform,
+    sharpness: f32,
+    depth_frame_index: u64,
+}
+
+fn write_rgb_keyframes(dir: &Path, id: u32, kfs: &[scancraft_color::RgbKeyframe]) -> Result<(), String> {
+    let rgb_dir = dir.join(rgb_dir_rel(id));
+    if kfs.is_empty() {
+        let _ = std::fs::remove_dir_all(&rgb_dir);
+        return Ok(());
+    }
+    std::fs::create_dir_all(&rgb_dir).map_err(|e| e.to_string())?;
+    let mut entries = Vec::with_capacity(kfs.len());
+    for kf in kfs {
+        let jpeg_file = format!("kf-{:06}.jpg", kf.id);
+        std::fs::write(rgb_dir.join(&jpeg_file), &*kf.jpeg).map_err(|e| e.to_string())?;
+        entries.push(RgbKeyframeManifestEntry {
+            id: kf.id,
+            timestamp_ms: kf.timestamp_ms,
+            jpeg_file,
+            width: kf.width,
+            height: kf.height,
+            camera: (*kf.camera).clone(),
+            sensor_pose: kf.sensor_pose,
+            camera_pose: kf.camera_pose,
+            sharpness: kf.sharpness,
+            depth_frame_index: kf.depth_frame_index,
+        });
+    }
+    let json = serde_json::to_string_pretty(&entries).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join(rgb_manifest_rel(id)), json).map_err(|e| e.to_string())
+}
+
+fn read_rgb_keyframes(dir: &Path, manifest_rel: &str) -> Result<Vec<scancraft_color::RgbKeyframe>, String> {
+    let manifest_path = files::resolve(dir, manifest_rel);
+    let rgb_dir = manifest_path.parent().ok_or_else(|| "invalid RGB manifest path".to_string())?;
+    let json = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let entries: Vec<RgbKeyframeManifestEntry> = serde_json::from_str(&json).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
+    let mut out = Vec::with_capacity(entries.len());
+    for e in entries {
+        let jpeg_path = rgb_dir.join(&e.jpeg_file);
+        let jpeg = std::fs::read(&jpeg_path).map_err(|err| format!("{}: {err}", jpeg_path.display()))?;
+        out.push(scancraft_color::RgbKeyframe {
+            id: e.id,
+            timestamp_ms: e.timestamp_ms,
+            jpeg: Arc::new(jpeg),
+            width: e.width,
+            height: e.height,
+            camera: Arc::new(e.camera),
+            sensor_pose: e.sensor_pose,
+            camera_pose: e.camera_pose,
+            sharpness: e.sharpness,
+            depth_frame_index: e.depth_frame_index,
+        });
+    }
+    Ok(out)
+}
+
 /// Key in a pass's free-form `scan_config` JSON that says where the pass came from. Projects
 /// without it (all older ones) hold captured passes only; older versions of the app ignore it.
 const ORIGIN_KEY: &str = "origin";
@@ -473,6 +553,9 @@ fn scan_config_json(p: &StoredPass) -> serde_json::Value {
     }
     if let (true, Some(map)) = (p.edit.is_some(), value.as_object_mut()) {
         map.insert(CLEANED_KEY.into(), serde_json::json!(cleaned_path(p.id)));
+    }
+    if let (false, Some(map)) = (p.rgb_keyframes.is_empty(), value.as_object_mut()) {
+        map.insert(RGB_KEYFRAMES_KEY.into(), serde_json::json!(rgb_manifest_rel(p.id)));
     }
     value
 }
@@ -561,6 +644,7 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
                 let _ = std::fs::remove_file(dir.join(cleaned_counts_path(p.id)));
             }
         }
+        write_rgb_keyframes(dir, p.id, &p.rgb_keyframes)?;
     }
     let mut outputs = Vec::new();
     std::fs::create_dir_all(dir.join("outputs")).map_err(|e| e.to_string())?;
@@ -613,6 +697,10 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             Some(file) => Some(Arc::new(read_cleaned(dir, record.id, file).map_err(|e| format!("the cleaned surface of {} cannot be read ({e})", record.name))?)),
             None => None,
         };
+        let rgb_keyframes = match record.scan_config.get(RGB_KEYFRAMES_KEY).and_then(|v| v.as_str()) {
+            Some(file) => read_rgb_keyframes(dir, file).map_err(|e| format!("the colour keyframes of {} cannot be read ({e})", record.name))?,
+            None => Vec::new(),
+        };
         passes.push(StoredPass {
             id: record.id,
             name: record.name.clone(),
@@ -632,6 +720,7 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             keyframes: kfs.into_iter().map(from_record).collect(),
             surface,
             edit,
+            rgb_keyframes,
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
@@ -707,8 +796,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None },
-                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
+                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
             ],
             merged: Some((merged, vec![1])),
             cleaned: None,
@@ -791,8 +880,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None },
-                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new() },
+                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None, rgb_keyframes: Vec::new() },
             ],
             merged: None,
             cleaned: None,
@@ -842,7 +931,7 @@ mod tests {
             name: "Cleaned".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)) }],
+            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)), rgb_keyframes: Vec::new() }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -874,7 +963,7 @@ mod tests {
             name: "Old".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None }],
+            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new() }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -887,6 +976,57 @@ mod tests {
         let loaded = load(&dir).unwrap();
         assert_eq!(loaded.passes[0].meta.origin, PassOrigin::Captured);
         assert!(loaded.passes[0].surface.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rgb_keyframes_round_trip_through_a_project_folder() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-rgb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut meta = PassMeta::new(ScanConfig::default(), None, PassStart::Moved);
+        meta.alignment = AlignState::Reference;
+        let cam = Arc::new(scancraft_core::ColorCamera {
+            width: 32,
+            height: 24,
+            intrinsics: scancraft_core::PinholeIntrinsics { fx: 40.0, fy: 40.0, cx: 16.0, cy: 12.0 },
+            distortion: [0.0; 5],
+            rotation: glam::Mat3::IDENTITY,
+            translation: Vec3::new(-12.0, 0.0, 0.0),
+        });
+        let color_frame = scancraft_core::ColorFrame {
+            image: scancraft_core::RgbImage { width: 32, height: 24, channels: 3, data: vec![180u8; 32 * 24 * 3] },
+            jpeg: None,
+            timestamp_ms: 120,
+            camera: Some(cam.clone()),
+        };
+        let kf = scancraft_color::RgbKeyframe::new(3, &color_frame, cam, Transform::from_translation(Vec3::new(1.0, 2.0, 3.0)), 42.5, 9).unwrap();
+        let project = StoredProject {
+            name: "RgbTest".into(),
+            reference: Some(1),
+            next_pass_id: 2,
+            passes: vec![StoredPass {
+                id: 1,
+                name: "Pass 1".into(),
+                frames: 1,
+                visible: true,
+                meta,
+                keyframes: Vec::new(),
+                surface: None,
+                edit: None,
+                rgb_keyframes: vec![kf],
+            }],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        assert!(dir.join(rgb_manifest_rel(1)).is_file());
+        let loaded = load(&dir).unwrap();
+        assert_eq!(loaded.passes[0].rgb_keyframes.len(), 1);
+        let back = &loaded.passes[0].rgb_keyframes[0];
+        assert_eq!((back.id, back.timestamp_ms, back.width, back.height, back.depth_frame_index), (3, 120, 32, 24, 9));
+        assert_eq!(&back.jpeg[..2], &[0xff, 0xd8]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

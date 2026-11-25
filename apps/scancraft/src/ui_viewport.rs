@@ -58,12 +58,19 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         if let Some(pp) = &app.poses_preview {
             previewed.extend(pp.layers.iter().map(|(id, _)| *id));
         }
-        // Isolate Object shows only its input, coloured by label.
+        // Isolate Object or AI Segment preview shows points coloured by object / background label.
         let isolating = app.tool == Some(crate::model::Tool::IsolateObject) && app.object_picking.is_some();
+        let ai_picking = app.tool == Some(crate::model::Tool::AiSegment) && app.ai_picking.is_some();
+        let ai_has_preview = ai_picking && app.ai_picking.as_ref().is_some_and(|a| a.preview.is_some());
         if isolating {
             frame.point_shading = PointShading::Vertex;
             if let Some(o) = &app.object_picking {
                 frame.points.push(PointLayer { generation: o.generation | 1 << 60, points: Arc::clone(&o.layer), overlay: false });
+            }
+        } else if ai_has_preview {
+            frame.point_shading = PointShading::Vertex;
+            if let Some(layer) = app.ai_picking.as_ref().and_then(|a| a.preview.as_ref()) {
+                frame.points.push(PointLayer { generation: layer.generation | 1 << 60, points: Arc::clone(&layer.gpu), overlay: false });
             }
         } else if colour_passes {
             let colours: Vec<[u8; 3]> = app.passes.iter().map(|p| app.pass_colour(p.id)).collect();
@@ -85,7 +92,7 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
                 frame.points.push(PointLayer { generation: p.layer.generation, points: Arc::clone(&p.layer.gpu), overlay: false });
             }
         }
-        if !isolating {
+        if !isolating && !ai_has_preview {
             if let Some(a) = &app.align_preview {
                 frame.points.push(PointLayer { generation: a.layer.generation, points: Arc::clone(&a.layer.gpu), overlay: false });
             }
@@ -126,6 +133,21 @@ pub fn central(app: &mut ScanCraftApp, root: &mut egui::Ui) {
             let bottom = view.bottom() - kit::nav::bar_height() - 2.0 * kit::SHELL_GAP;
             let area = Rect::from_min_max(pos2(view.left() + ui_panels::BROWSER_WIDTH + 2.0 * kit::SHELL_GAP, cards.bottom + kit::SHELL_GAP), pos2(view.right() - ui_panels::PROPERTIES_WIDTH - 2.0 * kit::SHELL_GAP, bottom));
             pair_panes(app, ui, area);
+        } else if ai_picking {
+            let bottom = view.bottom() - kit::nav::bar_height() - 2.0 * kit::SHELL_GAP;
+            let area = Rect::from_min_max(pos2(view.left() + ui_panels::BROWSER_WIDTH + 2.0 * kit::SHELL_GAP, cards.bottom + kit::SHELL_GAP), pos2(view.right() - ui_panels::PROPERTIES_WIDTH - 2.0 * kit::SHELL_GAP, bottom));
+            let mut scene = Some(frame);
+            crate::ui_ai::ai_segment_panes(app, ctx, ui, area, &mut |app, _, ui, right_rect| {
+                if let Some(mut frame) = scene.take() {
+                    app.camera.aspect_ratio = (right_rect.width() / right_rect.height().max(1.0)).max(0.1);
+                    frame.view_proj = app.camera.view_projection();
+                    frame.eye = app.camera.eye;
+                    frame.viewport_px = [right_rect.width() * ppp, right_rect.height() * ppp];
+                    let r_resp = ui.interact(right_rect, ui.id().with("ai_3d_viewport"), Sense::click_and_drag());
+                    ui.painter().add(frame.into_shape(right_rect));
+                    camera_input(app, ui, &r_resp, right_rect);
+                }
+            });
         } else {
             ui.painter().add(frame.into_shape(view));
             camera_input(app, ui, &response, view);
@@ -511,35 +533,62 @@ fn camera_inset(app: &mut ScanCraftApp, ctx: &egui::Context, pos: egui::Pos2, ma
         kit::frame(Surface::Panel).inner_margin(Margin::same(kit::CARD_INSET as i8)).show(ui, |ui| {
             ui.set_width(w + GAUGE_W + 4.0 + if wide { INSET_CONTROLS_W + 12.0 } else { 0.0 });
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            // Header: title and the IR / Depth switch (the grip sits in the top-right corner).
+            // Header: title and the IR / Depth / Colour switch (the grip sits in the top-right corner).
             let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 26.0), Sense::hover());
             ui.painter().text(pos2(head.left() + t.space_6, head.center().y), egui::Align2::LEFT_CENTER, "Camera", fonts::semibold(t.font_label), t.text);
             let has_depth = app.capture != Capture::Idle;
-            let seg = Rect::from_min_max(pos2(head.right() - 140.0, head.top() + 2.0), pos2(head.right() - 20.0, head.bottom() - 2.0));
+            let has_rgb = app.connection.as_ref().is_some_and(|c| c.capabilities.has_rgb_camera);
+            let seg = Rect::from_min_max(pos2(head.right() - 184.0, head.top() + 2.0), pos2(head.right() - 20.0, head.bottom() - 2.0));
             let mut child = ui.new_child(egui::UiBuilder::new().max_rect(seg));
             child.spacing_mut().interact_size.y = seg.height();
-            let mut index = if app.inset_depth && has_depth { 1 } else { 0 };
-            let reasons = [None, Some("Depth is shown while capturing")];
+            let mut index = match app.inset_view {
+                crate::app::InsetView::Ir => 0,
+                crate::app::InsetView::Depth if has_depth => 1,
+                crate::app::InsetView::Color if has_rgb => 2,
+                _ => 0,
+            };
+            let reasons = [None, Some("Depth is shown while capturing"), Some("No RGB camera on this scanner")];
             kit::form::scope(&mut child, |ui| {
-                if kit::segmented(ui, &mut index, &["IR", "Depth"], &[true, has_depth], &reasons) {
-                    app.inset_depth = index == 1;
+                if kit::segmented(ui, &mut index, &["IR", "Depth", "Colour"], &[true, has_depth, has_rgb], &reasons) {
+                    app.inset_view = match index {
+                        1 => crate::app::InsetView::Depth,
+                        2 => crate::app::InsetView::Color,
+                        _ => crate::app::InsetView::Ir,
+                    };
                 }
             });
             ui.add_space(2.0);
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 4.0;
-                let (img_rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
+                let (img_rect, img_resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
                 ui.painter().rect_filled(img_rect, t.radius_sm, t.control_fill);
-                let tex = if app.inset_depth && has_depth { app.depth_texture.as_ref() } else { app.ir_texture.as_ref() };
+                let active_view = match app.inset_view {
+                    crate::app::InsetView::Depth if has_depth => crate::app::InsetView::Depth,
+                    crate::app::InsetView::Color if has_rgb => crate::app::InsetView::Color,
+                    _ => crate::app::InsetView::Ir,
+                };
+                let tex = match active_view {
+                    crate::app::InsetView::Ir => app.ir_texture.as_ref(),
+                    crate::app::InsetView::Depth => app.depth_texture.as_ref(),
+                    crate::app::InsetView::Color => app.ai_mask_texture.as_ref().filter(|_| app.settings.live_ai_segment).or(app.color_texture.as_ref()),
+                };
                 match tex.filter(|_| live) {
                     Some(tex) => {
                         let size = tex.size_vec2();
                         let scale = (img_rect.width() / size.x).min(img_rect.height() / size.y);
                         let r = Rect::from_center_size(img_rect.center(), size * scale);
                         ui.painter().image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), egui::Color32::WHITE);
-                        if !(app.inset_depth && has_depth) {
+                        if active_view == crate::app::InsetView::Ir {
                             if let Some(o) = &app.overlay {
                                 paint_marker_dots(ui.painter(), r, o);
+                            }
+                        } else if active_view == crate::app::InsetView::Color && app.settings.live_ai_segment && img_resp.clicked() {
+                            if let Some(pos) = img_resp.interact_pointer_pos() {
+                                if r.contains(pos) {
+                                    let nx = (pos.x - r.min.x) / r.width().max(1.0);
+                                    let ny = (pos.y - r.min.y) / r.height().max(1.0);
+                                    app.trigger_live_ai_prompt(nx, ny);
+                                }
                             }
                         }
                     }

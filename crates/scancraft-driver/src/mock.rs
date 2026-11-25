@@ -4,8 +4,8 @@ use crate::types::{
     ScannerCapabilities,
 };
 use async_trait::async_trait;
-use glam::{Quat, Vec3};
-use scancraft_core::{DepthMap, ImuSample, IrImages, PinholeIntrinsics, PreviewFrame, RgbImage, SensorFrame};
+use glam::{Mat3, Quat, Vec3};
+use scancraft_core::{ColorCamera, ColorFrame, DepthMap, ImuSample, IrImages, PinholeIntrinsics, PreviewFrame, RgbImage, SensorFrame};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
@@ -143,6 +143,78 @@ impl MockDevice {
         };
         (depth_map, ir_image)
     }
+
+    /// Generates a calibrated synthetic RGB frame aligned with `depth` for colour/AI testing.
+    pub fn generate_synthetic_color(depth: &DepthMap, phase: f32, timestamp_ms: u64) -> ColorFrame {
+        let w = depth.width;
+        let h = depth.height;
+        let intrinsics = depth.intrinsics.unwrap_or(PinholeIntrinsics {
+            fx: 275.0 / 0.42,
+            fy: 275.0 / 0.42,
+            cx: w as f32 * 0.5,
+            cy: h as f32 * 0.5,
+        });
+        let camera = Arc::new(ColorCamera {
+            width: w,
+            height: h,
+            intrinsics,
+            distortion: [0.0; 5],
+            rotation: Mat3::IDENTITY,
+            translation: Vec3::new(-12.0, 0.0, 0.0),
+        });
+        let mut data = vec![0u8; (w * h * 3) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let off = ((y * w + x) * 3) as usize;
+                // Cool grey-blue studio background gradient.
+                data[off] = 28;
+                data[off + 1] = 34 + (y * 24 / h.max(1)) as u8;
+                data[off + 2] = 46 + (y * 28 / h.max(1)) as u8;
+            }
+        }
+        let mut zbuf = vec![f32::INFINITY; (w * h) as usize];
+        for y in 0..depth.height {
+            for x in 0..depth.width {
+                let raw = depth.data[(y * depth.width + x) as usize];
+                if raw == 0 {
+                    continue;
+                }
+                let z = raw as f32 * depth.scale_mm;
+                let xo = (x as f32 - intrinsics.cx) * z / intrinsics.fx;
+                let yo = (y as f32 - intrinsics.cy) * z / intrinsics.fy;
+                let c_pt = camera.depth_optical_to_color(Vec3::new(xo, yo, z));
+                let Some(px) = camera.project_color(c_pt) else { continue };
+                let band = (yo * 0.12 + phase).sin() * 0.5 + 0.5;
+                let r_col = (185.0 + 45.0 * band).clamp(0.0, 255.0) as u8;
+                let g_col = (105.0 + 35.0 * (1.0 - band)).clamp(0.0, 255.0) as u8;
+                let b_col = (68.0 + 22.0 * band).clamp(0.0, 255.0) as u8;
+                let u0 = px.x.floor() as i32;
+                let v0 = px.y.floor() as i32;
+                for dv in 0..=1 {
+                    for du in 0..=1 {
+                        let u = u0 + du;
+                        let v = v0 + dv;
+                        if u >= 0 && v >= 0 && u < w as i32 && v < h as i32 {
+                            let idx = (v as u32 * w + u as u32) as usize;
+                            if c_pt.z <= zbuf[idx] + 1.0 {
+                                zbuf[idx] = c_pt.z;
+                                let off = idx * 3;
+                                data[off] = r_col;
+                                data[off + 1] = g_col;
+                                data[off + 2] = b_col;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ColorFrame {
+            image: RgbImage { width: w, height: h, channels: 3, data },
+            jpeg: None,
+            timestamp_ms,
+            camera: Some(camera),
+        }
+    }
 }
 
 #[async_trait]
@@ -193,9 +265,10 @@ impl ScannerDevice for MockDevice {
         Ok(())
     }
 
-    async fn start_scan(&mut self, _config: &ScanConfig) -> Result<mpsc::Receiver<SensorFrame>, DriverError> {
+    async fn start_scan(&mut self, config: &ScanConfig) -> Result<mpsc::Receiver<SensorFrame>, DriverError> {
         let (tx, rx) = mpsc::channel(16);
         let streaming = self.streaming.clone();
+        let emit_color = config.color_texture || config.tracking == crate::modes::TrackingMode::Color;
         streaming.store(true, Ordering::SeqCst);
 
         tokio::spawn(async move {
@@ -206,18 +279,21 @@ impl ScannerDevice for MockDevice {
                 ticker.tick().await;
                 frame_idx += 1;
                 let phase = (frame_idx as f32) * 0.05;
+                let ts = frame_idx * 66;
                 let (depth, ir) = Self::generate_synthetic_scan(640, 512, phase);
+                let color = emit_color.then(|| Self::generate_synthetic_color(&depth, phase, ts));
 
                 let imu_sample = ImuSample {
-                    timestamp_ms: frame_idx * 66,
+                    timestamp_ms: ts,
                     orientation: Quat::from_rotation_z(phase * 0.5),
                     angular_velocity: Vec3::new(0.0, 0.0, 0.05),
                     linear_acceleration: Vec3::new(0.0, 0.0, 1.0),
                     euler_degrees: Vec3::new(0.0, 0.0, (phase * 0.5).to_degrees()),
                 };
 
-                let mut raw_frame = SensorFrame::new(frame_idx, frame_idx * 66);
+                let mut raw_frame = SensorFrame::new(frame_idx, ts);
                 raw_frame.depth = Some(depth);
+                raw_frame.color = color;
                 raw_frame.ir = Some(IrImages { left: ir, right: None, rectified: true, rig: None });
                 raw_frame.imu = Some(imu_sample);
 
@@ -270,5 +346,17 @@ mod intrinsics_tests {
         let size = cloud.bbox.max - cloud.bbox.min;
         assert!((100.0..160.0).contains(&size.z), "height {size:?}");
         assert!(cloud.bbox.min.y > 200.0 && cloud.bbox.max.y < 290.0, "{:?}", cloud.bbox);
+    }
+
+    #[test]
+    fn synthetic_color_has_calibrated_camera_and_object_pixels() {
+        let (depth, _) = MockDevice::generate_synthetic_scan(640, 512, 0.0);
+        let color = MockDevice::generate_synthetic_color(&depth, 0.0, 100);
+        assert_eq!((color.image.width, color.image.height, color.image.channels), (640, 512, 3));
+        assert!(color.camera.is_some());
+        // Centre pixels belong to the vase (terracotta R > B), corners are cool backdrop (B > R).
+        let center = ((256 * 640 + 300) * 3) as usize;
+        assert!(color.image.data[center] > color.image.data[center + 2]);
+        assert!(color.image.data[2] > color.image.data[0]);
     }
 }

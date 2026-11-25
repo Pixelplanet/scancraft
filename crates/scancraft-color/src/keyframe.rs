@@ -39,7 +39,10 @@ pub struct RgbKeyframe {
 
 impl RgbKeyframe {
     pub fn new(id: u64, frame: &ColorFrame, camera: Arc<ColorCamera>, sensor_pose: Transform, sharpness: f32, depth_frame_index: u64) -> Option<Self> {
-        let jpeg = frame.jpeg.clone()?;
+        let jpeg = match &frame.jpeg {
+            Some(j) => j.clone(),
+            None => encode_rgb_jpeg(&frame.image)?,
+        };
         Some(Self {
             id,
             timestamp_ms: frame.timestamp_ms,
@@ -69,6 +72,25 @@ impl RgbKeyframe {
         let c = self.camera_pose.inverse().transform_point3(p);
         self.camera.project_color(c).map(|px| (px, c.z))
     }
+}
+
+fn encode_rgb_jpeg(image: &scancraft_core::RgbImage) -> Option<Arc<Vec<u8>>> {
+    if image.width == 0 || image.height == 0 || image.channels < 3 {
+        return None;
+    }
+    let expected = (image.width as usize).checked_mul(image.height as usize)?.checked_mul(image.channels as usize)?;
+    if image.data.len() < expected {
+        return None;
+    }
+    let rgb = if image.channels == 3 {
+        image.data[..expected].to_vec()
+    } else {
+        image.data[..expected].chunks_exact(image.channels as usize).flat_map(|px| [px[0], px[1], px[2]]).collect()
+    };
+    let mut out = Vec::new();
+    let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90);
+    enc.encode(&rgb, image.width, image.height, image::ExtendedColorType::Rgb8).ok()?;
+    Some(Arc::new(out))
 }
 
 /// Pose at time `t` between two timed poses (linear translation, slerp rotation). The POP 4's
@@ -209,5 +231,24 @@ mod tests {
         let mid = interpolate_pose(150, (100, &p0), (200, &p1));
         assert!((mid.translation.x - 5.0).abs() < 1e-5);
         assert!((mid.rotation.angle_between(Quat::IDENTITY) - 0.1).abs() < 1e-4);
+    }
+
+    #[test]
+    fn encodes_jpeg_when_frame_has_raw_rgb_only() {
+        let cam = camera();
+        let mut data = vec![0u8; 64 * 48 * 3];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = ((i * 17) % 251) as u8;
+        }
+        let f = ColorFrame {
+            image: RgbImage { width: 64, height: 48, channels: 3, data },
+            jpeg: None,
+            timestamp_ms: 42,
+            camera: Some(cam.clone()),
+        };
+        let kf = RgbKeyframe::new(7, &f, cam, Transform::default(), 55.0, 3).expect("raw RGB encodes to JPEG");
+        assert_eq!(&kf.jpeg[..2], &[0xff, 0xd8]);
+        let decoded = image::load_from_memory(&kf.jpeg).expect("encoded JPEG decodes").to_rgb8();
+        assert_eq!((decoded.width(), decoded.height()), (64, 48));
     }
 }

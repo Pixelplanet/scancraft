@@ -76,6 +76,7 @@ fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
         mask: isolation::new_cache(),
         surface: lp.stored.surface,
         edit: lp.stored.edit,
+        rgb_keyframes: lp.stored.rgb_keyframes,
     }
 }
 
@@ -726,8 +727,11 @@ impl ScanCraftApp {
             return;
         }
         let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
-        let passes: Vec<_> =
-            self.passes.iter().map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone())).collect();
+        let passes: Vec<_> = self
+            .passes
+            .iter()
+            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone()))
+            .collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
         let merged = self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone()));
@@ -741,9 +745,9 @@ impl ScanCraftApp {
         });
         self.spawn_job("Saving the project", move || {
             let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface, edit) in passes {
+            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes) in passes {
                 let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit });
+                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes });
             }
             let n = stored.len();
             let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
@@ -792,6 +796,7 @@ impl ScanCraftApp {
         self.clear_previews();
         self.picking = None;
         self.object_picking = None;
+        self.ai_picking = None;
         self.highlight = None;
         self.passes.clear();
         // The open project's results are replaced, not invalidated, by the opened ones.
@@ -952,6 +957,7 @@ impl ScanCraftApp {
             mask: scan.mask,
             surface: Some(scan.surface),
             edit: None,
+            rgb_keyframes: Vec::new(),
         };
         let name = pass.name.clone();
         self.append_passes(vec![pass]);

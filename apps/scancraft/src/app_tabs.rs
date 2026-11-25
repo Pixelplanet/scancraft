@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use scancraft_render::{Camera, CameraPreset};
 
 use super::{AlignPreview, Highlight, PairPicking, PosesPreview, ScanCraftApp, Tone};
+use crate::ai_segment::AiPicking;
 use crate::isolation::ObjectPicking;
 use crate::model::*;
 use crate::project::{PassStart, ProjectInfo};
@@ -32,6 +33,7 @@ pub struct ProjectTab {
     poses_preview: Option<PosesPreview>,
     picking: Option<PairPicking>,
     object_picking: Option<ObjectPicking>,
+    ai_picking: Option<AiPicking>,
     highlight: Option<Highlight>,
     selection: Option<Node>,
     stage: Stage,
@@ -64,6 +66,7 @@ impl ProjectTab {
             poses_preview: None,
             picking: None,
             object_picking: None,
+            ai_picking: None,
             highlight: None,
             selection: None,
             stage: Stage::Connect,
@@ -110,6 +113,7 @@ impl ScanCraftApp {
         swap(&mut self.poses_preview, &mut tab.poses_preview);
         swap(&mut self.picking, &mut tab.picking);
         swap(&mut self.object_picking, &mut tab.object_picking);
+        swap(&mut self.ai_picking, &mut tab.ai_picking);
         swap(&mut self.highlight, &mut tab.highlight);
         swap(&mut self.selection, &mut tab.selection);
         swap(&mut self.stage, &mut tab.stage);

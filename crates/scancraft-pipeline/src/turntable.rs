@@ -415,6 +415,7 @@ mod tests {
             depth: Box::new(TurntableFilter::new(Box::new(OnDeviceDepth::new(150.0, 600.0)), TurntableConfig::default())),
             pose: None,
             color: None,
+            exported_rgb_keyframes: 0,
         };
         let mut tracker = Tracker::new();
         let mut first: Option<(usize, Transform)> = None;
@@ -437,7 +438,7 @@ mod tests {
 
     #[test]
     fn without_turntable_mode_the_background_wins() {
-        let mut pipeline = crate::PassPipeline { depth: Box::new(OnDeviceDepth::new(150.0, 600.0)), pose: None, color: None };
+        let mut pipeline = crate::PassPipeline { depth: Box::new(OnDeviceDepth::new(150.0, 600.0)), pose: None, color: None, exported_rgb_keyframes: 0 };
         let mut tracker = Tracker::new();
         let mut poses = Vec::new();
         for i in 0..12usize {

@@ -219,6 +219,7 @@ pub struct PassPipeline {
     pub pose: Option<Box<dyn PoseEstimator>>,
     /// Colour recording (colour passes and Color tracking): RGB keyframes + vertex colours.
     pub color: Option<scancraft_color::ColorRecorder>,
+    exported_rgb_keyframes: usize,
 }
 
 impl PassPipeline {
@@ -268,6 +269,17 @@ impl PassPipeline {
     /// RGB keyframes recorded so far in this pass (empty without colour).
     pub fn rgb_keyframes(&self) -> &[scancraft_color::RgbKeyframe] {
         self.color.as_ref().map_or(&[], |c| c.keyframes())
+    }
+
+    /// Returns RGB keyframes added since the last call.
+    pub fn take_new_rgb_keyframes(&mut self) -> Vec<scancraft_color::RgbKeyframe> {
+        let kfs = self.color.as_ref().map_or(&[][..], |c| c.keyframes());
+        if self.exported_rgb_keyframes >= kfs.len() {
+            return Vec::new();
+        }
+        let out = kfs[self.exported_rgb_keyframes..].to_vec();
+        self.exported_rgb_keyframes = kfs.len();
+        out
     }
 }
 
@@ -326,7 +338,7 @@ pub fn pipeline_with(config: &ScanConfig, min_mm: f32, max_mm: f32, options: &Pi
     };
     // Color tracking implies colour recording (docs/architecture/scan-sessions.md section 4).
     let color = (config.color_texture || config.tracking == TrackingMode::Color).then(scancraft_color::ColorRecorder::default);
-    Ok(PassPipeline { depth, pose, color })
+    Ok(PassPipeline { depth, pose, color, exported_rgb_keyframes: 0 })
 }
 
 #[cfg(test)]

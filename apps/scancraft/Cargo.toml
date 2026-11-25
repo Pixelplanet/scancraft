@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 scancraft-core.workspace = true
+scancraft-color.workspace = true
 scancraft-driver.workspace = true
 scancraft-driver-revopoint.workspace = true
 scancraft-render.workspace = true
@@ -16,8 +17,10 @@ scancraft-pipeline.workspace = true
 async-trait.workspace = true
 scancraft-fusion.workspace = true
 scancraft-mesh.workspace = true
+scancraft-segment.workspace = true
 scancraft-io.workspace = true
 scancraft-align.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true
 image.workspace = true

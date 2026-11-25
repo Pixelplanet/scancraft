@@ -2,14 +2,149 @@
 //! pose and world-space points; and turn preview frames into previews and a distance reading.
 
 use eframe::egui::ColorImage;
-use scancraft_core::{DepthMap, PreviewFrame, RgbImage, SensorFrame};
-use std::sync::Arc;
+use scancraft_core::{ColorCamera, DepthMap, PreviewFrame, RgbImage, SensorFrame};
+use scancraft_segment::{Mask2D, PostprocessConfig};
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use scancraft_slam::{Tracker, TrackerConfig};
 use tokio::sync::mpsc;
 
+use crate::ai_pack::SharedAiEngine;
+use crate::ai_segment::build_overlay_image;
 use crate::model::{FrameRates, KeyframeInfo, ScanUpdate, SharedTracker};
+
+/// Shared control state for optional non-blocking live SAM 2.1 segmentation during capture.
+pub struct LiveAiState {
+    pub enabled: AtomicBool,
+    pub engine: Arc<SharedAiEngine>,
+    pending_prompt: Mutex<Option<(f32, f32)>>,
+    reset_requested: AtomicBool,
+}
+
+impl LiveAiState {
+    pub fn new(engine: Arc<SharedAiEngine>) -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            engine,
+            pending_prompt: Mutex::new(None),
+            reset_requested: AtomicBool::new(false),
+        }
+    }
+
+    pub fn set_enabled(&self, on: bool) {
+        let prev = self.enabled.swap(on, Ordering::SeqCst);
+        if !on || !prev {
+            self.reset();
+        }
+    }
+
+    pub fn set_prompt_normalized(&self, nx: f32, ny: f32) {
+        if let Ok(mut g) = self.pending_prompt.lock() {
+            *g = Some((nx.clamp(0.0, 1.0), ny.clamp(0.0, 1.0)));
+        }
+    }
+
+    pub fn reset(&self) {
+        self.reset_requested.store(true, Ordering::SeqCst);
+        if let Ok(mut g) = self.pending_prompt.lock() {
+            *g = None;
+        }
+    }
+}
+
+struct LiveAiJobInput {
+    frame_index: u64,
+    rgb: RgbImage,
+    prompt_norm: Option<(f32, f32)>,
+    reset: bool,
+}
+
+struct LiveAiJobOutput {
+    mask: Mask2D,
+    tracking: bool,
+    iou: f32,
+    provider: String,
+    overlay: ColorImage,
+}
+
+fn spawn_live_ai_helper(
+    engine: Arc<SharedAiEngine>,
+) -> (std::sync::mpsc::SyncSender<LiveAiJobInput>, std::sync::mpsc::Receiver<LiveAiJobOutput>) {
+    let (in_tx, in_rx) = std::sync::mpsc::sync_channel::<LiveAiJobInput>(1);
+    let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<LiveAiJobOutput>(1);
+    std::thread::spawn(move || {
+        let mut active = false;
+        while let Ok(job) = in_rx.recv() {
+            if job.reset {
+                active = false;
+                let _ = engine.with_segmenter(|seg, _| {
+                    seg.reset();
+                    Ok(())
+                });
+            }
+            if job.prompt_norm.is_none() && !active {
+                continue;
+            }
+            let res = engine.with_segmenter(|seg, provider| {
+                let fm = if let Some((nx, ny)) = job.prompt_norm {
+                    seg.reset();
+                    active = true;
+                    let prompt = scancraft_segment::FramePrompt::default().with_point(
+                        nx * (job.rgb.width.saturating_sub(1) as f32),
+                        ny * (job.rgb.height.saturating_sub(1) as f32),
+                        true,
+                    );
+                    seg.add_prompt(job.frame_index, &job.rgb, &prompt)
+                        .map_err(|e| format!("Live AI prompt: {e}"))?
+                } else {
+                    seg.propagate(job.frame_index, &job.rgb)
+                        .map_err(|e| format!("Live AI propagate: {e}"))?
+                };
+                let overlay = build_overlay_image(&job.rgb, &fm.mask, &[]);
+                Ok(LiveAiJobOutput {
+                    tracking: !fm.status.is_lost(),
+                    iou: fm.iou_score,
+                    provider: provider.to_string(),
+                    mask: fm.mask,
+                    overlay,
+                })
+            });
+            if let Ok(out) = res {
+                let _ = out_tx.try_send(out);
+            }
+        }
+    });
+    (in_tx, out_rx)
+}
+
+fn mask_depth_map(depth: &DepthMap, cam: &ColorCamera, mask: &Mask2D) -> DepthMap {
+    let Some(k) = depth.intrinsics else {
+        return depth.clone();
+    };
+    let mut masked = depth.data.clone();
+    for y in 0..depth.height {
+        for x in 0..depth.width {
+            let idx = (y * depth.width + x) as usize;
+            let raw = masked[idx];
+            if raw == 0 {
+                continue;
+            }
+            let z = raw as f32 * depth.scale_mm;
+            let optical = glam::Vec3::new((x as f32 - k.cx) * z / k.fx, (y as f32 - k.cy) * z / k.fy, z);
+            let c_pt = cam.depth_optical_to_color(optical);
+            let keep = cam.project_color(c_pt).is_some_and(|px| {
+                let mx = (px.x.round() as i32).clamp(0, mask.width as i32 - 1) as u32;
+                let my = (px.y.round() as i32).clamp(0, mask.height as i32 - 1) as u32;
+                mask.is_foreground(mx, my)
+            });
+            if !keep {
+                masked[idx] = 0;
+            }
+        }
+    }
+    DepthMap::new(depth.width, depth.height, depth.scale_mm, masked).with_intrinsics(k)
+}
 
 /// Events per second over a sliding window.
 #[derive(Debug, Default)]
@@ -85,6 +220,27 @@ pub fn ir_preview(img: &RgbImage, max_w: usize) -> Option<ColorImage> {
     Some(ColorImage::from_rgba_unmultiplied([pw, ph], &out))
 }
 
+/// Colour preview of an 8-bit RGB image, at most `max_w` wide (nearest-cell sample).
+pub fn rgb_preview(img: &RgbImage, max_w: usize) -> Option<ColorImage> {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let ch = img.channels.max(1) as usize;
+    if w == 0 || h == 0 || ch < 3 || img.data.len() < w * h * ch {
+        return None;
+    }
+    let step = (w / max_w.max(1)).max(1);
+    let (pw, ph) = ((w / step).max(1), (h / step).max(1));
+    let mut out = Vec::with_capacity(pw * ph * 4);
+    for py in 0..ph {
+        for px in 0..pw {
+            let x = (px * step + step / 2).min(w - 1);
+            let y = (py * step + step / 2).min(h - 1);
+            let i = (y * w + x) * ch;
+            out.extend_from_slice(&[img.data[i], img.data[i + 1], img.data[i + 2], 255]);
+        }
+    }
+    Some(ColorImage::from_rgba_unmultiplied([pw, ph], &out))
+}
+
 /// Depth preview: grey by distance inside the working range, amber when too close, blue when too
 /// far, dark where there is no measurement. Returns the image and the mean in-range distance.
 pub fn depth_preview(depth: &DepthMap, min_mm: f32, max_mm: f32, max_w: usize) -> (ColorImage, Option<f32>) {
@@ -142,6 +298,7 @@ pub async fn scan_worker(
     scan_config: scancraft_driver::ScanConfig,
     tracker: SharedTracker,
     paused: Arc<AtomicBool>,
+    live_ai: Arc<LiveAiState>,
 ) {
     // The scan mode decides how frames become geometry and poses (docs/architecture/scan-sessions.md).
     let mut pipeline = match scancraft_pipeline::pipeline_for(&scan_config, config.min_mm, config.max_mm) {
@@ -151,10 +308,15 @@ pub async fn scan_worker(
             return;
         }
     };
+    let (ai_in, ai_out) = spawn_live_ai_helper(Arc::clone(&live_ai.engine));
+    let mut latest_ai: Option<LiveAiJobOutput> = None;
+    let min_iou = PostprocessConfig::default().min_iou;
+
     // Points and keyframes are handed over once; an update the interface could not take yet
     // carries them into the next one.
     let mut carried_points: Vec<scancraft_core::Point3D> = Vec::new();
     let mut carried_keyframes: Vec<KeyframeInfo> = Vec::new();
+    let mut carried_rgb_keyframes: Vec<scancraft_color::RgbKeyframe> = Vec::new();
     let (mut incoming, mut processed, mut marker) = (RateWindow::default(), RateWindow::default(), RateWindow::default());
     while let Some(mut frame) = frames.recv().await {
         incoming.tick(std::time::Instant::now());
@@ -164,6 +326,34 @@ pub async fn scan_worker(
             frame = newer;
         }
         processed.tick(std::time::Instant::now());
+
+        while let Ok(res) = ai_out.try_recv() {
+            latest_ai = Some(res);
+        }
+        if !live_ai.enabled.load(Ordering::Relaxed) {
+            latest_ai = None;
+        } else if let Some(c) = frame.color.as_ref() {
+            let prompt_norm = live_ai.pending_prompt.lock().ok().and_then(|mut g| g.take());
+            let reset = live_ai.reset_requested.swap(false, Ordering::Relaxed);
+            if reset {
+                latest_ai = None;
+            }
+            let _ = ai_in.try_send(LiveAiJobInput {
+                frame_index: frame.frame_index,
+                rgb: c.image.clone(),
+                prompt_norm,
+                reset,
+            });
+        }
+
+        if let (Some(ai), Some(cam), Some(depth)) = (
+            latest_ai.as_ref().filter(|a| a.tracking && a.iou >= min_iou),
+            frame.color.as_ref().and_then(|c| c.camera.as_ref()),
+            frame.depth.as_ref(),
+        ) {
+            frame.depth = Some(mask_depth_map(depth, cam, &ai.mask));
+        }
+
         let (depth_image, distance) = match frame.depth.as_ref() {
             Some(d) => {
                 let (img, dist) = depth_preview(d, config.min_mm, config.max_mm, 320);
@@ -172,7 +362,11 @@ pub async fn scan_worker(
             None => (None, None),
         };
         let ir_image = frame.ir.as_ref().and_then(|ir| ir_preview(&ir.left, 320));
-
+        let color_image = frame.color.as_ref().and_then(|c| rgb_preview(&c.image, 320));
+        let (ai_mask_overlay, ai_status) = match latest_ai.as_ref() {
+            Some(ai) => (Some(ai.overlay.clone()), Some((ai.iou, ai.provider.clone()))),
+            None => (None, None),
+        };
 
         // The tracker fuses only frames it could align and hands back just the newly seen
         // surface, so holding still or losing track never stacks duplicate points.
@@ -191,6 +385,7 @@ pub async fn scan_worker(
                 seed = Some(tracker.seed_state()).filter(|s| *s != scancraft_slam::SeedState::None);
             }
             overlay = pipeline.overlay();
+            carried_rgb_keyframes.extend(pipeline.take_new_rgb_keyframes());
         }
         let now = std::time::Instant::now();
         // Count a marker update only for frames the pipeline actually processed (repeated IR
@@ -208,10 +403,14 @@ pub async fn scan_worker(
         let update = ScanUpdate {
             ir_image,
             depth_image,
+            color_image,
             distance_mm: distance,
             tracking,
             new_points: std::mem::take(&mut carried_points),
             keyframes: std::mem::take(&mut carried_keyframes),
+            rgb_keyframes: std::mem::take(&mut carried_rgb_keyframes),
+            ai_mask_overlay,
+            ai_status,
             seed,
             overlay,
             rates,
@@ -221,6 +420,7 @@ pub async fn scan_worker(
             Err(mpsc::error::TrySendError::Full(update)) => {
                 carried_points = update.new_points;
                 carried_keyframes = update.keyframes;
+                carried_rgb_keyframes = update.rgb_keyframes;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => break,
         }
@@ -234,7 +434,22 @@ pub async fn preview_worker(mut frames: mpsc::Receiver<PreviewFrame>, ui: mpsc::
             frame = newer;
         }
         let ir_image = frame.ir_image.as_ref().or(frame.rgb_image.as_ref()).and_then(|img| ir_preview(img, 320));
-        let update = ScanUpdate { ir_image, depth_image: None, distance_mm: frame.average_distance_mm, tracking: None, new_points: Vec::new(), keyframes: Vec::new(), seed: None, overlay: None, rates: None };
+        let color_image = frame.rgb_image.as_ref().and_then(|img| rgb_preview(img, 320));
+        let update = ScanUpdate {
+            ir_image,
+            depth_image: None,
+            color_image,
+            distance_mm: frame.average_distance_mm,
+            tracking: None,
+            new_points: Vec::new(),
+            keyframes: Vec::new(),
+            rgb_keyframes: Vec::new(),
+            ai_mask_overlay: None,
+            ai_status: None,
+            seed: None,
+            overlay: None,
+            rates: None,
+        };
         match ui.try_send(update) {
             Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
             Err(mpsc::error::TrySendError::Closed(_)) => break,

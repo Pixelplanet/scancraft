@@ -3,6 +3,8 @@
 //! `scancraft --mock` connects the built-in simulated scanner at start;
 //! `scancraft --connect <ip>` connects a network scanner at start.
 
+mod ai_pack;
+mod ai_segment;
 mod alignment;
 mod app;
 mod dev;
@@ -13,6 +15,7 @@ mod model;
 mod project;
 mod replay;
 mod scan_modes;
+mod ui_ai;
 mod ui_history;
 mod ui_panels;
 mod ui_shell;
@@ -105,6 +108,7 @@ impl eframe::App for ScanCraft {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.app.close_prompt = Some(app::ClosePrompt::Quit);
         }
+        crate::ui_ai::ai_pack_modal(&mut self.app, &ctx);
         ui_shell::close_prompt(&mut self.app, &ctx);
         ui_shell::app_bar(&mut self.app, ui);
         ui_shell::status_bar(&mut self.app, ui);

@@ -19,6 +19,8 @@ pub enum PickPurpose {
     SaveFolder,
     /// The file an export writes.
     ExportFile,
+    /// A folder holding pre-downloaded AI pack files (models and/or ONNX Runtime DLLs).
+    AiPackFolder,
 }
 
 /// A dialog's answer: the purpose and the chosen paths (empty when cancelled).
@@ -90,6 +92,7 @@ impl FilePicker {
                 PickPurpose::AddProjects => dialog.set_title("Add ScanCraft Projects").pick_folders().unwrap_or_default(),
                 PickPurpose::OpenProject => dialog.set_title("Open ScanCraft Project").pick_folder().into_iter().collect(),
                 PickPurpose::SaveFolder => dialog.set_title("Save Project into Folder").pick_folder().into_iter().collect(),
+                PickPurpose::AiPackFolder => dialog.set_title("Select AI Pack Folder (Models or ONNX Runtime)").pick_folder().into_iter().collect(),
                 PickPurpose::ExportFile => {
                     let (label, ext) = export_filter(&extension);
                     let mut dialog = dialog.set_title("Export").add_filter(label, ext);

@@ -57,6 +57,8 @@ pub enum Tool {
     Crop,
     /// Keep the object: click a cluster to keep it, shift-click one to leave it out.
     IsolateObject,
+    /// Segment the object with SAM 2.1 video segmentation on colour keyframes.
+    AiSegment,
     Reconstruct,
     Smooth,
     Decimate,
@@ -86,6 +88,7 @@ impl Tool {
             Tool::Downsample => "Downsample",
             Tool::Crop => "Crop Box",
             Tool::IsolateObject => "Isolate Object",
+            Tool::AiSegment => "AI Segment",
             Tool::Reconstruct => "Reconstruct Surface",
             Tool::Smooth => "Smooth",
             Tool::Decimate => "Decimate",
@@ -103,6 +106,7 @@ impl Tool {
             Tool::Downsample => "snap",
             Tool::Crop => "box",
             Tool::IsolateObject => "body",
+            Tool::AiSegment => "filter",
             Tool::Reconstruct => "mesh_body",
             Tool::Smooth => "surface",
             Tool::Decimate => "reach",
@@ -118,7 +122,7 @@ impl Tool {
         match self {
             Tool::ConnectIp | Tool::SaveProject => Stage::Connect,
             Tool::PointPairs(_) => Stage::Align,
-            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject => Stage::Clean,
+            Tool::RemovePlane | Tool::Outliers | Tool::Downsample | Tool::Crop | Tool::IsolateObject | Tool::AiSegment => Stage::Clean,
             Tool::Reconstruct | Tool::Smooth | Tool::Decimate | Tool::FillHoles | Tool::MakeSolid => Stage::Mesh,
             Tool::Export(_) => Stage::Export,
         }
@@ -291,6 +295,8 @@ pub struct ScanPass {
     /// merge and saving. A cleaned captured pass cannot be continued or have frames discarded
     /// until its cleaning is reset.
     pub edit: Option<Arc<PointCloud>>,
+    /// Calibrated RGB keyframes captured during this pass (for colour projection and AI segmentation).
+    pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
 }
 
 impl ScanPass {
@@ -447,11 +453,18 @@ pub enum DeviceEvent {
 pub struct ScanUpdate {
     pub ir_image: Option<ColorImage>,
     pub depth_image: Option<ColorImage>,
+    pub color_image: Option<ColorImage>,
     pub distance_mm: Option<f32>,
     pub tracking: Option<TrackingStatus>,
     pub new_points: Vec<Point3D>,
     /// Keyframes stored since the last update the interface received.
     pub keyframes: Vec<KeyframeInfo>,
+    /// Calibrated RGB keyframes added since the last update.
+    pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
+    /// Live AI segmentation object mask overlay for `color_image`, if active.
+    pub ai_mask_overlay: Option<ColorImage>,
+    /// Live AI segmentation IoU score (0..1) and active provider label.
+    pub ai_status: Option<(f32, String)>,
     /// For a pass started inside the project model: whether it has located itself yet.
     pub seed: Option<SeedState>,
     /// Markers (or other features) of this frame, for the camera view and the 3D view.
@@ -508,6 +521,26 @@ pub enum JobResult {
     Refined(Box<RefineOutcome>),
     /// The Isolate Object tool's segmentation, and the picks it was made for.
     Isolated { segmentation: Arc<scancraft_fusion::Segmentation>, picks: crate::isolation::Picks },
+    /// Initial single-keyframe SAM 2.1 mask (preview + score) before propagating across all keyframes.
+    AiPrompted {
+        pass: u32,
+        keyframe_index: usize,
+        mask: scancraft_segment::FrameMask,
+        overlay: egui::ColorImage,
+    },
+    /// SAM 2.1 video propagation + 3D depth-buffered multi-view labels for the active pass.
+    AiPropagated {
+        pass: u32,
+        masks: Vec<scancraft_segment::FrameMask>,
+        labels: Vec<scancraft_segment::PointLabel>,
+        message: String,
+    },
+    /// AI Pack install / download / verification finished.
+    AiPackUpdated {
+        status: crate::ai_pack::AiPackStatus,
+        message: String,
+        ok: bool,
+    },
     Merged { cloud: PointCloud, passes: Vec<u32>, message: String },
     Saved { path: std::path::PathBuf, name: String, message: String },
     Opened(Box<OpenedProject>),
@@ -594,6 +627,7 @@ pub struct PassSnapshot {
     pub mask: MaskCache,
     pub surface: Option<Arc<PointCloud>>,
     pub edit: Option<Arc<PointCloud>>,
+    pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
 }
 
 /// Undo history: the states before each action (oldest first) and, after an undo, the states

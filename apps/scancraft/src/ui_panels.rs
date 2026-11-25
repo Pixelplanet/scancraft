@@ -570,16 +570,21 @@ pub fn properties(app: &mut ScanCraftApp, ctx: &egui::Context, bounds: Rect) -> 
                     let blocked = app.tool_blocked(tool);
                     let bad_ip = tool == Tool::ConnectIp && !app.ip_valid();
                     let few_pairs = matches!(tool, Tool::PointPairs(_)) && app.picked_pairs().len() < 3;
+                    let no_ai_object = tool == Tool::AiSegment && app.ai_picking.as_ref().is_none_or(|a| a.kept_count() == 0);
                     let label = match tool {
                         Tool::ConnectIp => "Connect",
                         Tool::Export(_) => "Export",
                         Tool::PointPairs(_) => "Align",
                         Tool::SaveProject => "Save",
+                        Tool::AiSegment => "Keep object",
                         _ => "Apply",
                     };
                     kit::Actions {
-                        primary: Some((label, blocked.is_none() && !bad_ip && !few_pairs)),
-                        primary_tip: blocked.or(bad_ip.then_some("Enter a valid address")).or(few_pairs.then_some("Pick at least 3 pairs")),
+                        primary: Some((label, blocked.is_none() && !bad_ip && !few_pairs && !no_ai_object)),
+                        primary_tip: blocked
+                            .or(bad_ip.then_some("Enter a valid address"))
+                            .or(few_pairs.then_some("Pick at least 3 pairs"))
+                            .or(no_ai_object.then_some("Click a keyframe and run Propagate all first")),
                         cancel: Some("Cancel"),
                         ..Default::default()
                     }
@@ -750,6 +755,7 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         Tool::Export(_) => export_form(app, ui),
         Tool::PointPairs(id) => pairs_form(app, ui, id),
         Tool::IsolateObject => isolate_form(app, ui),
+        Tool::AiSegment => crate::ui_ai::ai_segment_form(app, ui),
         Tool::SaveProject => {
             kit::row(ui, "Folder", |ui| path_field(app, ui, PickPurpose::SaveFolder));
             let n = app.passes.len();
@@ -1052,6 +1058,7 @@ fn scan_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             app.show_inset = true;
         }
     });
+    crate::ui_ai::scan_live_ai_controls(app, ui);
     kit::section(ui, "density", "Density", false, |ui| {
         ui.add_enabled_ui(!live, |ui| {
             let s = &mut app.settings;

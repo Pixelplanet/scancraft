@@ -57,6 +57,15 @@ pub enum Tone {
     Error,
 }
 
+/// Which camera image the bottom-left camera view displays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum InsetView {
+    #[default]
+    Ir,
+    Depth,
+    Color,
+}
+
 /// Frames per second over a short window.
 #[derive(Default)]
 pub struct FpsMeter {
@@ -128,6 +137,8 @@ pub struct Settings {
     /// open next time.
     pub import_path: String,
     pub add_project_path: String,
+    /// Optional live SAM 2.1 segmentation of RGB frames while capturing.
+    pub live_ai_segment: bool,
 }
 
 impl Default for Settings {
@@ -161,6 +172,7 @@ impl Default for Settings {
             whole_scene: false,
             import_path: String::new(),
             add_project_path: String::new(),
+            live_ai_segment: false,
         }
     }
 }
@@ -275,7 +287,9 @@ pub struct ScanCraftApp {
     // Live read-outs.
     pub ir_texture: Option<TextureHandle>,
     pub depth_texture: Option<TextureHandle>,
-    pub inset_depth: bool,
+    pub color_texture: Option<TextureHandle>,
+    pub ai_mask_texture: Option<TextureHandle>,
+    pub inset_view: InsetView,
     pub show_inset: bool,
     pub distance_mm: Option<f32>,
     pub tracking: Option<TrackingStatus>,
@@ -320,6 +334,14 @@ pub struct ScanCraftApp {
     pub picking: Option<PairPicking>,
     /// The Isolate Object tool's picks and result.
     pub object_picking: Option<ObjectPicking>,
+    /// The AI Segment tool's interactive SAM 2.1 picking/propagation state.
+    pub ai_picking: Option<crate::ai_segment::AiPicking>,
+    /// Optional AI Pack runtime, installation status, and consent modal flag.
+    pub ai_engine: Arc<crate::ai_pack::SharedAiEngine>,
+    pub ai_status: crate::ai_pack::AiPackStatus,
+    pub ai_pack_modal: bool,
+    pub live_ai: Arc<crate::worker::LiveAiState>,
+    pub live_ai_status: Option<(f32, String)>,
     /// The undo snapshot of the running job, pushed when it succeeds.
     pending_undo: Option<Snapshot>,
     /// A message shown over the view for a few seconds.
@@ -397,6 +419,9 @@ impl ScanCraftApp {
         let (dev_tx, dev_rx) = mpsc::channel(32);
         let (job_tx, job_rx) = mpsc::channel(8);
         let scan_config = ScanConfig::default();
+        let ai_engine = Arc::new(crate::ai_pack::SharedAiEngine::default());
+        let ai_status = crate::ai_pack::inspect_pack(Some(&ai_engine));
+        let live_ai = Arc::new(crate::worker::LiveAiState::new(Arc::clone(&ai_engine)));
         let mut app = ScanCraftApp {
             rt,
             registry,
@@ -416,7 +441,9 @@ impl ScanCraftApp {
             preview_starting: false,
             ir_texture: None,
             depth_texture: None,
-            inset_depth: false,
+            color_texture: None,
+            ai_mask_texture: None,
+            inset_view: InsetView::Ir,
             show_inset: true,
             distance_mm: None,
             tracking: None,
@@ -446,6 +473,12 @@ impl ScanCraftApp {
             poses_preview: None,
             picking: None,
             object_picking: None,
+            ai_picking: None,
+            ai_engine,
+            ai_status,
+            ai_pack_modal: false,
+            live_ai,
+            live_ai_status: None,
             pending_undo: None,
             toast: None,
             toast_action: None,
@@ -560,8 +593,11 @@ impl ScanCraftApp {
             }
         }
         self.mesh = None;
-        // An open Isolate Object tool works on a copy of the old points, placed as they were.
+        // An open Isolate Object / AI Segment tool works on a copy of the old points, placed as they were.
         if self.object_picking.take().is_some() && self.tool == Some(Tool::IsolateObject) {
+            self.tool = None;
+        }
+        if self.ai_picking.take().is_some() && self.tool == Some(Tool::AiSegment) {
             self.tool = None;
         }
         if matches!(self.selection, Some(Node::Mesh)) {
@@ -917,10 +953,12 @@ impl ScanCraftApp {
                     self.settings.min_mm = conn.info.recommended_distance_range_mm.0.min(self.settings.min_mm);
                     self.settings.max_mm = conn.info.recommended_distance_range_mm.1.max(self.settings.max_mm);
                     let choice = scan_modes::reconcile(&conn.capabilities.modes, self.mode_choice());
+                    let has_rgb = conn.capabilities.has_rgb_camera;
                     self.connection = Some(conn);
                     self.scan_config.light = choice.light;
                     self.scan_config.tracking = choice.tracking;
                     self.scan_config.object = choice.object;
+                    self.scan_config.color_texture = has_rgb;
                     self.apply_preset();
                     self.selection = Some(Node::Device);
                     self.say(Tone::Success, message);
@@ -993,6 +1031,7 @@ impl ScanCraftApp {
                                 mask: isolation::new_cache(),
                                 surface: None,
                                 edit: None,
+                                rgb_keyframes: Vec::new(),
                             });
                             (id, tracker, "Capturing")
                         }
@@ -1000,10 +1039,11 @@ impl ScanCraftApp {
                     self.active_pass = Some(id);
                     self.selection = Some(Node::Pass(id));
                     self.paused_flag = Arc::new(AtomicBool::new(false));
+                    self.live_ai_status = None;
                     let (tx, urx) = mpsc::channel(4);
                     self.updates = Some(urx);
                     self.fps.clear();
-                    self.rt.spawn(worker::scan_worker(rx, tx, config, scan_config, tracker, self.paused_flag.clone()));
+                    self.rt.spawn(worker::scan_worker(rx, tx, config, scan_config, tracker, self.paused_flag.clone(), Arc::clone(&self.live_ai)));
                     self.say(Tone::Normal, format!("{verb} pass {id}"));
                 }
                 DeviceEvent::ScanFailed(e) => {
@@ -1082,6 +1122,26 @@ impl ScanCraftApp {
                 match &mut self.depth_texture {
                     Some(t) => t.set(img, TextureOptions::LINEAR),
                     None => self.depth_texture = Some(ctx.load_texture("depth_preview", img, TextureOptions::LINEAR)),
+                }
+            }
+            if let Some(img) = u.color_image {
+                match &mut self.color_texture {
+                    Some(t) => t.set(img, TextureOptions::LINEAR),
+                    None => self.color_texture = Some(ctx.load_texture("color_preview", img, TextureOptions::LINEAR)),
+                }
+            }
+            if let Some(img) = u.ai_mask_overlay {
+                match &mut self.ai_mask_texture {
+                    Some(t) => t.set(img, TextureOptions::LINEAR),
+                    None => self.ai_mask_texture = Some(ctx.load_texture("ai_mask_preview", img, TextureOptions::LINEAR)),
+                }
+            }
+            if u.ai_status.is_some() {
+                self.live_ai_status = u.ai_status;
+            }
+            if !u.rgb_keyframes.is_empty() {
+                if let Some(pass) = self.active_pass.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)) {
+                    pass.rgb_keyframes.extend(u.rgb_keyframes);
                 }
             }
             if let Some(t) = &u.tracking {
@@ -1262,6 +1322,7 @@ impl ScanCraftApp {
                     mask: p.mask.clone(),
                     surface: p.surface.clone(),
                     edit: p.edit.clone(),
+                    rgb_keyframes: p.rgb_keyframes.clone(),
                 })
                 .collect(),
             label: label.to_string(),
@@ -1285,7 +1346,8 @@ impl ScanCraftApp {
         self.clear_previews();
         self.picking = None;
         self.object_picking = None;
-        if self.tool == Some(Tool::IsolateObject) {
+        self.ai_picking = None;
+        if matches!(self.tool, Some(Tool::IsolateObject | Tool::AiSegment)) {
             self.tool = None;
         }
         let merged_visible = self.merged.as_ref().is_none_or(|m| m.layer.visible);
@@ -1316,7 +1378,7 @@ impl ScanCraftApp {
                 if differs {
                     resync.push((p.id, p.tracker.clone(), flags));
                 }
-                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit }
+                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit, rgb_keyframes: p.rgb_keyframes }
             })
             .collect();
         // The project changed (for unsaved-changes tracking), though no layer is new.
@@ -1600,6 +1662,7 @@ impl ScanCraftApp {
                     None
                 }
             }
+            Tool::AiSegment => self.ai_segment_blocked(),
             Tool::Smooth | Tool::Decimate => self.mesh.is_none().then_some("Reconstruct a surface first"),
             Tool::FillHoles => match &self.mesh {
                 None => Some("Reconstruct a surface first"),
@@ -1636,8 +1699,14 @@ impl ScanCraftApp {
         if tool == Tool::IsolateObject && !self.start_object_picking() {
             return;
         }
+        if tool == Tool::AiSegment && !self.start_ai_picking() {
+            return;
+        }
         if tool != Tool::IsolateObject && !tool.is_file() {
             self.object_picking = None;
+        }
+        if tool != Tool::AiSegment && !tool.is_file() {
+            self.ai_picking = None;
         }
         if tool == Tool::SaveProject {
             if let Some(path) = &self.project.path {
@@ -1659,6 +1728,7 @@ impl ScanCraftApp {
         self.tool = None;
         self.picking = None;
         self.object_picking = None;
+        self.ai_picking = None;
     }
 
     pub fn set_export_format(&mut self, format: ExportFormat) {
@@ -1959,6 +2029,248 @@ impl ScanCraftApp {
         }
     }
 
+    // ------------------------------------------------------------------ AI segment & AI Pack
+
+    pub fn refresh_ai_status(&mut self) {
+        self.ai_status = crate::ai_pack::inspect_pack(Some(&self.ai_engine));
+    }
+
+    pub fn download_ai_pack(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.ai_engine.unload();
+        self.spawn_job("Downloading AI Pack", || match crate::ai_pack::download_pack() {
+            Ok(status) => JobResult::AiPackUpdated {
+                ok: status.ready,
+                message: if status.ready {
+                    format!("AI Pack verified and ready ({:.0} MB)", status.total_mb())
+                } else {
+                    "Downloaded files did not complete AI Pack verification".to_string()
+                },
+                status,
+            },
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    pub fn install_ai_pack_from(&mut self, folder: std::path::PathBuf) {
+        if self.busy.is_some() {
+            return;
+        }
+        self.ai_engine.unload();
+        self.spawn_job("Installing AI Pack", move || match crate::ai_pack::install_from_folder(&folder) {
+            Ok(status) => JobResult::AiPackUpdated {
+                ok: status.ready,
+                message: if status.ready {
+                    format!("Installed & verified AI Pack ({:.0} MB)", status.total_mb())
+                } else {
+                    "Copied matching files; still waiting for remaining AI Pack files".to_string()
+                },
+                status,
+            },
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    pub fn remove_ai_pack(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let engine = Arc::clone(&self.ai_engine);
+        self.spawn_job("Removing AI Pack", move || match crate::ai_pack::remove_pack(&engine) {
+            Ok(status) => JobResult::AiPackUpdated {
+                ok: true,
+                message: "Removed downloaded AI Pack files".to_string(),
+                status,
+            },
+            Err(e) => JobResult::Failed(e),
+        });
+    }
+
+    pub fn sync_live_ai_setting(&mut self) {
+        self.live_ai.set_enabled(self.settings.live_ai_segment);
+        if !self.settings.live_ai_segment {
+            self.live_ai_status = None;
+            self.ai_mask_texture = None;
+        }
+    }
+
+    pub fn trigger_live_ai_prompt(&mut self, nx: f32, ny: f32) {
+        self.live_ai.set_prompt_normalized(nx, ny);
+    }
+
+    pub fn ai_segment_blocked(&self) -> Option<&'static str> {
+        if self.ai_picking.is_some() {
+            return None;
+        }
+        if !self.ai_status.ready {
+            return Some("Install the AI Pack first (AI Pack in top bar)");
+        }
+        let targets = self.clean_targets();
+        let target = match targets.as_slice() {
+            [] => return Some("Nothing shown: show a pass to segment"),
+            [CleanTarget::Merged] => return Some("AI Segment needs a scan pass with RGB keyframes (hide Merged model)"),
+            [CleanTarget::Pass(id)] => *id,
+            _ => return Some("Show only the pass to segment (hide the others)"),
+        };
+        let Some(pass) = self.passes.iter().find(|p| p.id == target) else {
+            return Some("Pass not found");
+        };
+        if pass.rgb_keyframes.is_empty() {
+            return Some("Selected pass has no recorded RGB keyframes (enable colour scanner)");
+        }
+        None
+    }
+
+    pub fn start_ai_picking(&mut self) -> bool {
+        if self.ai_picking.is_some() {
+            return true;
+        }
+        if let Some(why) = self.ai_segment_blocked() {
+            if !self.ai_status.ready {
+                self.ai_pack_modal = true;
+            }
+            self.say(Tone::Warning, why);
+            return false;
+        }
+        let Some(&CleanTarget::Pass(id)) = self.clean_targets().first() else { return false };
+        let Some(p) = self.passes.iter().find(|p| p.id == id) else { return false };
+        let input = match p.source().editable() {
+            Ok(c) => Arc::new(c),
+            Err(e) => {
+                self.say(Tone::Error, e);
+                return false;
+            }
+        };
+        match crate::ai_segment::AiPicking::from_pass(p.id, p.name.clone(), input, p.meta.transform, &p.rgb_keyframes) {
+            Ok(picking) => {
+                self.ai_picking = Some(picking);
+                self.say(Tone::Normal, "Click the object on the keyframe, then run Propagate all");
+                true
+            }
+            Err(e) => {
+                self.say(Tone::Error, e);
+                false
+            }
+        }
+    }
+
+    pub fn select_ai_keyframe(&mut self, index: usize) {
+        if let Some(ai) = self.ai_picking.as_mut() {
+            ai.selected = index.min(ai.keyframes.len().saturating_sub(1));
+            ai.preview_texture = None;
+        }
+    }
+
+    pub fn add_ai_pick(&mut self, pick: crate::ai_segment::ImagePick) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(ai) = self.ai_picking.as_mut() else { return };
+        let idx = ai.selected;
+        ai.prompts[idx].push(pick);
+        ai.labels = None;
+        ai.preview = None;
+        ai.masked_displays[idx] = None;
+        ai.texture_rev += 1;
+        ai.preview_texture = None;
+        self.evaluate_selected_ai_prompt();
+    }
+
+    pub fn undo_ai_pick(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(ai) = self.ai_picking.as_mut() else { return };
+        let idx = ai.selected;
+        if ai.prompts[idx].pop().is_some() {
+            ai.labels = None;
+            ai.preview = None;
+            ai.masks[idx] = None;
+            ai.masked_displays[idx] = None;
+            ai.texture_rev += 1;
+            ai.preview_texture = None;
+            if !ai.prompts[idx].is_empty() {
+                self.evaluate_selected_ai_prompt();
+            }
+        }
+    }
+
+    fn evaluate_selected_ai_prompt(&mut self) {
+        let Some(ai) = self.ai_picking.as_ref() else { return };
+        let idx = ai.selected;
+        let Some(prompt) = ai.build_prompt_for(idx) else { return };
+        let pass = ai.pass;
+        let kf_id = ai.keyframes[idx].kf.id;
+        let rgb = ai.keyframes[idx].rgb.clone();
+        let picks = ai.prompts[idx].clone();
+        let engine = Arc::clone(&self.ai_engine);
+        self.spawn_job("Running SAM 2.1 prompt", move || {
+            match crate::ai_segment::run_single_keyframe(&engine, &rgb, &prompt, &picks, kf_id) {
+                Ok((mask, overlay)) => JobResult::AiPrompted { pass, keyframe_index: idx, mask, overlay },
+                Err(e) => JobResult::Failed(e),
+            }
+        });
+    }
+
+    pub fn propagate_ai_segment(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(ai) = self.ai_picking.as_ref() else { return };
+        if !ai.any_prompts() {
+            self.say(Tone::Warning, "Click on at least one keyframe to mark the object first");
+            return;
+        }
+        let pass = ai.pass;
+        let keyframes: Vec<(scancraft_color::RgbKeyframe, scancraft_core::RgbImage)> =
+            ai.keyframes.iter().map(|k| (k.kf.clone(), k.rgb.clone())).collect();
+        let prompts: Vec<Option<scancraft_segment::FramePrompt>> =
+            (0..keyframes.len()).map(|i| ai.build_prompt_for(i)).collect();
+        let pass_points = ai.input.points.clone();
+        let engine = Arc::clone(&self.ai_engine);
+        self.spawn_job("Segmenting keyframes with SAM 2.1", move || {
+            match crate::ai_segment::propagate_and_project_3d(&engine, &keyframes, &prompts, &pass_points) {
+                Ok((masks, labels, provider)) => {
+                    let kept = labels.iter().filter(|l| **l == scancraft_segment::PointLabel::Object).count();
+                    JobResult::AiPropagated {
+                        pass,
+                        masks,
+                        labels,
+                        message: format!(
+                            "SAM 2.1 ({provider}): segmented {kept} of {} points across {} keyframes",
+                            thousands(pass_points.len()),
+                            keyframes.len()
+                        ),
+                    }
+                }
+                Err(e) => JobResult::Failed(e),
+            }
+        });
+    }
+
+    fn commit_ai_segment(&mut self) {
+        let Some((pass, kept, total)) = self
+            .ai_picking
+            .as_ref()
+            .and_then(|ai| ai.filter_pass_cloud().map(|c| (ai.pass, c, ai.input.len())))
+        else {
+            self.say(Tone::Warning, "Click a keyframe and run Propagate all first");
+            return;
+        };
+        if kept.is_empty() {
+            self.say(Tone::Warning, "No object points remained; adjust the clicks and propagate again");
+            return;
+        }
+        self.history.push(self.snapshot("AI segment object"));
+        let msg = format!("AI Segment: kept {} of {} points", thousands(kept.len()), thousands(total));
+        self.apply_cleaned(vec![(pass, kept)], None);
+        self.say(Tone::Success, msg);
+        self.ai_picking = None;
+        self.tool = None;
+    }
+
     pub fn remove_object_pick(&mut self, index: usize) {
         let Some(o) = self.object_picking.as_mut() else { return };
         if index < o.picks.len() {
@@ -2026,6 +2338,10 @@ impl ScanCraftApp {
             }
             Tool::IsolateObject => {
                 self.commit_object();
+                return;
+            }
+            Tool::AiSegment => {
+                self.commit_ai_segment();
                 return;
             }
             Tool::RemovePlane => {
@@ -2191,6 +2507,7 @@ impl ScanCraftApp {
             P::ImportScans => self.settings.import_path.clone(),
             P::AddProjects => self.settings.add_project_path.clone(),
             P::OpenProject | P::SaveFolder => self.settings.project_path.clone(),
+            P::AiPackFolder => crate::ai_pack::effective_models_dir().parent().map(|d| d.display().to_string()).unwrap_or_default(),
             P::ExportFile => {
                 let path = std::path::Path::new(self.settings.export_path.trim());
                 if path.is_absolute() {
@@ -2238,6 +2555,7 @@ impl ScanCraftApp {
                 }
             }
             P::SaveFolder => self.settings.project_path = first.display().to_string(),
+            P::AiPackFolder => self.install_ai_pack_from(first),
             P::ExportFile => {
                 // The format follows the chosen extension when it names one we write.
                 let ext = first.extension().map(|e| e.to_string_lossy().to_ascii_lowercase());
@@ -2329,6 +2647,27 @@ impl ScanCraftApp {
                     }
                     // Picks made while it ran.
                     self.segment_picks();
+                }
+                JobResult::AiPrompted { pass, keyframe_index, mask, overlay } => {
+                    let score = mask.iou_score;
+                    if let Some(ai) = self.ai_picking.as_mut().filter(|a| a.pass == pass) {
+                        ai.set_prompt_result(keyframe_index, mask, overlay);
+                    }
+                    self.refresh_ai_status();
+                    self.say(Tone::Normal, format!("SAM 2.1 mask updated (IoU {score:.2}) · run Propagate all when ready"));
+                }
+                JobResult::AiPropagated { pass, masks, labels, message } => {
+                    let g = self.preview_generation();
+                    let provider = self.ai_engine.provider_summary().unwrap_or_default();
+                    if let Some(ai) = self.ai_picking.as_mut().filter(|a| a.pass == pass) {
+                        ai.set_propagation_result(masks, labels, provider, g);
+                    }
+                    self.refresh_ai_status();
+                    self.say(Tone::Success, message);
+                }
+                JobResult::AiPackUpdated { status, message, ok } => {
+                    self.ai_status = status;
+                    self.say(if ok { Tone::Success } else { Tone::Warning }, message);
                 }
                 JobResult::Merged { cloud, passes, message } => {
                     // Meshing starts again from the new model.
@@ -2434,6 +2773,7 @@ mod tests {
             mask: isolation::new_cache(),
             surface: None,
             edit: None,
+            rgb_keyframes: Vec::new(),
         });
     }
 
@@ -2711,6 +3051,7 @@ mod tests {
             mask: isolation::new_cache(),
             surface: Some(surface),
             edit: None,
+            rgb_keyframes: Vec::new(),
         });
     }
 
@@ -3033,5 +3374,87 @@ mod tests {
         assert!(app.tool.is_none() && app.object_picking.is_none());
         app.undo();
         assert!(!app.passes[1].is_cleaned() && app.passes[1].layer.len() == total);
+    }
+
+    #[test]
+    fn mock_capture_with_color_populates_rgb_keyframes_by_default() {
+        let mut app = app();
+        app.connect_mock();
+        let t0 = Instant::now();
+        while app.connection.is_none() && t0.elapsed() < Duration::from_secs(5) {
+            app.poll_device_events();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(app.scan_config.color_texture, "RGB-capable scanner should default color_texture to true");
+        app.start_scan();
+        let t0 = Instant::now();
+        while app.passes.first().is_none_or(|p| p.rgb_keyframes.is_empty()) && t0.elapsed() < Duration::from_secs(10) {
+            app.poll_device_events();
+            app.poll_updates(&egui::Context::default());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let rgb_count = app.passes.first().map(|p| p.rgb_keyframes.len()).unwrap_or(0);
+        app.stop_scan();
+        let t0 = Instant::now();
+        while app.capture != Capture::Idle && t0.elapsed() < Duration::from_secs(5) {
+            app.poll_device_events();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(rgb_count > 0, "expected captured RGB keyframes on MockDevice");
+    }
+
+    #[test]
+    #[ignore = "requires SAM 2.1 models + ONNX Runtime DirectML/CPU binaries in SCANCRAFT_SAM2_DIR / SCANCRAFT_ORT_DIR or %LOCALAPPDATA%/ScanCraft/ai"]
+    fn ai_segment_live_workflow_on_sam21() {
+        let mut app = app();
+        app.refresh_ai_status();
+        assert!(app.ai_status.ready, "AI Pack must be installed and verified: {:?}", app.ai_status);
+        let total = table_and_block().len();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        // Synthetic RGB keyframes aligned to the block standing at z > 0 along optical axis (+Y = 0..200 mm).
+        let cam = Arc::new(scancraft_core::ColorCamera {
+            width: 128,
+            height: 128,
+            intrinsics: scancraft_core::PinholeIntrinsics { fx: 160.0, fy: 160.0, cx: 64.0, cy: 64.0 },
+            distortion: [0.0; 5],
+            rotation: glam::Mat3::IDENTITY,
+            translation: glam::Vec3::ZERO,
+        });
+        let pose = scancraft_align::rigid(glam::Quat::IDENTITY, glam::Vec3::new(0.0, -200.0, 20.0));
+        let mut kfs = Vec::new();
+        for i in 0..2u64 {
+            let mut rgb_data = vec![30u8; 128 * 128 * 3];
+            for y in 44..84 {
+                for x in 44..84 {
+                    let off = (y * 128 + x) * 3;
+                    rgb_data[off] = 220;
+                    rgb_data[off + 1] = 110;
+                    rgb_data[off + 2] = 70;
+                }
+            }
+            let frame = scancraft_core::ColorFrame {
+                image: scancraft_core::RgbImage { width: 128, height: 128, channels: 3, data: rgb_data },
+                jpeg: None,
+                timestamp_ms: i * 100,
+                camera: Some(cam.clone()),
+            };
+            kfs.push(scancraft_color::RgbKeyframe::new(i, &frame, cam.clone(), pose, 50.0, i).unwrap());
+        }
+        app.passes[0].rgb_keyframes = kfs;
+        app.open_tool(Tool::AiSegment);
+        assert_eq!(app.tool, Some(Tool::AiSegment));
+        app.add_ai_pick(crate::ai_segment::ImagePick { x: 64.0, y: 64.0, positive: true });
+        finish_job(&mut app);
+        assert!(app.ai_picking.as_ref().unwrap().current_mask().is_some());
+        app.propagate_ai_segment();
+        finish_job(&mut app);
+        let kept_preview = app.ai_picking.as_ref().unwrap().kept_count();
+        assert!(kept_preview > 0 && kept_preview < total, "kept_preview={kept_preview}, total={total}");
+        app.run_tool(Tool::AiSegment);
+        assert!(app.passes[0].is_cleaned());
+        assert_eq!(app.passes[0].layer.len(), kept_preview);
+        assert!(app.tool.is_none() && app.ai_picking.is_none());
+        app.undo();
+        assert!(!app.passes[0].is_cleaned() && app.passes[0].layer.len() == total);
     }
 }

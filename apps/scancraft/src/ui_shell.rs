@@ -83,8 +83,20 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
         // The project tabs, as SolidCraft's document tabs: name, a dot while it has unsaved
-        // changes, a close button; the pill on the right limits how wide they may get.
-        project_tabs(app, ui, r, x + 10.0, r.right() - 220.0);
+        // changes, a close button; the pills on the right limit how wide they may get.
+        project_tabs(app, ui, r, x + 10.0, r.right() - 325.0);
+        // AI Pack status pill (opens the consent / download / local-folder setup dialog).
+        let (ai_dot, ai_text) = if app.ai_status.ready {
+            (t.agent_ok, "AI Ready")
+        } else {
+            (t.text_dim, "AI Pack")
+        };
+        let ai_pill = kit::app_bar_pill(ui, r.right() - 225.0, r, ai_dot, ai_text)
+            .on_hover_text(format!("SAM 2.1 + DirectML AI Pack: {}", app.ai_status.provider_summary));
+        if ai_pill.clicked() {
+            app.refresh_ai_status();
+            app.ai_pack_modal = true;
+        }
         // Connection pill at the right.
         let (dot, text) = match &app.connection {
             Some(c) => (t.agent_ok, format!("{} connected", c.short_name())),
@@ -552,6 +564,14 @@ fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
                         pressed(Tool::IsolateObject),
                         "Keep the object: the table, marker blocks and loose fragments go. Click a cluster to keep it, Shift+click to leave one out",
                     ),
+                    rb(
+                        "ai_segment",
+                        "filter",
+                        "AI Segment",
+                        app.tool_blocked(Tool::AiSegment).filter(|_| !pressed(Tool::AiSegment)),
+                        pressed(Tool::AiSegment),
+                        "Click an RGB keyframe to segment the object across all keyframes with SAM 2.1",
+                    ),
                     rb("plane", "plane", "Remove Plane", app.tool_blocked(Tool::RemovePlane), pressed(Tool::RemovePlane), "Remove the turntable or table plane (RANSAC)"),
                     rb("outliers", "filter", "Outliers", app.tool_blocked(Tool::Outliers), pressed(Tool::Outliers), "Remove isolated points (statistical outlier removal)"),
                     rb("crop", "box", "Crop Box", app.tool_blocked(Tool::Crop), pressed(Tool::Crop), "Keep only the points inside a box"),
@@ -677,6 +697,13 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
                 app.close_tool();
             } else {
                 app.open_tool(Tool::IsolateObject);
+            }
+        }
+        "ai_segment" => {
+            if pressed(Tool::AiSegment) {
+                app.close_tool();
+            } else {
+                app.open_tool(Tool::AiSegment);
             }
         }
         "plane" => app.open_tool(Tool::RemovePlane),

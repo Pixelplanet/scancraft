@@ -47,7 +47,7 @@ impl DotsPose {
     /// `color`: also use colour features (Color tracking); otherwise geometry of the dots only.
     pub fn new(min_mm: f32, max_mm: f32, color: bool) -> Self {
         let pose: Option<Box<dyn PoseEstimator>> = if color { Some(Box::new(crate::color::ColorPoseEstimator::new(min_mm, max_mm))) } else { None };
-        Self { inner: PassPipeline { depth: Box::new(DotsDepth::new(min_mm, max_mm)), pose, color: None }, tracker: Tracker::new(), last_state: None }
+        Self { inner: PassPipeline { depth: Box::new(DotsDepth::new(min_mm, max_mm)), pose, color: None, exported_rgb_keyframes: 0 }, tracker: Tracker::new(), last_state: None }
     }
 }
 

@@ -126,7 +126,7 @@ mod tests {
     use scancraft_driver::ScanConfig;
 
     fn loaded(id: u32, name: &str) -> LoadedPass {
-        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None };
+        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new() };
         project::rebuild(stored)
     }
 
