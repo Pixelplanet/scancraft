@@ -346,3 +346,18 @@ laser model are not built.
   `rejectorient`, `tool:datums`, `tool:scale`, `datumkind`, `datumonto`, `datumflip`,
   `scaletrue`; `accept` also accepts an orient proposal. On the real two-pass shell scan Auto
   Orient chose "largest face" (no rim detected), turning the project 9.9°.
+- 2026-11-25 (second PC, branch `agent/orient`, stopped mid-rework, NOT merged) — State of the
+  orient work when the session stopped. Committed and tested (`scancraft-align` 50 + 2,
+  app 70): everything in the entry above, plus commit "WIP: orient rework". Findings: saved
+  `merged.ply` and imported PLYs carry no normals (`scancraft-io` fills `[0, 0, 1]`), so the first
+  Auto Orient result on the shell project ("largest face", 9.9°) came from placeholder normals;
+  `app_orient.rs::with_real_normals` now estimates them for the orient / datum / scale tools.
+  Rim detector measured with the new `examples/orient_ply.rs` (`rim_report`): the merged shell is
+  not one-sided to any border plane (20 % beyond it) and fails the spread test, so no rim is
+  right there; pass 2 failed only the boundary share (47.5 %), which was lowered from 50 % to
+  30 % with a new holed-dome test. **Still to do:** (1) re-take the screenshots and look at them:
+  the shaded preview with the grid under it, the "Dia." label, the weak-evidence warning, the
+  Scale tool's shaded layer (all in code, none checked on screen); (2) re-run Auto Orient on the
+  shell project now that normals are real and record what it chooses; (3) rebase on
+  `origin/main`, run both test suites, push; (4) remove the worktree `C:\Projects\scancraft-orient`.
+  Screenshots so far: `C:\Projects\scancraft-eval\orient\` (taken before the rework).
