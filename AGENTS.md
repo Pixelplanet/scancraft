@@ -95,6 +95,14 @@ rea xrefs <address> --binary "E:\Revopoint\Revo Scan 6\3DCamera.dll"
 
 ## Working Rules
 
+- **Several agents work in parallel. Each one works in its own git worktree on its own branch,
+  never in the shared checkout** (others' uncommitted changes show up there and get mixed into
+  commits). Start with
+  `git fetch origin && git worktree add ../scancraft-<task> -b agent/<task> origin/main`, work
+  and build only there, with its own `CARGO_TARGET_DIR` (e.g. `../scancraft-target-<task>`).
+  Finish by rebasing on `origin/main`, running the tests of what you touched, and pushing
+  `agent/<task>`; merge into `main` only when the user says so. Remove the worktree afterwards
+  (`git worktree remove`). Commit author: `Pixelplanet <Pixelplanet@users.noreply.github.com>`.
 - Analyze only software and hardware we own or are authorized to examine;
   purpose is interoperability and research (see REA's `DISCLAIMER.md`).
 - Record evidence (file offset, function address, capture frame number) for
