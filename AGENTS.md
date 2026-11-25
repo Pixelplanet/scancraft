@@ -299,3 +299,15 @@ laser model are not built.
   layers make snapshots cheap, history bounded by 2 GiB / 200 steps, History button + timeline
   card with jump to any step (`ui_history.rs`). Open Project picked while busy now opens when free
   (1.4). Script steps `history`, `undo`, `removeplane`, `outliers`.
+- 2026-11-25 (second PC, `scancraft-segment`) — Built `crates/scancraft-segment` (SAM 2.1 video
+  segmentation on `ort` 2.0.0-rc.15 `load-dynamic` + `directml` + `api-24`, no CUDA/TensorRT) and
+  example `segment_seq`: SHA-256 verification for all 4 `jax-image-tools/sam21-tiny-video-onnx`
+  graphs + `constants.json` + ORT 1.24.4 / DirectML 1.15.4 DLLs; DXGI adapter enumeration +
+  DirectML-vs-CPU self-test; Rust memory bank (conditioning + 6 recent frames, 16 object pointers
+  with 1D sine temporal PE), point/box prompts + mid-sequence re-prompting; mask resampling,
+  stability/IoU lost-object detection; `ColorCamera` + depth-buffer occlusion mask→3D projection +
+  `MultiViewVoter`; `GeometricSegmenter` fallback. Verified: 15 model-free unit tests +
+  `#[ignore]` live test (`sam2_live`, `SCANCRAFT_SAM2_DIR`). Measured on AMD Radeon 890M (iGPU,
+  1024 px fp32, 6-frame 640×480 clip): self-test IoU 1.0000 vs CPU; seed 476.4 ms, tracked mean
+  875.1 ms (vision_encoder 405.3 ms, memory_attention 397.5 ms, mask_decoder 23.4 ms,
+  memory_encoder 24.4 ms) vs CPU 8 threads 1807.3 ms (~2.1× speedup).

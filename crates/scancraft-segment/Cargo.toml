@@ -1,0 +1,30 @@
+[package]
+name = "scancraft-segment"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "AI object segmentation (SAM 2.1 video on ONNX Runtime + DirectML) and geometric fallback"
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-fusion.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+image.workspace = true
+
+# Dynamic ONNX Runtime loading (no build-time binary download, no CUDA/TensorRT).
+ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "ndarray", "tracing", "load-dynamic", "directml", "api-24"] }
+ndarray = "0.17"
+sha2 = "0.10"
+libloading = "0.9"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = ["Win32_Graphics_Dxgi"] }
+
+[dev-dependencies]
+anyhow.workspace = true
+env_logger.workspace = true
