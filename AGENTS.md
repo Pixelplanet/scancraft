@@ -345,19 +345,21 @@ laser model are not built.
   proposal), Orient by Datums and Scale from Lengths. New `--auto` steps `autoorient`,
   `rejectorient`, `tool:datums`, `tool:scale`, `datumkind`, `datumonto`, `datumflip`,
   `scaletrue`; `accept` also accepts an orient proposal. On the real two-pass shell scan Auto
-  Orient chose "largest face" (no rim detected), turning the project 9.9°.
-- 2026-11-25 (second PC, branch `agent/orient`, stopped mid-rework, NOT merged) — State of the
-  orient work when the session stopped. Committed and tested (`scancraft-align` 50 + 2,
-  app 70): everything in the entry above, plus commit "WIP: orient rework". Findings: saved
-  `merged.ply` and imported PLYs carry no normals (`scancraft-io` fills `[0, 0, 1]`), so the first
-  Auto Orient result on the shell project ("largest face", 9.9°) came from placeholder normals;
-  `app_orient.rs::with_real_normals` now estimates them for the orient / datum / scale tools.
-  Rim detector measured with the new `examples/orient_ply.rs` (`rim_report`): the merged shell is
-  not one-sided to any border plane (20 % beyond it) and fails the spread test, so no rim is
-  right there; pass 2 failed only the boundary share (47.5 %), which was lowered from 50 % to
-  30 % with a new holed-dome test. **Still to do:** (1) re-take the screenshots and look at them:
-  the shaded preview with the grid under it, the "Dia." label, the weak-evidence warning, the
-  Scale tool's shaded layer (all in code, none checked on screen); (2) re-run Auto Orient on the
-  shell project now that normals are real and record what it chooses; (3) rebase on
-  `origin/main`, run both test suites, push; (4) remove the worktree `C:\Projects\scancraft-orient`.
-  Screenshots so far: `C:\Projects\scancraft-eval\orient\` (taken before the rework).
+  Orient chose "largest face" (no rim detected); see the follow-up entry for the corrected result.
+- 2026-11-25 (second PC, branch `agent/orient`, follow-up) — Orient rework after looking at the
+  first screenshots. Saved `merged.ply` files from before the saving/exports change and
+  project-loaded clouds carry no normals (`[0, 0, 1]` placeholders), so the first Auto Orient
+  result on the shell project (9.9°) came from placeholder normals;
+  `app_orient.rs::with_real_normals` estimates them (only when >= 95 % are placeholders) for the
+  orient / datum / scale tools, and the previews are lit with the grid under the part. With real
+  normals Auto Orient on the two-pass shell says: up from "largest face", turned 44.6°,
+  6 face directions, no main axis, no rim. No rim is right for that merge: measured with the
+  new `crates/scancraft-align/examples/orient_ply.rs` (`rim_report`) the best border plane has
+  35.6 % of the boundary points at 4.13 mm RMS and 2011 of 8764 samples beyond it. Rim boundary
+  share limit lowered from 50 % to 30 % (pass 2 alone failed only that, at 47.5 %), with a
+  holed-dome test. Datums card: count / diameter ("Ø") and the fit RMS on separate rows, clear of
+  the remove button; Scale: length labels beside the segment, clear of the markers. New `--auto`
+  steps `toolapply`, `datumtol:<mm>`. Tests after rebasing on `dde8819`: `scancraft-align`
+  50 + 2, app 76. Not seen on screen: the "Little to go on" warning (no test input has fewer
+  than two face directions). Known rough edge: the Datums card scrolls its hint line when a plane,
+  an axis and a conflict message are all shown, although the window has room.

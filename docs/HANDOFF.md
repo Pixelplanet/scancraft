@@ -49,7 +49,8 @@ solid-model commit:
   planes and axes), Scale from Lengths for imported passes, and Horn's start plus a
   nearly-collinear warning in Point Pairs (`scancraft-align` `horn`/`fit`/`datum`/`orient`/`scale`,
   app `app_orient.rs` / `ui_orient.rs`, ribbon group "Orient" on the Align stage). On the real
-  shell scan Auto Orient found no rim and stood the part on its largest face — worth a look.
+  shell scan Auto Orient finds no rim (correct for that merge, see `examples/orient_ply.rs`) and
+  stands the part on its largest face (44.6°); a part with a clean open rim has not been tried.
 
 **Update 2026-11-24 (version 0.2.0).** Merging several scans works: Align All (pose graph,
 automatic table removal, wall-aware quality for inside/outside scans), Refine as a preview, Merge,
