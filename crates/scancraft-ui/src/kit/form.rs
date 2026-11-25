@@ -265,7 +265,21 @@ fn paint_button(ui: &Ui, rect: Rect, label: &str, kind: Button, enabled: bool, h
     let t = Tokens::get();
     let hovered = enabled && hovered;
     let (fill, border, ink) = if !enabled {
-        (t.control_fill, egui::Stroke::new(1.0, t.control_border), t.form_dim)
+        // Dimmed, but the kind stays recognisable (primary keeps its fill, danger its red).
+        match kind {
+            Button::Primary => (t.form_primary_fill.gamma_multiply(0.35), egui::Stroke::NONE, t.on_accent.gamma_multiply(0.5)),
+            Button::Ghost => (egui::Color32::TRANSPARENT, egui::Stroke::NONE, t.text_dim.gamma_multiply(0.6)),
+            Button::Normal => (
+                t.control_fill.gamma_multiply(0.5),
+                egui::Stroke::new(1.0, t.control_border.gamma_multiply(0.5)),
+                t.text_dim.gamma_multiply(0.6),
+            ),
+            Button::Danger => (
+                t.control_fill.gamma_multiply(0.5),
+                egui::Stroke::new(1.0, t.form_error.gamma_multiply(0.4)),
+                t.form_error.gamma_multiply(0.4),
+            ),
+        }
     } else {
         match kind {
             Button::Primary => (t.form_primary_fill, egui::Stroke::NONE, t.on_accent),
@@ -286,10 +300,14 @@ fn paint_button(ui: &Ui, rect: Rect, label: &str, kind: Button, enabled: bool, h
 
 /// Interacts with a fixed `rect` as a button and paints it (`button_widget`).
 fn button_at(ui: &mut Ui, rect: Rect, label: &str, kind: Button, enabled: bool) -> Response {
+    let t = Tokens::get();
     let enabled = enabled && ui.is_enabled();
     let id = ui.make_persistent_id(("kit_button", rect.min.x.to_bits(), rect.min.y.to_bits(), label));
     let response = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
     paint_button(ui, rect, label, kind, enabled, response.hovered());
+    if response.has_focus() {
+        ui.painter().rect_stroke(rect.expand(1.0), t.control_radius.saturating_add(1), egui::Stroke::new(1.0, t.form_primary), egui::StrokeKind::Inside);
+    }
     response.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, label));
     if enabled && response.hovered() {
         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -644,5 +662,28 @@ mod tests {
         let destructive = r.destructive.unwrap();
         assert_eq!(cancel.rect.right(), primary.rect.left() - t.space_6);
         assert!(destructive.rect.right() <= cancel.rect.left() - t.space_6 + 0.01, "destructive overlapped cancel");
+    }
+
+    #[test]
+    fn a_focused_button_clicks_on_enter() {
+        let ctx = egui::Context::default();
+        let mut id = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            id = Some(button(ui, "Apply", Button::Primary, true).id);
+        });
+        ctx.memory_mut(|m| m.request_focus(id.unwrap()));
+        let mut clicked = false;
+        let _ = ctx.run_ui(
+            egui::RawInput {
+                events: vec![egui::Event::Key { key: egui::Key::Enter, physical_key: Some(egui::Key::Enter), pressed: true, repeat: false, modifiers: egui::Modifiers::NONE }],
+                ..Default::default()
+            },
+            |ui| {
+                let r = button(ui, "Apply", Button::Primary, true);
+                assert!(r.has_focus());
+                clicked = r.clicked();
+            },
+        );
+        assert!(clicked, "Enter on a focused kit button did not click it");
     }
 }

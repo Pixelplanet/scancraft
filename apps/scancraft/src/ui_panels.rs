@@ -1206,8 +1206,6 @@ fn poses_preview_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
             });
         }
     }
-    ui.add_space(t.space_4);
-    kit::note(ui, "Accept or reject it in the card on the right.");
 }
 
 fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
@@ -1262,7 +1260,6 @@ fn align_body(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 );
             }
         }
-        kit::note(ui, "Accept or reject it in the card on the right.");
         return;
     }
     let placed = app.passes.iter().filter(|p| p.meta.alignment.is_placed()).count();
