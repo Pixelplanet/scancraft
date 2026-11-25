@@ -700,7 +700,7 @@ pub fn ribbon(app: &mut ScanCraftApp, ui: &mut egui::Ui, rect: Rect) {
             }
         }
         "ai_segment" => {
-            if pressed(Tool::AiSegment) {
+            if app.tool == Some(Tool::AiSegment) {
                 app.close_tool();
             } else {
                 app.open_tool(Tool::AiSegment);

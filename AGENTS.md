@@ -311,3 +311,15 @@ laser model are not built.
   1024 px fp32, 6-frame 640×480 clip): self-test IoU 1.0000 vs CPU; seed 476.4 ms, tracked mean
   875.1 ms (vision_encoder 405.3 ms, memory_attention 397.5 ms, mask_decoder 23.4 ms,
   memory_encoder 24.4 ms) vs CPU 8 threads 1807.3 ms (~2.1× speedup).
+- 2026-11-25 (second PC, `feature/scancraft-segment`, full app integration) — Wired `scancraft-segment`
+  into `apps/scancraft`, `scancraft-color`, `scancraft-driver`, and `scancraft-pipeline`:
+  `RgbKeyframe::new` encodes raw RGB frames to JPEG when needed; `MockDevice` emits calibrated RGB
+  frames when `color_texture` is set; `PassPipeline::take_new_rgb_keyframes` streams keyframes live;
+  `ScanCraftApp` enables `color_texture` by default on RGB-capable scanners and persists
+  `pass-<id>/rgb/keyframes.json` + JPEGs; `ai_pack.rs` + consent modal handle opt-in download/folder
+  install/removal and DirectML licence/telemetry notices; `Tool::AiSegment` provides split-view
+  interactive prompting, SAM 2.1 propagation, multi-view depth-buffered 3D labeling, and Clean
+  apply/undo; `worker.rs` + `camera_inset` add `Colour` view and experimental non-blocking live AI
+  masking. Rebased on `main` (`2de56c0`); verified with unit tests across all touched crates,
+  `#[ignore]` live SAM 2.1 app workflow test on Radeon 890M, and `--demo-project`/`--auto` GUI
+  screenshot checks.

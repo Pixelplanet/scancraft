@@ -40,94 +40,96 @@ pub fn ai_pack_modal(app: &mut ScanCraftApp, ctx: &egui::Context) {
         .collapsible(false)
         .resizable(false)
         .anchor(egui::Align2::CENTER_CENTER, vec2(0.0, 0.0))
-        .fixed_size(vec2(520.0, 0.0))
+        .fixed_size(vec2(580.0, 0.0))
         .order(egui::Order::Foreground)
         .frame(kit::frame(Surface::Feature).inner_margin(Margin::same(t.space_16 as i8)))
         .show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("AI Object Segmentation Pack (SAM 2.1 + DirectML)").size(15.0).strong().color(t.text));
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::close_button(ui, "Close").clicked() {
-                        close = true;
-                    }
+            kit::scope(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("AI Object Segmentation Pack (SAM 2.1 + DirectML)").size(15.0).strong().color(t.text));
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::close_button(ui, "Close").clicked() {
+                            close = true;
+                        }
+                    });
                 });
-            });
-            ui.add_space(t.space_8);
+                ui.add_space(t.space_8);
 
-            kit::frame(Surface::Panel).inner_margin(Margin::same(t.space_8 as i8)).show(ui, |ui| {
-                kit::row(ui, "Status", |ui| {
-                    let msg = if status.ready {
-                        format!("Installed ({:.0} MB)", status.total_mb())
-                    } else {
-                        "Not installed".to_string()
-                    };
-                    kit::status_line(ui, &msg, if status.ready { t.agent_ok } else { t.warning });
-                });
-                kit::row(ui, "Backend", |ui| kit::value_text(ui, &status.provider_summary, !status.ready));
-                kit::row(ui, "Models", |ui| {
-                    kit::value_text(
-                        ui,
-                        &if status.models_ready {
-                            format!("Verified · {}", status.models_dir.display())
+                kit::frame(Surface::Panel).inner_margin(Margin::same(t.space_8 as i8)).show(ui, |ui| {
+                    kit::row(ui, "Status", |ui| {
+                        let msg = if status.ready {
+                            format!("Installed ({:.0} MB)", status.total_mb())
                         } else {
-                            format!("Missing (~{ESTIMATED_MODELS_MB:.0} MB) · {}", status.models_dir.display())
-                        },
-                        !status.models_ready,
-                    );
+                            "Not installed".to_string()
+                        };
+                        kit::status_line(ui, &msg, if status.ready { t.agent_ok } else { t.warning });
+                    });
+                    kit::row(ui, "Backend", |ui| kit::value_text(ui, &status.provider_summary, !status.ready));
+                    kit::row(ui, "Models", |ui| {
+                        kit::value_text(
+                            ui,
+                            &if status.models_ready {
+                                format!("Verified · {}", status.models_dir.display())
+                            } else {
+                                format!("Missing (~{ESTIMATED_MODELS_MB:.0} MB) · {}", status.models_dir.display())
+                            },
+                            !status.models_ready,
+                        );
+                    });
+                    kit::row(ui, "Runtime", |ui| {
+                        kit::value_text(
+                            ui,
+                            &if status.runtime_ready {
+                                format!("Verified ORT {ORT_VERSION_PIN} + DirectML {DIRECTML_VERSION_PIN}")
+                            } else {
+                                format!("Missing (~{ESTIMATED_RUNTIME_MB:.0} MB) · {}", status.runtime_dir.display())
+                            },
+                            !status.runtime_ready,
+                        );
+                    });
                 });
-                kit::row(ui, "Runtime", |ui| {
-                    kit::value_text(
-                        ui,
-                        &if status.runtime_ready {
-                            format!("Verified ORT {ORT_VERSION_PIN} + DirectML {DIRECTML_VERSION_PIN}")
-                        } else {
-                            format!("Missing (~{ESTIMATED_RUNTIME_MB:.0} MB) · {}", status.runtime_dir.display())
-                        },
-                        !status.runtime_ready,
-                    );
-                });
-            });
 
-            ui.add_space(t.space_8);
-            kit::note(
-                ui,
-                "Before downloading (~380 MB total from Hugging Face & NuGet, verified by SHA-256), please review the bundled third-party terms:",
-            );
-            ui.add_space(t.space_4);
-            kit::frame(Surface::Panel).inner_margin(Margin::same(t.space_8 as i8)).show(ui, |ui| {
-                kit::note(ui, &format!("• SAM 2.1 Hiera-Tiny ONNX ({SAM21_TINY_HF_REPO}): Apache-2.0 licence. Never uses Revo Scan's proprietary encrypted models."));
-                kit::note(ui, &format!("• ONNX Runtime {ORT_VERSION_PIN} (Microsoft.ML.OnnxRuntime.DirectML): MIT licence + ThirdPartyNotices."));
-                kit::note(ui, &format!("• DirectML {DIRECTML_VERSION_PIN} (Microsoft.AI.DirectML): Microsoft Software License — Windows/Xbox only, app-bundled only, includes Microsoft diagnostic/error telemetry notice."));
-            });
-
-            ui.add_space(t.space_12);
-            ui.horizontal(|ui| {
-                let can_dl = !busy && !status.ready;
-                if kit::button(
+                ui.add_space(t.space_8);
+                kit::note(
                     ui,
-                    if busy { "Working…" } else if status.ready { "Already installed" } else { "Accept & Download AI Pack (~380 MB)" },
-                    Button::Primary,
-                    can_dl,
-                )
-                .clicked()
-                {
-                    action_download = true;
-                }
-                if kit::button(ui, "Install from folder…", Button::Normal, !busy)
-                    .on_hover_text("Copy and SHA-256-verify pre-downloaded model/runtime files from a local folder")
+                    "Before downloading (~380 MB total from Hugging Face & NuGet, verified by SHA-256), please review the bundled third-party terms:",
+                );
+                ui.add_space(t.space_4);
+                kit::frame(Surface::Panel).inner_margin(Margin::same(t.space_8 as i8)).show(ui, |ui| {
+                    kit::note(ui, &format!("• SAM 2.1 Hiera-Tiny ONNX ({SAM21_TINY_HF_REPO}): Apache-2.0 licence. Never uses Revo Scan's proprietary encrypted models."));
+                    kit::note(ui, &format!("• ONNX Runtime {ORT_VERSION_PIN} (Microsoft.ML.OnnxRuntime.DirectML): MIT licence + ThirdPartyNotices."));
+                    kit::note(ui, &format!("• DirectML {DIRECTML_VERSION_PIN} (Microsoft.AI.DirectML): Microsoft Software License — Windows/Xbox only, app-bundled only, includes Microsoft diagnostic/error telemetry notice."));
+                });
+
+                ui.add_space(t.space_12);
+                ui.horizontal(|ui| {
+                    let can_dl = !busy && !status.ready;
+                    if kit::button(
+                        ui,
+                        if busy { "Working…" } else if status.ready { "Installed" } else { "Accept & Download (~380 MB)" },
+                        Button::Primary,
+                        can_dl,
+                    )
                     .clicked()
-                {
-                    action_install_folder = true;
-                }
-                if status.models_dir.exists() || status.runtime_dir.exists() {
-                    if kit::button(ui, "Remove Pack", Button::Danger, !busy).clicked() {
-                        action_remove = true;
+                    {
+                        action_download = true;
                     }
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if kit::button(ui, "Recheck", Button::Normal, !busy).clicked() {
-                        action_refresh = true;
+                    if kit::button(ui, "From folder…", Button::Normal, !busy)
+                        .on_hover_text("Copy and SHA-256-verify pre-downloaded model/runtime files from a local folder")
+                        .clicked()
+                    {
+                        action_install_folder = true;
                     }
+                    if status.models_dir.exists() || status.runtime_dir.exists() {
+                        if kit::button(ui, "Remove", Button::Danger, !busy).clicked() {
+                            action_remove = true;
+                        }
+                    }
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if kit::button(ui, "Recheck", Button::Normal, !busy).clicked() {
+                            action_refresh = true;
+                        }
+                    });
                 });
             });
         });
@@ -251,11 +253,11 @@ pub fn ai_segment_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
         let cur = ai.selected;
         let max = ai.keyframes.len().saturating_sub(1);
         ui.horizontal(|ui| {
-            if kit::button(ui, "<", Button::Normal, cur > 0 && !busy).clicked() {
+            if ui.add_enabled(cur > 0 && !busy, egui::Button::new("  <  ")).clicked() {
                 select_kf = Some(cur - 1);
             }
-            kit::value_text(ui, &format!("{} / {}", cur + 1, ai.keyframes.len()), false);
-            if kit::button(ui, ">", Button::Normal, cur < max && !busy).clicked() {
+            ui.label(egui::RichText::new(format!("{} / {}", cur + 1, ai.keyframes.len())).color(t.text));
+            if ui.add_enabled(cur < max && !busy, egui::Button::new("  >  ")).clicked() {
                 select_kf = Some(cur + 1);
             }
         });

@@ -849,6 +849,7 @@ mod tests {
             mask: crate::isolation::new_cache(),
             surface: None,
             edit: None,
+            rgb_keyframes: Vec::new(),
         };
         let mut h = History::default();
         for i in 0..5 {
