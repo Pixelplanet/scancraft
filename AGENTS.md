@@ -363,3 +363,6 @@ laser model are not built.
   50 + 2, app 76. Not seen on screen: the "Little to go on" warning (no test input has fewer
   than two face directions). Known rough edge: the Datums card scrolls its hint line when a plane,
   an axis and a conflict message are all shown, although the window has room.
+- 2026-11-25 (second PC) — `agent/orient` reviewed and merged. Fix: Make Reference and deleting the
+  reference pass only relabel the reference (`rebase_project`); they no longer rebuild the frame
+  around it at the origin, which silently undid Auto Orient / Datums and dropped the merged model.

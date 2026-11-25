@@ -3480,6 +3480,29 @@ mod tests {
     }
 
     #[test]
+    fn make_reference_and_deleting_the_reference_keep_an_orientation() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let second = scancraft_align::rigid(glam::Quat::from_rotation_z(0.2), glam::Vec3::new(5.0, 0.0, 0.0));
+        add_fixed_pass(&mut app, 2, table_and_block(), second);
+        // Orient the project (as Auto Orient / Datums do): every placed pass moves.
+        let turn = scancraft_align::rigid(glam::Quat::from_rotation_x(0.7), glam::Vec3::new(0.0, 0.0, 12.0));
+        app.move_project_frame(turn, "Auto Orient");
+        let oriented: Vec<Transform> = app.passes.iter().map(|p| p.meta.transform).collect();
+        let points: Vec<[f32; 3]> = app.passes.iter().map(|p| p.layer.cloud.points[7].position).collect();
+        // Make the other pass the reference: nothing moves, only the label changes.
+        app.set_reference(2);
+        assert_eq!(app.passes[1].meta.alignment, AlignState::Reference);
+        assert!(matches!(app.passes[0].meta.alignment, AlignState::Aligned { .. }));
+        assert_eq!(app.passes.iter().map(|p| p.meta.transform).collect::<Vec<_>>(), oriented, "Make Reference moved the passes");
+        assert_eq!(app.passes.iter().map(|p| p.layer.cloud.points[7].position).collect::<Vec<_>>(), points);
+        // Deleting the reference hands the role on, again without moving anything.
+        app.delete_pass(2);
+        assert_eq!(app.passes[0].meta.alignment, AlignState::Reference);
+        assert_eq!(app.passes[0].meta.transform, oriented[0]);
+    }
+
+    #[test]
     fn nothing_shown_means_nothing_to_clean() {
         let mut app = app();
         add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());

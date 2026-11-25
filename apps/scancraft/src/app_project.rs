@@ -298,24 +298,21 @@ impl ScanCraftApp {
         p.tinted = None;
     }
 
-    /// Makes `id` (a placed pass) the frame of the project: every placed pass is re-expressed
-    /// relative to it.
+    /// Makes pass `id` the reference without moving anything. The project frame stays where it
+    /// is: an orientation from Auto Orient or Datums is kept, and the merged model and mesh still
+    /// fit. (It used to rebuild the frame around the new reference at the origin, which silently
+    /// undid any orientation.) Align All and refinement hold the reference at its current pose,
+    /// so it does not need to sit at the origin.
     pub(super) fn rebase_project(&mut self, id: u32) {
-        let Some(base) = self.passes.iter().find(|p| p.id == id).map(|p| p.meta.transform) else { return };
-        let inv = base.inverse();
-        let ids: Vec<(u32, Transform, AlignState)> = self.passes.iter().filter(|p| p.meta.alignment.is_placed()).map(|p| (p.id, p.meta.transform, p.meta.alignment)).collect();
-        for (pid, t, state) in ids {
-            let state = if pid == id {
-                AlignState::Reference
-            } else if state == AlignState::Reference {
-                AlignState::Aligned { method: AlignMethod::Auto, quality: None }
-            } else {
-                state
-            };
-            self.place_pass(pid, scancraft_align::compose(&inv, &t), state);
+        for p in &mut self.passes {
+            if p.id == id {
+                p.meta.alignment = AlignState::Reference;
+            } else if p.meta.alignment == AlignState::Reference {
+                p.meta.alignment = AlignState::Aligned { method: AlignMethod::Auto, quality: None };
+            }
         }
-        self.merged = None;
-        self.invalidate_derived("The project frame changed");
+        // Only a label changed: the project counts as edited (saving records the reference).
+        let _ = self.generation();
     }
 
     pub fn set_reference(&mut self, id: u32) {
@@ -326,7 +323,7 @@ impl ScanCraftApp {
         self.record(self.snapshot(&format!("Make {name} the Reference")));
         self.clear_previews();
         self.rebase_project(id);
-        self.say(Tone::Normal, format!("{name} is the reference; the project frame is now its frame"));
+        self.say(Tone::Normal, format!("{name} is the reference; nothing moved"));
     }
 
     /// Back to its own frame (e.g. a wrong alignment).
