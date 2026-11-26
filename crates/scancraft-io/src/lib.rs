@@ -3,6 +3,7 @@ pub mod normals;
 pub mod obj;
 pub mod ply;
 pub mod project;
+pub mod revo;
 pub mod stl;
 
 pub use import::{
@@ -12,6 +13,7 @@ pub use import::{
 pub use normals::NormalEstimation;
 pub use obj::{load_obj, save_mesh_obj};
 pub use ply::{load_ply, save_mesh_ply_binary, save_ply_binary};
+pub use revo::{marker_framework_beside, read_marker_framework, RevoMarker};
 pub use stl::{save_mesh_stl_ascii, save_mesh_stl_binary};
 
 use thiserror::Error;
