@@ -404,3 +404,9 @@ laser model are not built.
   or the `.mkf` beside a raw scan): 0.19–0.27° / 0.36–0.81 mm measured, limits 0.5° / 1.2 mm.
   Tests: `scancraft-io` 29, `scancraft-align` 53 + 4 real-data (ignored, all pass), `scancraft-mesh`
   51, `scancraft` 85.
+- 2026-11-26 — Project file format, step 1 (library only, branch `agent/project-file`):
+  `<name>.scancraft` project file (old `project.json` folders still open; saving one leaves a
+  stub older versions refuse), `.scancraftz` bundles (ZIP64, stored, project file first, SHA-256
+  manifest, contents filter, save-back with raw copies of unchanged entries), working folders
+  with crash recovery, lock files. `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`;
+  status and what is left in `docs/open-issues.md` 4.1.

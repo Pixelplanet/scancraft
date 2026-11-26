@@ -799,7 +799,7 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             kit::row(ui, "Folder", |ui| path_field(app, ui, PickPurpose::SaveFolder));
             let n = app.passes.len();
             kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
-            kit::note(ui, "Saves project.json and each pass's keyframes into the folder (created if needed). Saving again overwrites it.");
+            kit::note(ui, "Saves the project file (<name>.scancraft) and each pass's data into the folder (created if needed). Saving again overwrites it.");
         }
     }
 }

@@ -2641,7 +2641,7 @@ impl ScanCraftApp {
                 self.settings.add_project_path = first.display().to_string();
                 let (projects, others): (Vec<_>, Vec<_>) = picked.paths.into_iter().partition(|p| scancraft_io::project::is_project(p));
                 if let Some(p) = others.first() {
-                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no project.json)", p.display()));
+                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no .scancraft file)", p.display()));
                 }
                 self.queue_imports(projects);
             }
@@ -2658,7 +2658,7 @@ impl ScanCraftApp {
                         self.say(Tone::Normal, format!("{name} opens when the running operation has finished"));
                     }
                 } else {
-                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no project.json)", first.display()));
+                    self.say(Tone::Warning, format!("{} is not a ScanCraft project (no .scancraft file)", first.display()));
                 }
             }
             P::SaveFolder => self.settings.project_path = first.display().to_string(),
@@ -3362,7 +3362,7 @@ mod tests {
         app.request_close_tab(0);
         app.save_then_close();
         finish_job(&mut app);
-        assert!(dir.join(scancraft_io::project::PROJECT_FILE).is_file(), "saved");
+        assert!(scancraft_io::project::locate(&dir).is_ok_and(|l| !l.legacy), "saved");
         assert_eq!(app.tabs.len(), 1, "closed after the save");
         assert!(app.passes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
@@ -3890,7 +3890,7 @@ mod tests {
             finish_job(&mut app);
             app.poll_jobs();
         }
-        assert!(d1.join(scancraft_io::project::PROJECT_FILE).is_file() && d2.join(scancraft_io::project::PROJECT_FILE).is_file());
+        assert!(scancraft_io::project::is_project(&d1) && scancraft_io::project::is_project(&d2));
         assert!(!app.any_dirty());
         assert!(app.close_window && app.quit_confirmed, "the window closes once all are saved");
         let _ = std::fs::remove_dir_all(&d1);

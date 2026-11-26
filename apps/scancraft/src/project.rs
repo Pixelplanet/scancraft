@@ -527,18 +527,18 @@ fn alignment_state(r: &AlignmentRecord) -> AlignState {
 
 /// An imported pass's surface file, relative to the project folder.
 pub fn surface_path(id: u32) -> String {
-    format!("{}/surface.ply", files::pass_dir(id))
+    files::surface_path(id)
 }
 
 /// A cleaned pass's surface file, and the file with its points' observation counts (one
 /// little-endian u32 per point, in order), relative to the project folder.
 pub fn cleaned_path(id: u32) -> String {
-    format!("{}/cleaned.ply", files::pass_dir(id))
+    files::cleaned_path(id)
 }
 
 /// A pass's saved object labels, relative to the project folder.
 pub fn mask_path(id: u32) -> String {
-    format!("{}/object.bin", files::pass_dir(id))
+    files::object_labels_path(id)
 }
 
 /// A pass's marker map: [`files::markers_path`] (optional, like the object labels).
@@ -557,7 +557,7 @@ fn read_markers(dir: &Path, id: u32) -> Vec<PassMarker> {
 }
 
 pub fn cleaned_counts_path(id: u32) -> String {
-    format!("{}/cleaned_observations.bin", files::pass_dir(id))
+    files::cleaned_counts_path(id)
 }
 
 /// Key in a pass's `scan_config` JSON naming its cleaned surface file. Older versions ignore it
@@ -568,11 +568,11 @@ const CLEANED_KEY: &str = "cleaned";
 const RGB_KEYFRAMES_KEY: &str = "rgb_keyframes";
 
 fn rgb_dir_rel(id: u32) -> String {
-    format!("{}/rgb", files::pass_dir(id))
+    files::rgb_dir(id)
 }
 
 fn rgb_manifest_rel(id: u32) -> String {
-    format!("{}/keyframes.json", rgb_dir_rel(id))
+    files::rgb_manifest_path(id)
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -798,14 +798,13 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
         settings: project.settings.clone(),
     };
     let keyframes: Vec<(u32, Vec<KeyframeRecord>)> = project.passes.iter().map(|p| (p.id, p.keyframes.iter().map(to_record).collect())).collect();
-    files::save_project(dir, &file, &keyframes).map_err(e)
+    files::save_project(dir, &file, &keyframes).map(|_| ()).map_err(e)
 }
 
-/// Reads a project folder.
-pub fn load(dir: &Path) -> Result<StoredProject, String> {
-    if !files::is_project(dir) {
-        return Err(format!("{} holds no {}", dir.display(), files::PROJECT_FILE));
-    }
+/// Reads a project: its folder, its `.scancraft` file, or an older folder with `project.json`.
+pub fn load(path: &Path) -> Result<StoredProject, String> {
+    let location = files::locate(path).map_err(|e| e.to_string())?;
+    let dir = location.root.as_path();
     let (file, mut keyframes) = files::load_project(dir).map_err(|e| e.to_string())?;
     let mut passes = Vec::new();
     for record in &file.passes {
@@ -1231,7 +1230,7 @@ mod tests {
         };
         save(&dir, &project).unwrap();
         // What older versions wrote: the scan settings without an origin.
-        let json = std::fs::read_to_string(dir.join(files::PROJECT_FILE)).unwrap();
+        let json = std::fs::read_to_string(files::locate(&dir).unwrap().file).unwrap();
         assert!(!json.contains(&format!("\"{ORIGIN_KEY}\"")), "a captured pass stores no origin");
         let loaded = load(&dir).unwrap();
         assert_eq!(loaded.passes[0].meta.origin, PassOrigin::Captured);

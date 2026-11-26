@@ -961,6 +961,8 @@ impl ScanCraftApp {
         if !self.can_edit() {
             return;
         }
+        // A `.scancraft` file opens its folder (the project is saved there again).
+        let dir = scancraft_io::project::project_root(&dir).unwrap_or(dir);
         self.spawn_job("Opening the project", move || {
             let stored = match project::load(&dir) {
                 Ok(s) => s,
@@ -1098,8 +1100,8 @@ impl ScanCraftApp {
         if self.import_blocked().is_some() {
             return;
         }
-        if !scancraft_io::project::is_project(&dir) {
-            self.say(Tone::Error, format!("{} holds no {}", dir.display(), scancraft_io::project::PROJECT_FILE));
+        if let Err(e) = scancraft_io::project::locate(&dir) {
+            self.say(Tone::Error, e.to_string());
             return;
         }
         let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());

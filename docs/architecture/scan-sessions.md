@@ -139,7 +139,9 @@ pass, useful for step-wise turntable scans; the frames are tracked like any othe
 
 ## 8. Persistence
 
-Project folder: `project.json` (passes, modes, alignments, settings, output metadata) + per pass `pass-<n>/keyframes.bin` (packed points), `rgb/*.jpg`, `raw.bin` (optional recording), `markers.json` (optional marker map: the tracker's, or Revo's `marker_framework.mkf` read with an imported scan) + `outputs/`. Opening a project restores everything editable.
+Project folder (form A): `<name>.scancraft`, the project file (JSON: passes, modes, alignments, settings, output metadata; relative paths only; opened by double-click) + per pass `pass-<n>/keyframes.bin` (packed points), `surface.ply` (imported), `cleaned.ply` + `cleaned_observations.bin`, `object.bin`, `rgb/` (colour keyframes), `raw.bin` (optional recording), `markers.json` (optional marker map: the tracker's, or Revo's `marker_framework.mkf` read with an imported scan) + `outputs/`. Opening a project restores everything editable. One project per folder. Older folders with `project.json` keep opening; saving one writes the `.scancraft` file and turns `project.json` into a stub that older versions refuse ("saved by a newer version") instead of opening a stale copy. Every file is saved atomically (temporary file, then rename), the project file last.
+
+Bundle (form B): `<name>.scancraftz`, a plain ZIP64 of the same layout, entries stored, the project file first and a manifest (`scancraft-bundle.json`: contents, size and SHA-256 per entry) last. Which items go in is a setting (`scancraft_io::bundle::BundleContents`, table in [open-issues.md](../open-issues.md) 4.1). A bundle is opened into a working folder (`scancraft_io::workdir`, a temporary form A under a configurable root) and saved back with unchanged entries copied raw from the old bundle. Lock files (`.scancraft.lock` in a project folder, `<bundle>.lock` beside a bundle) keep two apps from saving over each other. Code: `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`.
 
 ## 9. Implementation plan (parallel work)
 

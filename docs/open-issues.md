@@ -475,3 +475,42 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
 | Merged model and mesh | Opening with results ready; otherwise Merge / Reconstruct again (minutes) | on |
 | Marker maps | Make Solid marker removal, marker display | on |
 | Raw stream recordings | Replaying a scan for analysis or bug reports only; several MB per second | off |
+
+**Status 2026-11-26: step 1 (library, `crates/scancraft-io`) done; no UI yet.**
+- `project.rs`: `save_project` writes `<name>.scancraft` (named after the project in a new
+  folder; an existing file keeps its name when the project is renamed), every file through a
+  temporary file + rename, the project file last. `locate` / `load_project` accept the
+  `.scancraft` file, its folder (exactly one `.scancraft`; several are refused with their names)
+  or an older folder with `project.json`. **Old `project.json`:** saving such a project replaces it
+  with a stub (`format: 2`, no passes, `moved_to: "<name>.scancraft"`), so an older ScanCraft
+  says "saved by a newer version" instead of opening a stale copy; this version ignores the stub
+  and says the `.scancraft` file is missing when it is gone. Layout paths (`surface_path`,
+  `cleaned_path`, `rgb_manifest_path`, …) now live in the io crate; the app uses them.
+- `bundle.rs`: `write_bundle`, `Bundle::{open, entries, verify, extract_to, read_project}`,
+  `save_back`. Items map to files with `classify` (`keyframes.bin` → Keyframes, `rgb/` → Colour
+  keyframes, `outputs/` → Merged model and mesh, `markers.json` → Marker maps, `raw.bin`, `raw/`
+  and in-project `raw_recording` paths → Raw recordings, everything else → core; locks, temp
+  files, the working-folder state, `project.json` and `Thumbs.db` never). A left-out file the
+  project cannot open without gets a placeholder (empty keyframe file for a pass with
+  `surface.ply` / `cleaned.ply`, `[]` for a colour manifest); the keyframes of a captured,
+  uncleaned pass are always kept, since they are its only surface. **So "Keyframes off" only
+  saves space for imported or cleaned passes until captured passes store their surface.**
+  Unchanged = same size and time stamp as recorded at extraction / last save, or same SHA-256 when
+  only the time differs, and the old entry still has the recorded size and CRC-32.
+- `workdir.rs`: `WorkFolder::{open, save, save_overwriting, save_as, save_as_folder, close,
+  recover}`, `leftovers`, `discard`, `default_root` (`%LOCALAPPDATA%\ScanCraft\work`). State
+  file `.scancraft-work.json` (bundle, its size and time at open / last save, owner pid + host +
+  process start, opened, per-file state, complete flag), written before unpacking. Free-space
+  check before unpacking and before writing a bundle (`IoError::NoSpace`). Save refuses with
+  `IoError::Conflict` when the bundle was replaced behind the app's back.
+- `lock.rs`: `.scancraft.lock` / `<bundle>.lock` with pid, host, process start time and token; a
+  dead owner on the same host (or a reused pid) is taken over, a live one is refused naming who
+  holds it (`IoError::Locked`), another host's lock counts as live until `take_over`.
+- Zip crate: `zip` 0.6.6 (MIT, already in the lock file), recorded in `apps/scancraft/ATTRIBUTION.md`.
+
+Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
+is unpacked at disk speed), keeping unknown project-file fields on save, tested sizes above 4 GiB
+(ZIP64 is written by the zip crate but not exercised by a test), and all of the app side: Open /
+Save / Save as Bundle… / Save As Project Folder in the UI, the contents settings page, the
+crash-recovery prompt, locking form-A folders when a tab opens them, file association in
+`install.ps1`, the command-line path and single instance.
