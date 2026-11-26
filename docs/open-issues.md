@@ -434,8 +434,44 @@ unless the user ticks them in.
 
 Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data folders.
 
-**Open decisions for the user:**
-- File extensions, for example `.scancraft` for the project and `.scancraftz` for the bundle.
-- Whether a bundle may also be opened and saved in place, accepting slow saves for small
-  projects.
-- Whether recordings may go into bundles at all.
+**Decided by the user (2026-11-26): build it as recommended.**
+- Extensions: `.scancraft` for the project file (form A) and `.scancraftz` for the bundle
+  (form B).
+- **Opening a bundle works on a working folder (a temporary form A):**
+  - Open unpacks the bundle into a working folder, and all work goes there.
+  - *Save* writes everything back into the bundle.
+  - Closing the tab removes the working folder.
+- **Bundle contents are chosen in a settings page** (future Settings menu). Each item says what
+  it is needed for (see below).
+
+**Design notes for the working folder:**
+- **Where:** a working-folder root set in Settings. It defaults to the user's local app data,
+  but scans are large, so it must be easy to move to a big drive. Show the space needed (the
+  bundle's size) and refuse with a clear message if it does not fit.
+- **Unpack lazily:** bundle entries are stored, not compressed, so large pass files can be read
+  straight from the bundle. Only files that change are written to the working folder
+  (copy-on-write).
+- **Save:** write a new bundle next to the old one (`*.scancraftz.tmp`), then rename it over
+  the old one.
+  - Changed files come from the working folder.
+  - Unchanged entries are copied raw from the old bundle, without decompressing anything.
+  - That keeps saves at disk speed and crash-safe.
+  - The working folder stays until the tab closes.
+- **Crash recovery:** a working folder records which bundle it belongs to and when that bundle
+  was last saved. On the next start the app offers to recover unsaved work (Open / Discard)
+  rather than deleting it.
+- **Save As Project Folder:** turns an opened bundle into a normal form-A project
+  (and *Save as Bundle…* goes the other way).
+- **The bundle is locked while it is open** (the same lock as for project folders), so a second
+  app or PC cannot open it for writing.
+
+**Bundle contents (settings, with the explanation shown to the user):**
+
+| Item | Needed for | Default |
+| --- | --- | --- |
+| Project file, pass surfaces and alignment, cleaned surfaces, object labels | Opening the project at all, merging, meshing | always |
+| Keyframes (depth frames and poses) | Continuing a pass, discarding frames, re-tracking, Same Position start, adding passes from it | on |
+| Colour keyframes | Colour, AI object segmentation | on |
+| Merged model and mesh | Opening with results ready; otherwise Merge / Reconstruct again (minutes) | on |
+| Marker maps | Make Solid marker removal, marker display | on |
+| Raw stream recordings | Replaying a scan for analysis or bug reports only; several MB per second | off |
