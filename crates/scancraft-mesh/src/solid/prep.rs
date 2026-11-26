@@ -269,7 +269,9 @@ impl ThicknessMap {
 /// too, but a sparser one: lines), and no point of its scan lies in the gap: within 0.6 mm of the line from it towards
 /// that surface, 0.25 mm from it up to 0.2 mm short of the surface. Along a line the strays are as
 /// dense as the surface, so density tests miss them. Points behind a face near a convex edge
-/// (the other face of the edge) have their own face running through that gap and stay.
+/// (the other face of the edge) have their own face running through that gap and stay. The other
+/// face of a thin wall seen from both sides lies behind nearly all of the face in front, not in
+/// lines, and stays too ([`behind_layer_is_a_face`]), however much sparser it is sampled.
 pub fn drop_behind_strays(pts: &mut Vec<WorkPoint>, radius: f32, min_mm: f32, max_mm: f32) -> usize {
     let pos: Vec<Vec3> = pts.iter().map(|p| p.p).collect();
     let grid = PointGrid::new(&pos, radius.max(0.5));
@@ -339,7 +341,7 @@ pub fn drop_behind_strays(pts: &mut Vec<WorkPoint>, radius: f32, min_mm: f32, ma
                     blocked += 1;
                 }
             });
-            blocked <= 1
+            blocked <= 1 && !behind_layer_is_a_face(p, i, f, &pts[..], &pos, &grid, min_mm, max_mm, radius)
         })
         .collect();
     let before = pts.len();
@@ -350,6 +352,71 @@ pub fn drop_behind_strays(pts: &mut Vec<WorkPoint>, radius: f32, min_mm: f32, ma
         r
     });
     before - pts.len()
+}
+
+/// Whether the layer through `p` (point `i`), behind the surface facing `f` in front of it, is a
+/// face of its own: the other face of a thin wall (a rib, a plate, the wall of a boss) that the
+/// scan sees from both sides. Such a face passes every test of [`drop_behind_strays`] whenever it
+/// is sampled more sparsely than the face in front (a grazing view), but it is a surface: in
+/// nearly every place across where the face in front is, it lies behind it too. Laser strays are
+/// lines and lie behind only part of it. Within `2 * radius` across, on 0.6 mm cells: the cells
+/// where the same scan has surface facing like `f` (its outermost such point, so curvature does not
+/// matter), and among them those with a point `min_mm - 0.2 .. max_mm + 0.4` behind that surface.
+#[allow(clippy::too_many_arguments)]
+fn behind_layer_is_a_face(
+    p: &WorkPoint,
+    i: usize,
+    f: Vec3,
+    pts: &[WorkPoint],
+    pos: &[Vec3],
+    grid: &PointGrid,
+    min_mm: f32,
+    max_mm: f32,
+    radius: f32,
+) -> bool {
+    const CELL: f32 = 0.6;
+    const FACE_SHARE: f32 = 0.7;
+    let r = 2.0 * radius;
+    let nc = (r / CELL).ceil() as i32;
+    let side = (2 * nc + 1) as usize;
+    let (eu, ev) = super::markers::tangent_frame(f);
+    let reach = (r * r + (max_mm + 2.0).powi(2)).sqrt();
+    // Per cell: the outermost point facing like `f`, and every point's height (along `f`).
+    let mut front = vec![f32::NEG_INFINITY; side * side];
+    let mut heights: Vec<(usize, f32)> = Vec::new();
+    grid.for_each_within(pos, p.p, reach, |j, _| {
+        let q = &pts[j as usize];
+        if q.scan != p.scan || q.kind != PointKind::Measured {
+            return;
+        }
+        let d = q.p - p.p;
+        let (a, b) = (d.dot(eu), d.dot(ev));
+        if a * a + b * b > r * r {
+            return;
+        }
+        let k = ((b / CELL).round() as i32 + nc) as usize * side + ((a / CELL).round() as i32 + nc) as usize;
+        let t = d.dot(f);
+        if q.n.dot(f) >= 0.5 && j as usize != i {
+            front[k] = front[k].max(t);
+        }
+        heights.push((k, t));
+    });
+    let mut behind = vec![false; side * side];
+    for &(k, t) in &heights {
+        let depth = front[k] - t;
+        if depth >= min_mm - 0.2 && depth <= max_mm + 0.4 {
+            behind[k] = true;
+        }
+    }
+    // Only the cells whose surface is the one in front of `p` (not a far-off sheet).
+    let (mut cells, mut covered) = (0usize, 0usize);
+    for k in 0..side * side {
+        if front[k] > -1.5 && front[k] < max_mm + 1.5 {
+            cells += 1;
+            covered += behind[k] as usize;
+        }
+    }
+    cells >= 8 && covered as f32 >= FACE_SHARE * cells as f32
 }
 
 /// Drops the less plausible layer where a sheet is doubled (ghost layers of misregistered

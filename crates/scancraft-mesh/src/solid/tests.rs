@@ -872,3 +872,140 @@ fn marker_site_on_a_sheet_of_changing_curvature_is_filled_flush() {
     let quad_off = (-60..=60).map(|k| k as f64 * 0.1).map(|x| (q.eval(x, 0.0) - sheet(x as f32, 0.0) as f64).abs()).fold(0.0, f64::max);
     assert!(quad_off > 0.08, "the quadric alone would do: {quad_off}");
 }
+
+/// Whether `p`'s direction from the centre lies within `r` mm (on the outer sphere) of `d`, or in
+/// the slot `|u| < half_len`, `|v| < half_w` round `d` when `half_len > 0`.
+fn in_gap(p: Vec3, d: Vec3, r: f32, half_len: f32, half_w: f32) -> bool {
+    let u = p.normalize();
+    if half_len > 0.0 {
+        let (eu, ev) = markers::tangent_frame(d);
+        u.dot(d) > 0.0 && (u.dot(eu) * R_OUT).abs() < half_len && (u.dot(ev) * R_OUT).abs() < half_w
+    } else {
+        u.angle_between(d) * R_OUT < r
+    }
+}
+
+fn holes_in(pts: &[SolidPoint]) -> HoleFilling {
+    let samples: Vec<Sample> =
+        pts.iter().map(|p| Sample { position: p.position, normal: p.normal, scan: p.scan, kind: PointKind::Measured }).collect();
+    fill_holes(&samples, &HoleConfig::default())
+}
+
+/// Fill points within `r` of `c` (projected onto the outer sphere).
+fn fill_near(fill: &[Sample], c: Vec3, r: f32) -> usize {
+    fill.iter().filter(|p| (p.position.normalize() * R_OUT).distance(c) < r).count()
+}
+
+#[test]
+fn gap_in_a_one_sided_face_is_filled_not_kept_as_a_bore() {
+    // Sticker-sized and dropout-sized gaps in a face scanned from one side only: nothing measured
+    // lies behind them, so their axis is clear like a screw hole's, but nothing shows the plate's
+    // other face round them either. They are filled.
+    let (a, b, c) = (dir(30.0, 0.0), dir(35.0, 120.0), dir(40.0, 240.0));
+    let pts: Vec<SolidPoint> = cap(R_OUT, 0.45, true, 1)
+        .into_iter()
+        .filter(|p| !in_gap(p.position, a, 2.0, 0.0, 0.0) && !in_gap(p.position, b, 2.75, 0.0, 0.0) && !in_gap(p.position, c, 4.5, 0.0, 0.0))
+        .collect();
+    let res = holes_in(&pts);
+    for (d, r) in [(a, 2.0), (b, 2.75), (c, 4.5)] {
+        let n = fill_near(&res.fill, d * R_OUT, r - 0.7);
+        assert!(n > 10, "gap of r {r} mm left open ({n} fill points in it)");
+    }
+}
+
+#[test]
+fn round_hole_through_both_faces_stays_open_but_a_slot_is_filled() {
+    // Both faces scanned: a round hole through both (a screw hole) stays open; an elongated gap
+    // through both (a dropout along a laser line) is not round and is filled.
+    let (hole, slot) = (dir(30.0, 0.0), dir(35.0, 180.0));
+    let gap = |p: &SolidPoint| in_gap(p.position, hole, 2.5, 0.0, 0.0) || in_gap(p.position, slot, 0.0, 7.0, 2.0);
+    let mut pts: Vec<SolidPoint> = cap(R_OUT, 0.45, true, 1).into_iter().filter(|p| !gap(p)).collect();
+    pts.extend(cap(R_OUT - WALL, 0.45, false, 2).into_iter().filter(|p| !gap(p)));
+    let res = holes_in(&pts);
+    assert_eq!(fill_near(&res.fill, hole * R_OUT, 2.0), 0, "the round through hole was filled");
+    let n = fill_near(&res.fill, slot * R_OUT, 1.0);
+    assert!(n > 10, "the slot was left open ({n} fill points in it)");
+    // The same hole in one face only (the other face scanned behind it) is filled.
+    let mut pts: Vec<SolidPoint> = cap(R_OUT, 0.45, true, 1).into_iter().filter(|p| !in_gap(p.position, hole, 2.5, 0.0, 0.0)).collect();
+    pts.extend(cap(R_OUT - WALL, 0.45, false, 2));
+    assert!(fill_near(&holes_in(&pts).fill, hole * R_OUT, 1.5) > 10, "a gap in one face was kept open");
+}
+
+#[test]
+fn dropout_in_a_thin_one_sided_wall_gives_no_tunnel() {
+    // A 1.8 mm wall scanned from outside only, with a 4 mm dropout: the solid is closed there and
+    // follows the sphere (a bore kept open here was a tunnel through the wall).
+    let gap_dir = dir(35.0, 60.0);
+    let pts: Vec<SolidPoint> = cap(R_OUT, 0.45, true, 1).into_iter().filter(|p| !in_gap(p.position, gap_dir, 2.0, 0.0, 0.0)).collect();
+    let res = build_solid(&pts, &[], &SolidConfig { detect: None, wall_mm: Some(1.8), ..test_params() });
+    let t = &res.report.topology;
+    assert!(t.watertight && t.manifold, "{t:?}");
+    assert_eq!(t.genus_total(), 0, "tunnel through the wall: {:?}", t.components);
+    let e = radial_errors(&res.mesh, |p| p.length() > R_OUT - 0.9 && p.normalize().angle_between(gap_dir) * R_OUT < 3.0, R_OUT);
+    assert!(!e.is_empty(), "no outer surface over the dropout");
+    eprintln!("thin one-sided dropout: outer max {:.4}", e.last().unwrap());
+    assert!(*e.last().unwrap() < 0.15, "outer face over the dropout off by {}", e.last().unwrap());
+}
+
+#[test]
+fn thin_wall_seen_from_both_sides_is_no_laser_stray() {
+    // A plate 0.8-1.5 mm thick seen from both sides by one scan, one face sampled more sparsely
+    // (a grazing view): its faces are 0.4-1.6 mm apart with nothing between, like a stray layer
+    // behind a surface, but the sparser face is a surface of its own and stays.
+    for (t, dense, sparse) in [(1.2f32, 0.3f32, 0.37f32), (0.8, 0.3, 0.4), (1.5, 0.25, 0.32), (1.2, 0.3, 0.45)] {
+        let mut pts = Vec::new();
+        let mut face = |s: f32, z: f32, n: Vec3, off: f32| {
+            let m = (20.0 / s) as i32;
+            for i in 0..=m {
+                for j in 0..=m {
+                    pts.push(WorkPoint { p: Vec3::new(i as f32 * s + off, j as f32 * s + off, z), n, scan: 1, kind: PointKind::Measured, area: 0.0 });
+                }
+            }
+        };
+        face(dense, 0.0, Vec3::Z, 0.0);
+        face(sparse, -t, -Vec3::Z, 0.1);
+        let n = pts.len();
+        let dropped = prep::drop_behind_strays(&mut pts, 2.0, 0.4, 1.6);
+        assert!(dropped * 100 <= n, "plate {t} mm ({dense}/{sparse} mm spacing): {dropped} of {n} points dropped as strays");
+    }
+}
+
+#[test]
+fn marker_near_a_rounded_rim_leaves_the_rolled_edge() {
+    // A flat top (z = 0, x < 0) rolling over a 2 mm radius edge into a side face (x = 2), and a
+    // sticker (r 4.5 mm, 0.4 mm proud) 3 mm in from the edge. The site's cut reaches over the
+    // rolled edge; the patch must not stand above it, and the rolled edge stays.
+    let true_z = |x: f32| if x <= 0.0 { 0.0 } else { -2.0 + (4.0 - x.min(2.0).powi(2)).max(0.0).sqrt() };
+    let s = 0.35;
+    let mut pts = Vec::new();
+    for j in -57..=57 {
+        let y = j as f32 * s;
+        for i in 0..=71 {
+            let x = -(i as f32) * s;
+            let lift = if (x + 3.0).hypot(y) < 4.5 { 0.4 } else { 0.0 };
+            pts.push(SolidPoint { position: Vec3::new(x, y, lift), normal: Vec3::Z, scan: 1 });
+        }
+        for k in 1..=17 {
+            let phi = k as f32 / 18.0 * std::f32::consts::FRAC_PI_2;
+            let n = Vec3::new(phi.sin(), 0.0, phi.cos());
+            pts.push(SolidPoint { position: Vec3::new(0.0, y, -2.0) + n * 2.0, normal: n, scan: 1 });
+        }
+        for k in 0..=23 {
+            pts.push(SolidPoint { position: Vec3::new(2.0, y, -2.0 - k as f32 * s), normal: Vec3::X, scan: 1 });
+        }
+    }
+    let m = Marker { id: "R".into(), center: Vec3::new(-3.0, 0.0, 0.0), normal: Vec3::Z, scan: None, source: MarkerSource::List, radius_mm: 3.0, score: 0.0 };
+    let out = remove_markers(&pts, &[m], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    let o = &out.outcomes[0];
+    assert!(o.fill.starts_with("quadric") && o.sectors_covered < 8 && o.fill_points > 100, "{o:?}");
+    for p in out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill) {
+        let above = p.position.z - true_z(p.position.x);
+        assert!(p.position.x < 2.05 && above < 0.35, "patch point {:.2} mm above the surface at x {:.2}", above, p.position.x);
+    }
+    let roll = |v: &[Vec3]| v.iter().filter(|p| p.x > 0.0 && p.z < -0.5 && p.z > -2.0 && p.y.abs() < 5.0).count();
+    let before = roll(&pts.iter().map(|p| p.position).collect::<Vec<_>>());
+    let after = roll(&out.samples.iter().filter(|p| p.kind == PointKind::Measured).map(|p| p.position).collect::<Vec<_>>());
+    assert_eq!(after, before, "rolled edge cut");
+    let raised = out.samples.iter().filter(|p| p.kind == PointKind::Measured && p.position.z > 0.2).count();
+    assert_eq!(raised, 0, "sticker points left");
+}

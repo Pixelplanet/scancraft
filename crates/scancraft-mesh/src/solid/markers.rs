@@ -16,9 +16,11 @@
 //!    0.3 mm lattice. A site whose annulus is not covered all round (a rim) or too rough (a rib or
 //!    edge nearby) is not cut at all (`keep_unfillable`), since an unfilled cut can open a hole.
 //!    Points that any site cuts (a neighbouring sticker) count for the coverage of an annulus but
-//!    are not fitted. Where the cuts of two sites on one sheet overlap, each lattice point belongs
-//!    to the site it lies deepest in and is placed on a blend of the covering patches, so the
-//!    overlap carries one layer without a step.
+//!    are not fitted. At a site not covered all round, cut points more than 0.3 mm below or 1 mm
+//!    above its patch are the surface beyond the sheet (a rim's rolled edge, a side face, a rib
+//!    foot): they are not cut and the patch keeps clear of them. Where the cuts of two sites on one
+//!    sheet overlap, each lattice point belongs to the site it lies deepest in and is placed on a
+//!    blend of the covering patches, so the overlap carries one layer without a step.
 //! 3. **Fairing** ([`fair_sites`], after meshing): the mesh annulus is fitted again and the mesh
 //!    inside the cut is blended onto that fit, which removes any dent or bump the solve left.
 //!    Overlapping sites share the vertices they both move (weighted mean of their displacements).
@@ -436,12 +438,33 @@ struct Patch {
     f: SiteFrame,
     q: Quadric,
     scan: u8,
-    /// For a site not covered all round: the lattice cells (index pairs at `fill_spacing_mm`) the
-    /// cut took points from, grown by one cell, and the mask of the [`FINE_SECTORS`] directions in
-    /// which the annulus has surface. The patch is emitted only in those cells or in directions
-    /// covered together with both neighbours, so it never reaches past the scanned surface (an
-    /// open rim, the end of the scan).
-    only: Option<(std::collections::HashSet<(i32, i32)>, u32)>,
+    /// Where the patch of a site not covered all round may go ([`PartialCover`]).
+    only: Option<PartialCover>,
+}
+
+/// Cut points of a site not covered all round lying more than this below its patch (mm) are real
+/// surface falling away from the sheet (a rim's rolled edge, a side face) and are not cut.
+const PARTIAL_CUT_BELOW_MM: f64 = 0.3;
+/// ... and more than this above it (a rib foot or a rim rising; a sticker is ~0.4 mm proud).
+const PARTIAL_CUT_ABOVE_MM: f64 = 1.0;
+
+/// For a site not covered all round: the lattice cells (index pairs at `fill_spacing_mm`) the cut
+/// took points from, grown by one cell; the mask of the [`FINE_SECTORS`] directions in which the
+/// annulus has surface; and the cells (grown by one) of the points inside the cut that are left
+/// because they lie off the patch, beyond the sheet. The patch is emitted only in the cut's cells
+/// or in directions covered together with both neighbours, so it never reaches past the scanned
+/// surface (an open rim, the end of the scan), and never over the surface left in the cut, so it
+/// does not stand above a rim's rolled edge.
+struct PartialCover {
+    cells: std::collections::HashSet<(i32, i32)>,
+    mask: u32,
+    beyond: std::collections::HashSet<(i32, i32)>,
+}
+
+impl PartialCover {
+    fn allows(&self, i: i32, j: i32, u: f32, v: f32) -> bool {
+        !self.beyond.contains(&(i, j)) && (self.cells.contains(&(i, j)) || direction_covered(self.mask, u, v))
+    }
 }
 
 impl Patch {
@@ -493,11 +516,36 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
 
     // Per site: the outcome, the patch quadric (fillable sites), whether the cut is applied and
     // the covered directions of the annulus.
-    let fits: Vec<(MarkerOutcome, Option<Quadric>, bool, u32)> = markers
+    let mut fits: Vec<(MarkerOutcome, Option<Quadric>, bool, u32)> = markers
         .par_iter()
         .zip(frames.par_iter())
         .zip(cuts.par_iter())
         .map(|((m, f), cut)| site_fit(m, f, cut.len(), pts, &pos, &grid, &in_cut, prm))
+        .collect();
+
+    // A site not covered all round lies at a rim or an edge, and its cut can reach over the surface
+    // beyond the sheet: a rim's rolled edge or a side face falling away, a rib foot rising. Cut
+    // points well off the site's patch are that surface, not the sticker (a disc about 0.4 mm
+    // proud, or nothing): they stay, and the patch keeps clear of them.
+    let mut beyond: Vec<Vec<u32>> = vec![Vec::new(); markers.len()];
+    let cuts: Vec<Vec<u32>> = cuts
+        .into_iter()
+        .enumerate()
+        .map(|(k, cut)| {
+            let (out, q, _, _) = &mut fits[k];
+            let Some(q) = *q else { return cut };
+            if out.sectors_covered >= 8 {
+                return cut;
+            }
+            let (on, off): (Vec<u32>, Vec<u32>) = cut.into_iter().partition(|&i| {
+                let (u, v, h) = frames[k].local(pts[i as usize].p);
+                let r = h as f64 - q.eval(u as f64, v as f64);
+                (-PARTIAL_CUT_BELOW_MM..=PARTIAL_CUT_ABOVE_MM).contains(&r)
+            });
+            out.cut_points = on.len();
+            beyond[k] = off;
+            on
+        })
         .collect();
 
     let patches: Vec<Patch> = fits
@@ -507,17 +555,20 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
             let q = (*q)?;
             let only = (out.sectors_covered < 8).then(|| {
                 let s = prm.fill_spacing_mm;
-                let mut cells = std::collections::HashSet::new();
-                for &i in &cuts[k] {
-                    let (u, v, _) = frames[k].local(pts[i as usize].p);
-                    let (a, b) = ((u / s).round() as i32, (v / s).round() as i32);
-                    for da in -1..=1 {
-                        for db in -1..=1 {
-                            cells.insert((a + da, b + db));
+                let cells_of = |idx: &[u32]| {
+                    let mut cells = std::collections::HashSet::new();
+                    for &i in idx {
+                        let (u, v, _) = frames[k].local(pts[i as usize].p);
+                        let (a, b) = ((u / s).round() as i32, (v / s).round() as i32);
+                        for da in -1..=1 {
+                            for db in -1..=1 {
+                                cells.insert((a + da, b + db));
+                            }
                         }
                     }
-                }
-                (cells, *mask)
+                    cells
+                };
+                PartialCover { cells: cells_of(&cuts[k]), mask: *mask, beyond: cells_of(&beyond[k]) }
             });
             Some(Patch { site: k, f: frames[k], q, scan: markers[k].scan.unwrap_or(0), only })
         })
@@ -579,6 +630,21 @@ fn fine_sector(u: f32, v: f32) -> usize {
 fn direction_covered(mask: u32, u: f32, v: f32) -> bool {
     let s = fine_sector(u, v);
     [s + FINE_SECTORS - 1, s, s + 1].iter().all(|&k| mask & 1 << (k % FINE_SECTORS) != 0)
+}
+
+/// 1 in the directions of (u, v) that `mask` covers, falling linearly to 0 two directions away
+/// from the nearest covered one.
+fn direction_weight(mask: u32, u: f32, v: f32) -> f32 {
+    let s = (v.atan2(u) + std::f32::consts::PI) / (std::f32::consts::TAU / FINE_SECTORS as f32);
+    let n = FINE_SECTORS as f32;
+    let dist = (0..FINE_SECTORS)
+        .filter(|&k| mask & 1 << k != 0)
+        .map(|k| {
+            let d = (s - (k as f32 + 0.5)).abs() % n;
+            d.min(n - d)
+        })
+        .fold(f32::INFINITY, f32::min);
+    ((2.5 - dist) / 2.0).clamp(0.0, 1.0)
 }
 
 /// Annulus fit of one site. Returns the outcome, the patch quadric when the site is filled,
@@ -689,7 +755,7 @@ fn lattice(a: usize, patches: &[Patch], prm: &MarkerConfig) -> Vec<WorkPoint> {
         'point: for j in -k..=k {
             let (u, v) = (i as f32 * s, j as f32 * s);
             let r = (u * u + v * v).sqrt();
-            if r > edge || pa.only.as_ref().is_some_and(|(cells, mask)| !cells.contains(&(i, j)) && !direction_covered(*mask, u, v)) {
+            if r > edge || pa.only.as_ref().is_some_and(|c| !c.allows(i, j, u, v)) {
                 continue;
             }
             let z = pa.q.eval(u as f64, v as f64) as f32;
@@ -834,6 +900,9 @@ pub(crate) fn merge_sites(sites: &[Marker], prm: &MarkerConfig) -> Vec<Marker> {
 /// the surface round it without a step or a kink; the band itself is not moved. A vertex moved by
 /// several sites gets the mean of their displacements, so overlapping sites neither undo each
 /// other nor leave a step.
+/// At a site not covered all round, moves of more than 0.25 mm fade out towards the directions
+/// without mesh surface round the cut (an open rim, whose rolled edge is not the sheet the fit
+/// extrapolates).
 /// Edges, ribs and the opposite wall are not on the fitted sheet and stay where they are;
 /// topology does not change. Marks the moved vertices inside a cut in `inside_cut`.
 pub(crate) fn fair_sites(
@@ -910,6 +979,7 @@ fn fair_one(
     let mut ann: Vec<(f64, f64, f64)> = Vec::new();
     let mut cand: Vec<u32> = Vec::new();
     let mut sector_count = [0u32; 8];
+    let mut fine = [0u32; FINE_SECTORS];
     grid.for_each_within(pos, f.c, (r_out * r_out + 4.0).sqrt(), |i, _| {
         let p = pos[i as usize];
         if vnormal[i as usize].dot(n) < 0.5 {
@@ -926,12 +996,14 @@ fn fair_one(
         if r >= rc && r < r_out {
             let s = (((v.atan2(u) + std::f32::consts::PI) / (std::f32::consts::TAU / 8.0)) as usize).min(7);
             sector_count[s] += 1;
+            fine[fine_sector(u, v)] += 1;
             if !in_other_cut(p) {
                 ann.push((u as f64, v as f64, h as f64));
             }
         }
     });
     let sectors = sector_count.iter().filter(|&&c| c >= 6).count();
+    let mask = fine.iter().enumerate().filter(|e| *e.1 >= 2).fold(0u32, |m, (s, _)| m | 1 << s);
     if sectors < 7 && (sectors as u32) < prm.partial_min_sectors.min(8) {
         return fail(format!("annulus covers {sectors}/8 sectors"), nan);
     }
@@ -980,7 +1052,20 @@ fn fair_one(
         let dz = q.eval(u, v) + field.at(u, v) - h;
         sum += -dz;
         max_before = max_before.max(dz.abs());
-        moves.push(FairMove { vertex: i, delta: n * dz as f32, weight: 1.0, inside: true });
+        // A site not covered all round (a rim, an edge) is faired fully only towards the
+        // directions in which the mesh has surface round it: towards an open rim the fit is an
+        // extrapolation and the mesh there is the rim's own rolled edge, which falls away from it.
+        // Towards a mere gap in the annulus the sheet goes on, and the moves stay small: up to
+        // 0.25 mm they are made in full, fading out by 0.5 mm. Both weights are continuous (the
+        // direction weight fades over two directions), so the patch shows no seam.
+        let weight = if sectors < 8 {
+            direction_weight(mask, u as f32, v as f32).max(((0.5 - dz.abs() as f32) / 0.25).clamp(0.0, 1.0))
+        } else {
+            1.0
+        };
+        if weight > 0.0 {
+            moves.push(FairMove { vertex: i, delta: n * dz as f32, weight, inside: true });
+        }
     }
     let out = FairOutcome {
         status: "faired".into(),
