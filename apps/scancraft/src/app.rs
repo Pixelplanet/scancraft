@@ -115,6 +115,11 @@ pub struct Settings {
     pub mc_cell_mm: f32,
     pub mesh_smoothness: f32,
     pub mesh_auto_smooth: usize,
+    /// Reconstruct: drop laser-line strays and points off the surface first, and cut the passes'
+    /// listed marker stickers out and fill them from the surface around them
+    /// (`scancraft_mesh::prepare_points`).
+    pub mesh_suppress_artefacts: bool,
+    pub mesh_remove_markers: bool,
     /// Smooth: strength (normal-filtering iterations) and how much edges are kept (0–1).
     pub smooth_iterations: usize,
     pub smooth_keep_edges: f32,
@@ -162,6 +167,8 @@ impl Default for Settings {
             mc_cell_mm: 0.7,
             mesh_smoothness: 3.0,
             mesh_auto_smooth: 4,
+            mesh_suppress_artefacts: true,
+            mesh_remove_markers: true,
             smooth_iterations: 4,
             smooth_keep_edges: 0.7,
             fill_max_mm: 60.0,
@@ -2496,21 +2503,42 @@ impl ScanCraftApp {
                 let input = self.working_cloud();
                 let config = scancraft_mesh::SurfaceConfig { cell_mm: s.mc_cell_mm, detail: s.mesh_smoothness, ..Default::default() };
                 let smoother = (s.mesh_auto_smooth > 0).then(|| smoother(s.mesh_auto_smooth, s.smooth_keep_edges));
+                let prepare = scancraft_mesh::PrepareConfig { suppress_artefacts: s.mesh_suppress_artefacts, remove_markers: s.mesh_remove_markers, ..Default::default() };
+                // The passes' listed markers, found on their surfaces in the job (as Make Solid does).
+                let markers_from = s.mesh_remove_markers.then(|| self.solid_input());
                 self.spawn_undoable("Reconstructing the surface", "Reconstruct Surface", move || {
-                    let (mut mesh, stats) = Mesher::reconstruct_with_stats(&input, &config);
+                    let markers = match markers_from.map(project_ops::listed_markers).transpose() {
+                        Ok(m) => m.unwrap_or_default(),
+                        Err(e) => return JobResult::Failed(e),
+                    };
+                    let (cloud, prep) = if prepare.suppress_artefacts || !markers.is_empty() { scancraft_mesh::prepare_points(&input, &markers, &prepare) } else { (input, Default::default()) };
+                    let (mut mesh, stats) = Mesher::reconstruct_with_stats(&cloud, &config);
                     if mesh.triangles.is_empty() {
                         return JobResult::Failed("Reconstruction produced no surface; try a larger cell size or more smoothness".into());
                     }
                     if let Some(sm) = smoother {
                         sm.smooth(&mut mesh);
                     }
+                    // The filled marker sites end flush with the surface around them.
+                    let filled: Vec<_> = prep.marker_sites.iter().zip(&prep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(m, _)| m.clone()).collect();
+                    if !filled.is_empty() {
+                        scancraft_mesh::solid::fair_marker_sites(&mut mesh, &filled, &prepare.markers);
+                    }
                     let analysis = Mesher::analyze(&mesh);
                     let holes = scancraft_mesh::HoleFiller::find_holes(&mesh).len();
                     let message = format!(
-                        "Reconstructed {} triangles (point spacing {:.2} mm, smoothing radius {:.1} mm){}",
+                        "Reconstructed {} triangles (point spacing {:.2} mm, smoothing radius {:.1} mm){}{}{}",
                         thousands(analysis.triangle_count),
                         stats.point_spacing_mm,
                         stats.support_radius_mm,
+                        match prep.dropped_laser_strays + prep.dropped_off_surface + prep.dropped_ghosts {
+                            0 => String::new(),
+                            n => format!(" · {} stray points dropped", thousands(n)),
+                        },
+                        match filled.len() {
+                            0 => String::new(),
+                            n => format!(" · {n} marker{} removed", if n == 1 { "" } else { "s" }),
+                        },
                         if holes > 0 { format!(" · {holes} openings: Fill Holes closes them") } else { String::new() }
                     );
                     JobResult::Mesh { message, mesh, analysis }
@@ -3820,6 +3848,33 @@ mod tests {
         });
         eprintln!("solid: {summary:#}");
 
+        // Merge, then Reconstruct with the default settings (scan artefacts suppressed, the listed
+        // markers removed): `reconstruct.ply`, in the same frame as the solid.
+        let t_rec = Instant::now();
+        app.merge_passes();
+        wait_for_jobs(&mut app, Duration::from_secs(600));
+        let merge_status = app.status.clone();
+        assert!(app.merged.is_some(), "{merge_status}");
+        app.run_tool(Tool::Reconstruct);
+        wait_for_jobs(&mut app, Duration::from_secs(600));
+        let reconstruct_status = app.status.clone();
+        eprintln!("merge: {merge_status}\nreconstruct: {reconstruct_status}");
+        let reconstruct_s = t_rec.elapsed().as_secs_f32();
+        let reconstruct_tris = {
+            let m = app.mesh.as_ref().expect("Reconstruct made no mesh");
+            scancraft_io::save_mesh_ply_binary(&m.mesh, out.join("reconstruct.ply")).unwrap();
+            m.mesh.triangles.len()
+        };
+        let peak_after_reconstruct = peak_working_set_mb();
+        // What Reconstruct's preparation did at each listed marker (the same call as the tool's).
+        let reconstruct_markers: Vec<String> = {
+            let markers = project_ops::listed_markers(app.solid_input()).unwrap();
+            let cfg = scancraft_mesh::PrepareConfig::default();
+            let (prepared, rep) = scancraft_mesh::prepare_points(&app.working_cloud(), &markers, &cfg);
+            scancraft_io::save_ply_binary(&prepared, out.join("reconstruct_input.ply")).unwrap();
+            rep.marker_sites.iter().zip(&rep.marker_outcomes).map(|(m, o)| format!("{} r {:.1}: {} (cut {}, fill {})", o.id, m.radius_mm, o.fill, o.cut_points, o.fill_points)).collect()
+        };
+
         // Into the app as the tool's result, then saved and opened again.
         let message = solid_message(r, &analysis);
         let triangles = solid.mesh.triangles.len();
@@ -3860,8 +3915,9 @@ mod tests {
         let report = serde_json::json!({
             "imports": imports, "align": {"status": align_status, "seconds": align_s, "refine": format!("{:?}", outcome.refine), "placements": placements, "edges": edges},
             "markers_under_poses": markers, "solid": summary, "settings": format!("{job:?}"),
+            "reconstruct": {"merge": merge_status, "status": reconstruct_status, "triangles": reconstruct_tris, "seconds": reconstruct_s, "markers": reconstruct_markers},
             "reopened": {"passes": reopen, "mesh_triangles": reopened_mesh, "saved_triangles": triangles},
-            "peak_working_set_mb": {"after_align": peak_after_align, "after_solid": peak_after_solid},
+            "peak_working_set_mb": {"after_align": peak_after_align, "after_solid": peak_after_solid, "after_reconstruct": peak_after_reconstruct},
             "total_seconds": t_all.elapsed().as_secs_f32(),
         });
         std::fs::write(out.join("app_report.json"), serde_json::to_string_pretty(&report).unwrap()).unwrap();

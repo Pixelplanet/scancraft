@@ -44,6 +44,9 @@ pub struct HoleConfig {
     pub bridge_max_window_mm: f32,
     /// A region is a real opening when this fraction of its border shows the wall's cut face.
     pub edge_wall_fraction: f32,
+    /// Leave round enclosed holes open whose axis is clear of points on both sides (screw holes
+    /// through a plate; see `through_bore`).
+    pub keep_through_holes: bool,
 }
 
 impl Default for HoleConfig {
@@ -56,6 +59,7 @@ impl Default for HoleConfig {
             bridge_span_mm: 40.0,
             bridge_max_window_mm: 40.0,
             edge_wall_fraction: 0.4,
+            keep_through_holes: true,
         }
     }
 }
@@ -339,9 +343,13 @@ fn holes_at(
     }
     let span = if bridge { min_span(&wall, side) } else { Vec::new() };
     let span_max = (prm.bridge_span_mm as f64 / PX) as f32;
-    let emit = |pix: &[usize], dt_hole: &[f32], fill: &mut Vec<WorkPoint>| {
+    // Patch points over the region's pixels, except those `skip` marks (a bore left open).
+    let emit = |pix: &[usize], dt_hole: &[f32], skip: Option<&[bool]>, fill: &mut Vec<WorkPoint>| {
         let resid = harmonic_fill(pix, dt_hole, &rsum, &rcnt, side);
         for (&k, &rk) in pix.iter().zip(&resid) {
+            if skip.is_some_and(|s| s[k]) {
+                continue;
+            }
             let (u, v) = (((k % side) as i32 - half) as f64 * PX, ((k / side) as i32 - half) as f64 * PX);
             let z = q.eval(u, v) + rk;
             let (gu, gv) = q.grad(u, v);
@@ -389,7 +397,7 @@ fn holes_at(
                 continue;
             }
             count += 1;
-            emit(&bp, &dt_hole, &mut fill);
+            emit(&bp, &dt_hole, None, &mut fill);
             continue;
         }
         // Only holes centred in the inner half of the window (other seeds take the rest).
@@ -425,10 +433,98 @@ fn holes_at(
         if edge_fraction(&dt_hole) > prm.edge_wall_fraction {
             continue;
         }
+        // A real opening through the part stays open; the rest of the region (a shadowed gap
+        // beside it) is still patched.
+        let bore = if prm.keep_through_holes { through_bore(pix, side, half, &q, s.p, (eu, ev, n), pts, pos, grid) } else { None };
+        if bore.as_ref().is_some_and(|open| pix.iter().filter(|&&k| !open[k]).count() < 2) {
+            continue;
+        }
         count += 1;
-        emit(pix, &dt_hole, &mut fill);
+        emit(pix, &dt_hole, bore.as_deref(), &mut fill);
     }
     (fill, count)
+}
+
+/// The bore of a real opening through the part inside an enclosed hole region (a screw hole in a
+/// bracket plate, often merged with a shadowed gap beside it), as a pixel mask: the pixels whose
+/// line along the sheet normal is clear of measured points within 0.5 mm for 30 mm on either side
+/// (no opposite face of a wall, no other plate, no rib), connected to the deepest such pixel.
+/// `None` when the clear part holds no disc of 1–6 mm radius. A data gap in one face of a wall has
+/// the other face behind it and is filled; a cut-out marker on a one-sided scan is the marker
+/// stage's (it is listed or detected and patched before this). Completion points do not count:
+/// behind a plate they are a guess.
+#[allow(clippy::too_many_arguments)]
+fn through_bore(
+    pix: &[usize],
+    side: usize,
+    half: i32,
+    q: &Quadric,
+    origin: Vec3,
+    (eu, ev, n): (Vec3, Vec3, Vec3),
+    pts: &[WorkPoint],
+    pos: &[Vec3],
+    grid: &PointGrid,
+) -> Option<Vec<bool>> {
+    const RADIAL: f32 = 0.5;
+    const REACH: f32 = 30.0;
+    let clear_at = |k: usize| {
+        let (u, v) = (((k % side) as i32 - half) as f64 * PX, ((k / side) as i32 - half) as f64 * PX);
+        let (gu, gv) = q.grad(u, v);
+        let nl = DVec3::new(-gu, -gv, 1.0).normalize();
+        let axis = (eu * nl.x as f32 + ev * nl.y as f32 + n * nl.z as f32).normalize();
+        let c = origin + eu * u as f32 + ev * v as f32 + n * q.eval(u, v) as f32;
+        // Outwards from the sheet in both directions: the opposite face of a wall is met first.
+        let mut t = 0.0f32;
+        while t <= REACH {
+            for x in [c + axis * t, c - axis * t] {
+                let mut hit = false;
+                grid.for_each_within(pos, x, 2.0 * RADIAL, |i, _| {
+                    let p = &pts[i as usize];
+                    if !hit && p.kind == PointKind::Measured {
+                        let d = p.p - c;
+                        let h = d.dot(axis);
+                        hit = (d - axis * h).length_squared() < RADIAL * RADIAL;
+                    }
+                });
+                if hit {
+                    return false;
+                }
+            }
+            t += RADIAL;
+        }
+        true
+    };
+    let clear: Vec<(usize, bool)> = pix.par_iter().map(|&k| (k, clear_at(k))).collect();
+    let mut blocked = vec![true; side * side];
+    for &(k, c) in &clear {
+        blocked[k] = !c;
+    }
+    let dt = chamfer_dt(&blocked, side);
+    let (deepest, depth) = clear.iter().filter(|e| e.1).map(|e| (e.0, dt[e.0])).max_by(|a, b| a.1.total_cmp(&b.1))?;
+    // chamfer_dt is in pixels, 3-4 weights normalised to one pixel per step.
+    let radius = depth as f64 * PX;
+    if !(1.0..=6.0).contains(&radius) {
+        return None;
+    }
+    // The clear pixels connected to the deepest one.
+    let mut open = vec![false; side * side];
+    open[deepest] = true;
+    let mut stack = vec![deepest];
+    while let Some(k) = stack.pop() {
+        let (a, b) = ((k % side) as i32, (k / side) as i32);
+        for (da, db) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (x, y) = (a + da, b + db);
+            if x < 0 || y < 0 || x >= side as i32 || y >= side as i32 {
+                continue;
+            }
+            let kk = y as usize * side + x as usize;
+            if !blocked[kk] && !open[kk] {
+                open[kk] = true;
+                stack.push(kk);
+            }
+        }
+    }
+    Some(open)
 }
 
 /// Per pixel, the shortest span between occupied pixels on both sides of it along one of four

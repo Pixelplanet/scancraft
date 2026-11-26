@@ -685,6 +685,7 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
     let t = Tokens::get();
     let input = thousands(app.working_len());
     let source = app.working_source();
+    let marker_count = matches!(tool, Tool::Reconstruct).then(|| app.solid_marker_count());
     if let Some(reason) = app.tool_blocked(tool) {
         kit::status_line(ui, reason, t.warning);
         ui.add_space(t.space_6);
@@ -736,6 +737,13 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             );
             kit::slider_row(ui, "Then smooth", &mut s.mesh_auto_smooth, 0..=10, 0, "").on_hover_text("Edge-preserving smoothing steps right after reconstruction (0 = off).");
             kit::slider_row(ui, "Keep edges", &mut s.smooth_keep_edges, 0.0..=1.0, 2, "").on_hover_text("High keeps edges and ribs sharp; low rounds everything like a plain smoothing filter.");
+            kit::checkbox(ui, "Suppress scan artefacts", &mut s.mesh_suppress_artefacts).on_hover_text(
+                "Drops stray points before meshing: the line patterns a cross-line laser leaves just behind a thin wall, and single points off the surface. Turn off for parts with engraving finer than about a millimetre.",
+            );
+            if let Some((markers, exact)) = marker_count.filter(|m| m.0 > 0) {
+                let label = if exact { format!("Remove marker stickers ({markers} listed)") } else { format!("Remove marker stickers (up to {markers} listed)") };
+                kit::checkbox(ui, &label, &mut s.mesh_remove_markers).on_hover_text("Cuts each listed sticker out and fills it from the surface around it, so the site ends flush. Only listed markers: Make Solid also finds unlisted ones.");
+            }
             kit::note(ui, "Open areas stay open; Fill Holes closes them.");
         }
         Tool::Smooth => {

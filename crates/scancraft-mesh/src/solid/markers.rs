@@ -84,13 +84,23 @@ pub struct MarkerConfig {
     pub fair_mesh: bool,
     /// Mesh annulus RMS limit for the fairing (the mesh is smoother than the data).
     pub fair_rms_max_mm: f32,
-    /// Width of the blend from the faired patch back to the mesh outside the cut.
+    /// Width of the band beyond the cut whose residual against the fit is carried into the faired
+    /// patch (see [`fair_sites`]).
     pub fair_blend_mm: f32,
     /// A listed marker normal whose direction disagrees with the data ([`orient_markers`]) by
     /// more than this (degrees) is replaced by the data's; closer ones keep their direction (near
     /// ribs and edges the tracker's normal is the better one). 180 or more: only the sign is
     /// taken from the data.
     pub reorient_min_deg: f32,
+    /// A site whose annulus is covered in at least this many of 8 sectors, but not all round (a
+    /// sticker near the rim or an edge of the scan), is still cut and patched, and faired on the
+    /// mesh. 8 or more disables it. Any site not covered all round is patched only where the cut
+    /// took points or the annulus has surface in that direction, so the patch never reaches past
+    /// the scanned surface.
+    pub partial_min_sectors: u32,
+    /// Grow a site's cut over a sparse ring around it by up to this much (mm; 0 = off), see
+    /// [`widen_over_sparse_rings`].
+    pub widen_max_mm: f32,
 }
 
 impl Default for MarkerConfig {
@@ -110,6 +120,8 @@ impl Default for MarkerConfig {
             fair_rms_max_mm: 0.1,
             fair_blend_mm: 2.0,
             reorient_min_deg: 10.0,
+            partial_min_sectors: 4,
+            widen_max_mm: 5.0,
         }
     }
 }
@@ -154,64 +166,97 @@ pub(crate) fn tangent_frame(n: Vec3) -> (Vec3, Vec3) {
     (u, n.cross(u))
 }
 
-/// Least-squares quadric height field z = c0 + c1 u + c2 v + c3 u² + c4 uv + c5 v².
+/// Least-squares height field z = c0 + c1 u + c2 v + c3 u² + c4 uv + c5 v², optionally with the
+/// cubic terms c6 u³ + c7 u²v + c8 uv² + c9 v³ ([`Quadric::fit_robust_cubic`]; zero otherwise).
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Quadric(pub [f64; 6]);
+pub(crate) struct Quadric(pub [f64; 10]);
 
 impl Quadric {
     #[inline]
     pub fn eval(&self, u: f64, v: f64) -> f64 {
         let c = &self.0;
-        c[0] + c[1] * u + c[2] * v + c[3] * u * u + c[4] * u * v + c[5] * v * v
+        c[0] + c[1] * u + c[2] * v + c[3] * u * u + c[4] * u * v + c[5] * v * v + c[6] * u * u * u + c[7] * u * u * v + c[8] * u * v * v + c[9] * v * v * v
     }
     #[inline]
     pub fn grad(&self, u: f64, v: f64) -> (f64, f64) {
         let c = &self.0;
-        (c[1] + 2.0 * c[3] * u + c[4] * v, c[2] + c[4] * u + 2.0 * c[5] * v)
+        (
+            c[1] + 2.0 * c[3] * u + c[4] * v + 3.0 * c[6] * u * u + 2.0 * c[7] * u * v + c[8] * v * v,
+            c[2] + c[4] * u + 2.0 * c[5] * v + c[7] * u * u + 2.0 * c[8] * u * v + 3.0 * c[9] * v * v,
+        )
     }
 
-    fn fit_once(s: &[(f64, f64, f64)], keep: &[bool]) -> Option<Quadric> {
-        let mut a = [[0f64; 6]; 6];
-        let mut b = [0f64; 6];
+    fn fit_once<const N: usize>(s: &[(f64, f64, f64)], keep: &[bool]) -> Option<Quadric> {
+        let mut a = [[0f64; N]; N];
+        let mut b = [0f64; N];
         let mut n = 0usize;
         for (&(u, v, z), &k) in s.iter().zip(keep) {
             if !k {
                 continue;
             }
             n += 1;
-            let f = [1.0, u, v, u * u, u * v, v * v];
-            for i in 0..6 {
+            let all = [1.0, u, v, u * u, u * v, v * v, u * u * u, u * u * v, u * v * v, v * v * v];
+            let f = &all[..N];
+            for i in 0..N {
                 b[i] += f[i] * z;
-                for j in 0..6 {
+                for j in 0..N {
                     a[i][j] += f[i] * f[j];
                 }
             }
         }
-        if n < 12 {
+        if n < 2 * N {
             return None;
         }
         // Tiny ridge for stability on narrow annuli.
         for (i, row) in a.iter_mut().enumerate() {
             row[i] += 1e-9 * (1.0 + row[i]);
         }
-        solve6(a, b).map(Quadric)
+        let x = solve(a, b)?;
+        let mut c = [0f64; 10];
+        c[..N].copy_from_slice(&x);
+        Some(Quadric(c))
     }
 
     /// Three-pass fit: each refit drops residuals beyond max(2 σ, 0.03 mm) of the previous fit.
     /// Returns the fit and the RMS over the kept samples.
     pub fn fit_robust(s: &[(f64, f64, f64)]) -> Option<(Quadric, f64, usize)> {
+        Self::fit_robust_n::<6>(s)
+    }
+
+    /// [`fit_robust`](Self::fit_robust) with the cubic terms: follows a sheet whose curvature
+    /// changes across the site (a gentle crease, the start of a rim's roll-off) that a quadric
+    /// averages into a dent or a bump at the centre.
+    pub fn fit_robust_cubic(s: &[(f64, f64, f64)]) -> Option<(Quadric, f64, usize)> {
+        Self::fit_robust_n::<10>(s)
+    }
+
+    fn fit_robust_n<const N: usize>(s: &[(f64, f64, f64)]) -> Option<(Quadric, f64, usize)> {
         let mut keep = vec![true; s.len()];
-        let mut q = Self::fit_once(s, &keep)?;
+        let mut q = Self::fit_once::<N>(s, &keep)?;
         let mut rms = rms_of(s, &keep, &q);
         for _ in 0..2 {
             let lim = (2.0 * rms).max(0.03);
             for (k, &(u, v, z)) in keep.iter_mut().zip(s) {
                 *k = (z - q.eval(u, v)).abs() <= lim;
             }
-            q = Self::fit_once(s, &keep)?;
+            q = Self::fit_once::<N>(s, &keep)?;
             rms = rms_of(s, &keep, &q);
         }
         Some((q, rms, keep.iter().filter(|k| **k).count()))
+    }
+
+    /// The annulus fit of a marker site: the quadric, or the cubic when the quadric leaves an
+    /// RMS above `rough_mm` and the cubic does clearly better (an annulus all round the site
+    /// constrains the cubic terms; a partial one does not, then the quadric is kept).
+    pub fn fit_annulus(s: &[(f64, f64, f64)], rough_mm: f64, covered_all_round: bool) -> Option<(Quadric, f64, usize)> {
+        let quad = Self::fit_robust(s)?;
+        if quad.1 <= rough_mm || !covered_all_round {
+            return Some(quad);
+        }
+        match Self::fit_robust_cubic(s) {
+            Some(cub) if cub.1 < 0.8 * quad.1 && cub.2 as f64 >= 0.9 * quad.2 as f64 => Some(cub),
+            _ => Some(quad),
+        }
     }
 }
 
@@ -231,27 +276,27 @@ fn rms_of(s: &[(f64, f64, f64)], keep: &[bool], q: &Quadric) -> f64 {
     }
 }
 
-/// Gaussian elimination with partial pivoting for a 6×6 system.
-pub(crate) fn solve6(mut a: [[f64; 6]; 6], mut b: [f64; 6]) -> Option<[f64; 6]> {
-    for c in 0..6 {
-        let p = (c..6).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
+/// Gaussian elimination with partial pivoting for an N×N system.
+pub(crate) fn solve<const N: usize>(mut a: [[f64; N]; N], mut b: [f64; N]) -> Option<[f64; N]> {
+    for c in 0..N {
+        let p = (c..N).max_by(|&i, &j| a[i][c].abs().total_cmp(&a[j][c].abs()))?;
         if a[p][c].abs() < 1e-12 {
             return None;
         }
         a.swap(c, p);
         b.swap(c, p);
-        for r in c + 1..6 {
+        for r in c + 1..N {
             let f = a[r][c] / a[c][c];
-            for k in c..6 {
+            for k in c..N {
                 a[r][k] -= f * a[c][k];
             }
             b[r] -= f * b[c];
         }
     }
-    let mut x = [0f64; 6];
-    for r in (0..6).rev() {
+    let mut x = [0f64; N];
+    for r in (0..N).rev() {
         let mut s = b[r];
-        for k in r + 1..6 {
+        for k in r + 1..N {
             s -= a[r][k] * x[k];
         }
         x[r] = s / a[r][r];
@@ -391,6 +436,12 @@ struct Patch {
     f: SiteFrame,
     q: Quadric,
     scan: u8,
+    /// For a site not covered all round: the lattice cells (index pairs at `fill_spacing_mm`) the
+    /// cut took points from, grown by one cell, and the mask of the [`FINE_SECTORS`] directions in
+    /// which the annulus has surface. The patch is emitted only in those cells or in directions
+    /// covered together with both neighbours, so it never reaches past the scanned surface (an
+    /// open rim, the end of the scan).
+    only: Option<(std::collections::HashSet<(i32, i32)>, u32)>,
 }
 
 impl Patch {
@@ -440,8 +491,9 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
         }
     }
 
-    // Per site: the outcome, the patch quadric (fillable sites) and whether the cut is applied.
-    let fits: Vec<(MarkerOutcome, Option<Quadric>, bool)> = markers
+    // Per site: the outcome, the patch quadric (fillable sites), whether the cut is applied and
+    // the covered directions of the annulus.
+    let fits: Vec<(MarkerOutcome, Option<Quadric>, bool, u32)> = markers
         .par_iter()
         .zip(frames.par_iter())
         .zip(cuts.par_iter())
@@ -451,13 +503,30 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
     let patches: Vec<Patch> = fits
         .iter()
         .enumerate()
-        .filter_map(|(k, (_, q, _))| q.map(|q| Patch { site: k, f: frames[k], q, scan: markers[k].scan.unwrap_or(0) }))
+        .filter_map(|(k, (out, q, _, mask))| {
+            let q = (*q)?;
+            let only = (out.sectors_covered < 8).then(|| {
+                let s = prm.fill_spacing_mm;
+                let mut cells = std::collections::HashSet::new();
+                for &i in &cuts[k] {
+                    let (u, v, _) = frames[k].local(pts[i as usize].p);
+                    let (a, b) = ((u / s).round() as i32, (v / s).round() as i32);
+                    for da in -1..=1 {
+                        for db in -1..=1 {
+                            cells.insert((a + da, b + db));
+                        }
+                    }
+                }
+                (cells, *mask)
+            });
+            Some(Patch { site: k, f: frames[k], q, scan: markers[k].scan.unwrap_or(0), only })
+        })
         .collect();
     let fills: Vec<Vec<WorkPoint>> = (0..patches.len()).into_par_iter().map(|a| lattice(a, &patches, prm)).collect();
 
     let mut remove = vec![false; pts.len()];
     let mut outcomes = Vec::with_capacity(markers.len());
-    for ((out, _, apply), cut) in fits.into_iter().zip(&cuts) {
+    for ((out, _, apply, _), cut) in fits.into_iter().zip(&cuts) {
         if apply {
             for &i in cut {
                 remove[i as usize] = true;
@@ -498,8 +567,23 @@ fn site_cut(f: &SiteFrame, pts: &[WorkPoint], pos: &[Vec3], grid: &PointGrid, pr
     cut
 }
 
-/// Annulus fit of one site. Returns the outcome, the patch quadric when the site is filled, and
-/// whether its cut is applied.
+/// Directions (sectors of the annulus) a partly covered site's patch is limited to.
+const FINE_SECTORS: usize = 24;
+
+fn fine_sector(u: f32, v: f32) -> usize {
+    (((v.atan2(u) + std::f32::consts::PI) / (std::f32::consts::TAU / FINE_SECTORS as f32)) as usize).min(FINE_SECTORS - 1)
+}
+
+/// Whether the direction of (u, v) and both neighbouring directions have annulus surface in
+/// `mask` (a direction at the end of the coverage is partly beyond it).
+fn direction_covered(mask: u32, u: f32, v: f32) -> bool {
+    let s = fine_sector(u, v);
+    [s + FINE_SECTORS - 1, s, s + 1].iter().all(|&k| mask & 1 << (k % FINE_SECTORS) != 0)
+}
+
+/// Annulus fit of one site. Returns the outcome, the patch quadric when the site is filled,
+/// whether its cut is applied, and the mask of the [`FINE_SECTORS`] directions in which the
+/// annulus has surface (two points or more).
 #[allow(clippy::too_many_arguments)]
 fn site_fit(
     m: &Marker,
@@ -510,9 +594,10 @@ fn site_fit(
     grid: &PointGrid,
     in_cut: &[bool],
     prm: &MarkerConfig,
-) -> (MarkerOutcome, Option<Quadric>, bool) {
+) -> (MarkerOutcome, Option<Quadric>, bool, u32) {
     let mut ann: Vec<(f64, f64, f64)> = Vec::new();
     let mut sector_count = [0u32; 8];
+    let mut fine = [0u32; FINE_SECTORS];
     grid.for_each_within(pos, f.c, (f.r_out * f.r_out + 4.0).sqrt(), |i, _| {
         let p = &pts[i as usize];
         if p.kind != PointKind::Measured || p.n.dot(f.n) < 0.5 {
@@ -527,12 +612,14 @@ fn site_fit(
             // A neighbour's cut is surface all the same (coverage), but its sticker is not fitted.
             let s = (((v.atan2(u) + std::f32::consts::PI) / (std::f32::consts::TAU / 8.0)) as usize).min(7);
             sector_count[s] += 1;
+            fine[fine_sector(u, v)] += 1;
             if !in_cut[i as usize] {
                 ann.push((u as f64, v as f64, h as f64));
             }
         }
     });
     let sectors = sector_count.iter().filter(|&&c| c >= 6).count() as u32;
+    let mask = fine.iter().enumerate().filter(|e| *e.1 >= 2).fold(0u32, |m, (s, _)| m | 1 << s);
     let mut out = MarkerOutcome {
         id: m.id.clone(),
         scan: m.scan,
@@ -548,31 +635,36 @@ fn site_fit(
     };
     if !prm.quadric_fill {
         out.fill = "implicit (M1)".into();
-        return (out, None, true);
+        return (out, None, true, mask);
     }
     // A site that cannot be patched is either left to the solve (cut, M1 behaviour) or kept.
     let unfillable = |mut out: MarkerOutcome, why: String| {
         if prm.keep_unfillable {
             out.fill = format!("kept (not cut): {why}");
             out.cut_points = 0;
-            (out, None, false)
+            (out, None, false, mask)
         } else {
             out.fill = format!("implicit: {why}");
-            (out, None, true)
+            (out, None, true, mask)
         }
     };
-    if sectors < 6 {
+    if sectors < 6 && sectors < prm.partial_min_sectors {
         return unfillable(out, format!("annulus covers {sectors}/8 sectors"));
     }
-    let Some((q, rms, _)) = Quadric::fit_robust(&ann) else {
+    let Some((q, rms, _)) = Quadric::fit_annulus(&ann, 0.5 * prm.fit_rms_max_mm as f64, sectors == 8) else {
         return unfillable(out, "quadric fit failed".into());
     };
     out.annulus_rms_mm = rms as f32;
     if rms > prm.fill_rms_limit_mm as f64 {
         return unfillable(out, format!("annulus RMS {:.3} mm", rms));
     }
-    out.fill = if rms > prm.fit_rms_max_mm as f64 { format!("quadric, rough annulus ({:.3} mm)", rms) } else { "quadric".into() };
-    (out, Some(q), true)
+    out.fill = match (rms > prm.fit_rms_max_mm as f64, sectors < 8) {
+        (false, false) => "quadric".into(),
+        (true, false) => format!("quadric, rough annulus ({:.3} mm)", rms),
+        (false, true) => format!("quadric, partial ({sectors}/8 sectors)"),
+        (true, true) => format!("quadric, partial ({sectors}/8 sectors), rough annulus ({:.3} mm)", rms),
+    };
+    (out, Some(q), true, mask)
 }
 
 /// Infill lattice of patch `a` (inside the cut, slightly overlapping the annulus edge). Where
@@ -597,7 +689,7 @@ fn lattice(a: usize, patches: &[Patch], prm: &MarkerConfig) -> Vec<WorkPoint> {
         'point: for j in -k..=k {
             let (u, v) = (i as f32 * s, j as f32 * s);
             let r = (u * u + v * v).sqrt();
-            if r > edge {
+            if r > edge || pa.only.as_ref().is_some_and(|(cells, mask)| !cells.contains(&(i, j)) && !direction_covered(*mask, u, v)) {
                 continue;
             }
             let z = pa.q.eval(u as f64, v as f64) as f32;
@@ -621,6 +713,58 @@ fn lattice(a: usize, patches: &[Patch], prm: &MarkerConfig) -> Vec<WorkPoint> {
         }
     }
     fill
+}
+
+/// Widens each site's cut over an empty ring around it. Revo Scan leaves an empty ring 6–9 mm
+/// around a sticker in some scans (the dark border of the marker returns no data); a cut that ends
+/// inside that ring leaves the solve or the mesher to bridge it, which shows as a ring of dimples
+/// round the patch, and the annulus fit would see only its outer part. Per site the occupancy of
+/// 0.5 mm rings from the cut outwards is measured (the share of ~0.7 mm cells along the ring that
+/// hold a same-facing point within 1.5 mm of the sheet; occupancy, not density, so where scans
+/// overlap counts the same as where one covers) and compared with the occupancy 6–9 mm beyond
+/// the cut; while a ring has less than half of that, the cut grows (by at most `widen_max_mm`).
+pub(crate) fn widen_over_sparse_rings(pts: &[WorkPoint], sites: &mut [Marker], prm: &MarkerConfig) {
+    if prm.widen_max_mm <= 0.0 || sites.is_empty() {
+        return;
+    }
+    let pos: Vec<Vec3> = pts.iter().map(|p| p.p).collect();
+    let grid = PointGrid::new(&pos, 2.0);
+    const BIN: f32 = 0.5;
+    const ARC: f32 = 0.7;
+    sites.par_iter_mut().for_each(|m| {
+        let f = SiteFrame::new(m, prm);
+        let (r0, r_ref0, r_ref1) = (f.rc, f.rc + 6.0, f.rc + 9.0);
+        let nb = ((r_ref1 - r0) / BIN).ceil() as usize;
+        let cells: Vec<usize> = (0..nb).map(|k| ((std::f32::consts::TAU * (r0 + (k as f32 + 0.5) * BIN) / ARC).ceil() as usize).max(8)).collect();
+        let mut occ: Vec<Vec<bool>> = cells.iter().map(|&c| vec![false; c]).collect();
+        grid.for_each_within(&pos, f.c, (r_ref1 * r_ref1 + 2.25).sqrt(), |i, _| {
+            let p = &pts[i as usize];
+            if p.kind != PointKind::Measured || p.n.dot(f.n) < 0.5 {
+                return;
+            }
+            let (u, v, h) = f.local(p.p);
+            let r = (u * u + v * v).sqrt();
+            if h.abs() < 1.5 && r >= r0 && r < r_ref1 {
+                let k = (((r - r0) / BIN) as usize).min(nb - 1);
+                let a = ((v.atan2(u) + std::f32::consts::PI) / std::f32::consts::TAU * cells[k] as f32) as usize;
+                occ[k][a.min(cells[k] - 1)] = true;
+            }
+        });
+        let share = |k: usize| occ[k].iter().filter(|&&o| o).count() as f32 / cells[k] as f32;
+        let refs: Vec<usize> = (0..nb).filter(|&k| r0 + k as f32 * BIN >= r_ref0).collect();
+        let reference = refs.iter().map(|&k| share(k)).sum::<f32>() / refs.len().max(1) as f32;
+        if reference < 0.3 {
+            return;
+        }
+        let mut k = 0usize;
+        while (k as f32) * BIN < prm.widen_max_mm && share(k) < 0.5 * reference {
+            k += 1;
+        }
+        if k > 0 {
+            // cut_radius = radius + 1 mm: the cut ends half a millimetre beyond the empty rings.
+            m.radius_mm = m.radius_mm.max(r0 + k as f32 * BIN + 0.5 - 1.0);
+        }
+    });
 }
 
 /// Radius of the cut at a site.
@@ -680,13 +824,16 @@ pub(crate) fn merge_sites(sites: &[Marker], prm: &MarkerConfig) -> Vec<Marker> {
 
 /// Mesh fairing of the marker sites. For every site the mesh vertices on the site's sheet (normal
 /// within 60° of the site normal, within 2 mm of the site plane) in the annulus
-/// `cut .. cut + fit_width` are fitted with a robust quadric height field; vertices inside the
-/// cut of another site on the same sheet count for the coverage but are not fitted. When the
-/// annulus is smooth (RMS ≤ `fair_rms_max_mm`) and covered all round, every vertex inside the cut
-/// (weight 1) and, fading out, in a `fair_blend_mm` band beyond it that lies on the fitted sheet
-/// (within 0.8 mm and facing like it within 25°) is moved along the site normal onto the quadric.
-/// A vertex moved by several sites gets the weighted mean of their displacements, applied with
-/// the largest of their weights, so overlapping sites neither undo each other nor leave a step.
+/// `cut .. cut + fit_width` are fitted with a robust quadric height field (cubic where the
+/// quadric leaves a rough annulus, [`Quadric::fit_annulus`]); vertices inside the cut of another
+/// site on the same sheet count for the coverage but are not fitted. When the annulus is smooth
+/// (RMS ≤ `fair_rms_max_mm`) and covered in at least `partial_min_sectors` of 8 sectors, every
+/// vertex inside the cut that lies on the fitted sheet (within 0.8 mm and facing like it within
+/// 25°) is moved along the site normal onto the fit plus the residual of the mesh against the fit
+/// in a `fair_blend_mm` band beyond the cut, interpolated inwards (Laplace), so the patch meets
+/// the surface round it without a step or a kink; the band itself is not moved. A vertex moved by
+/// several sites gets the mean of their displacements, so overlapping sites neither undo each
+/// other nor leave a step.
 /// Edges, ribs and the opposite wall are not on the fitted sheet and stay where they are;
 /// topology does not change. Marks the moved vertices inside a cut in `inside_cut`.
 pub(crate) fn fair_sites(
@@ -785,24 +932,29 @@ fn fair_one(
         }
     });
     let sectors = sector_count.iter().filter(|&&c| c >= 6).count();
-    if sectors < 7 {
+    if sectors < 7 && (sectors as u32) < prm.partial_min_sectors.min(8) {
         return fail(format!("annulus covers {sectors}/8 sectors"), nan);
     }
-    let Some((q, rms, kept)) = Quadric::fit_robust(&ann) else {
+    let Some((q, rms, kept)) = Quadric::fit_annulus(&ann, 0.5 * prm.fair_rms_max_mm as f64, sectors == 8) else {
         return fail("quadric fit failed".into(), nan);
     };
     if rms > prm.fair_rms_max_mm as f64 || (kept as f64) < 0.6 * ann.len() as f64 {
         return fail(format!("annulus RMS {:.3} mm ({kept}/{} kept)", rms, ann.len()), rms as f32);
     }
-    let (mut sum, mut cnt, mut max_before) = (0f64, 0usize, 0f64);
-    let mut moves = Vec::new();
+    // Inside the cut the vertices go onto the fit plus the residual of the surface around the cut
+    // against the fit, carried inwards by Laplace interpolation ([`residual_field`]): the patch
+    // meets the surface round it where it is, without a step or a kink at the edge of the cut
+    // (a ring of 0.05 mm over the 2 mm blend shows under a grazing light). The surface beyond the
+    // cut stays where it is.
+    let band = prm.fair_blend_mm.max(1.0);
+    let mut ring_res: Vec<(f64, f64, f64)> = Vec::new();
+    let mut inner: Vec<(u32, f64, f64, f64)> = Vec::new();
     for &i in &cand {
         let p = pos[i as usize];
         let (u, v, h) = f.local(p);
         let (u, v, h) = (u as f64, v as f64, h as f64);
         let z = q.eval(u, v);
-        let dz = z - h;
-        if dz.abs() > 0.8 {
+        if (z - h).abs() > 0.8 {
             continue;
         }
         let (gu, gv) = q.grad(u, v);
@@ -813,31 +965,119 @@ fn fair_one(
         }
         let r = (u * u + v * v).sqrt() as f32;
         if r < rc {
-            sum += -dz;
-            cnt += 1;
-            max_before = max_before.max(dz.abs());
-        }
-        let w = if r <= rc {
-            1.0
-        } else {
-            let t = ((r - rc) / prm.fair_blend_mm).clamp(0.0, 1.0);
-            1.0 - t * t * (3.0 - 2.0 * t)
-        };
-        if w > 0.0 {
-            moves.push(FairMove { vertex: i, delta: n * dz as f32, weight: w, inside: r < rc });
+            inner.push((i, u, v, h));
+        } else if r < rc + band && !in_other_cut(p) {
+            ring_res.push((u, v, h - z));
         }
     }
-    if cnt < 20 {
-        return fail(format!("only {cnt} mesh vertices on the sheet inside the cut"), rms as f32);
+    if inner.len() < 20 {
+        return fail(format!("only {} mesh vertices on the sheet inside the cut", inner.len()), rms as f32);
+    }
+    let field = residual_field(&ring_res, rc as f64, band as f64);
+    let (mut sum, mut max_before) = (0f64, 0f64);
+    let mut moves = Vec::with_capacity(inner.len());
+    for &(i, u, v, h) in &inner {
+        let dz = q.eval(u, v) + field.at(u, v) - h;
+        sum += -dz;
+        max_before = max_before.max(dz.abs());
+        moves.push(FairMove { vertex: i, delta: n * dz as f32, weight: 1.0, inside: true });
     }
     let out = FairOutcome {
         status: "faired".into(),
         ring_rms_mm: rms as f32,
-        mean_before_mm: (sum / cnt as f64) as f32,
+        mean_before_mm: (sum / inner.len() as f64) as f32,
         max_before_mm: max_before as f32,
         vertices: moves.len(),
     };
     (out, moves)
+}
+
+/// A residual height over a site's disc on a 0.35 mm pixel grid: the mean of the samples
+/// `(u, v, residual)` in each pixel of the band `rc .. rc + band`, and inside the cut (and in band
+/// pixels without samples) their Laplace interpolation (successive over-relaxation).
+struct ResidualField {
+    half: i32,
+    side: usize,
+    value: Vec<f64>,
+}
+
+const FIELD_PX: f64 = 0.35;
+
+fn residual_field(samples: &[(f64, f64, f64)], rc: f64, band: f64) -> ResidualField {
+    let half = ((rc + band) / FIELD_PX).ceil() as i32 + 1;
+    let side = (2 * half + 1) as usize;
+    let n = side * side;
+    let r_at = |k: usize| {
+        let (a, b) = ((k % side) as i32 - half, (k / side) as i32 - half);
+        (a as f64 * FIELD_PX).hypot(b as f64 * FIELD_PX)
+    };
+    let (mut sum, mut cnt) = (vec![0f64; n], vec![0u32; n]);
+    for &(u, v, r) in samples {
+        let (a, b) = ((u / FIELD_PX).round() as i32 + half, (v / FIELD_PX).round() as i32 + half);
+        if a >= 0 && b >= 0 && a < side as i32 && b < side as i32 {
+            let k = b as usize * side + a as usize;
+            sum[k] += r;
+            cnt[k] += 1;
+        }
+    }
+    let inside = |k: usize| r_at(k) < rc + band;
+    let mut value = vec![0f64; n];
+    let mut unknown: Vec<usize> = Vec::new();
+    let (mut bs, mut bc) = (0f64, 0usize);
+    for k in 0..n {
+        if cnt[k] > 0 && r_at(k) >= rc {
+            value[k] = sum[k] / cnt[k] as f64;
+            bs += value[k];
+            bc += 1;
+        } else if inside(k) {
+            unknown.push(k);
+        }
+    }
+    let start = if bc > 0 { bs / bc as f64 } else { 0.0 };
+    for &k in &unknown {
+        value[k] = start;
+    }
+    if bc > 0 {
+        for _ in 0..600 {
+            let mut change = 0f64;
+            for &k in &unknown {
+                let (a, b) = ((k % side) as i32, (k / side) as i32);
+                let (mut s, mut c) = (0f64, 0u32);
+                for (da, db) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                    let (x, y) = (a + da, b + db);
+                    if x < 0 || y < 0 || x >= side as i32 || y >= side as i32 {
+                        continue;
+                    }
+                    let kk = y as usize * side + x as usize;
+                    if inside(kk) {
+                        s += value[kk];
+                        c += 1;
+                    }
+                }
+                if c > 0 {
+                    let new = value[k] + 1.9 * (s / c as f64 - value[k]);
+                    change = change.max((new - value[k]).abs());
+                    value[k] = new;
+                }
+            }
+            if change < 1e-6 {
+                break;
+            }
+        }
+    }
+    ResidualField { half, side, value }
+}
+
+impl ResidualField {
+    /// Bilinear sample at (u, v).
+    fn at(&self, u: f64, v: f64) -> f64 {
+        let (x, y) = (u / FIELD_PX + self.half as f64, v / FIELD_PX + self.half as f64);
+        let (x0, y0) = (x.floor().clamp(0.0, (self.side - 2) as f64), y.floor().clamp(0.0, (self.side - 2) as f64));
+        let (tx, ty) = ((x - x0).clamp(0.0, 1.0), (y - y0).clamp(0.0, 1.0));
+        let k = y0 as usize * self.side + x0 as usize;
+        let v = &self.value;
+        (v[k] * (1.0 - tx) + v[k + 1] * tx) * (1.0 - ty) + (v[k + self.side] * (1.0 - tx) + v[k + self.side + 1] * tx) * ty
+    }
 }
 
 /// Detector settings (raised discs and round holes).
@@ -1069,11 +1309,78 @@ fn detect_at(si: usize, pts: &[WorkPoint], pos: &[Vec3], grid: &PointGrid, prm: 
             }
         }
         let good = (0..12).filter(|&s| tot[s] > 0 && hit[s] as f64 >= 0.6 * tot[s] as f64).count();
-        if good >= 11 {
-            return Some(mk(cu, cv, &q, MarkerSource::DetectedHole, radius as f32, radius as f32));
+        // A sticker sits on a plain sheet: beyond the ring the sheet goes on all round. A round
+        // opening in a narrow plate (a screw hole in a hinge bracket) or beside a rib has the
+        // plate's edge or the rib's foot there instead, and must stay open.
+        if good >= 11 && plain_surroundings(&occ, side, half, cu, cv, radius, w as f64) {
+            let m = mk(cu, cv, &q, MarkerSource::DetectedHole, radius as f32, radius as f32);
+            // A screw hole's rim goes on down as the wall of its bore; a cut-out sticker's does not.
+            if !bore_wall(pts, pos, grid, m.center, m.normal, radius as f32) {
+                return Some(m);
+            }
         }
     }
     None
+}
+
+/// Whether a round hole in a sheet (centre `c` on the sheet, `axis` its outward normal) is the
+/// mouth of a bore: measured points of any scan 0.3–6 mm below the sheet, between 0.6 × `radius`
+/// and `radius` + 1 mm from the axis, facing the axis (normal across the axis, pointing in), in
+/// at least 3 of 8 sectors. A screw hole through a bracket plate or a boss shows its bore wall; the
+/// gap a sticker was cut out of has nothing below its rim but the opposite face of the wall, which
+/// faces along the axis.
+fn bore_wall(pts: &[WorkPoint], pos: &[Vec3], grid: &PointGrid, c: Vec3, axis: Vec3, radius: f32) -> bool {
+    let (eu, ev) = tangent_frame(axis);
+    let mut count = [0u32; 8];
+    let reach = ((radius + 1.0).powi(2) + 36.0).sqrt();
+    grid.for_each_within(pos, c, reach, |i, _| {
+        let p = &pts[i as usize];
+        if p.kind != PointKind::Measured {
+            return;
+        }
+        let d = p.p - c;
+        let h = d.dot(axis);
+        if !(-6.0..=-0.3).contains(&h) {
+            return;
+        }
+        let radial = d - axis * h;
+        let r = radial.length();
+        if r < 0.6 * radius || r > radius + 1.0 || p.n.dot(axis).abs() > 0.6 || p.n.dot(radial / r) > -0.3 {
+            return;
+        }
+        let s = (((radial.dot(ev).atan2(radial.dot(eu)) + std::f32::consts::PI) / (std::f32::consts::TAU / 8.0)) as usize).min(7);
+        count[s] += 1;
+    });
+    count.iter().filter(|&&k| k >= 2).count() >= 3
+}
+
+/// Whether the sheet around a detected hole is plain: in the annulus `radius + 3 .. radius + 6` mm
+/// around (cu, cv) (as far as the window reaches) at least 85 % of the 0.5 mm pixels are occupied,
+/// and at least half of them in each of 12 sectors.
+fn plain_surroundings(occ: &[bool], side: usize, half: i32, cu: f64, cv: f64, radius: f64, w: f64) -> bool {
+    const PX: f64 = 0.5;
+    let (r0, r1) = (radius + 3.0, radius + 6.0);
+    let (mut hit, mut tot) = ([0u32; 12], [0u32; 12]);
+    for b in 0..side as i32 {
+        for a in 0..side as i32 {
+            let (x, y) = ((a - half) as f64 * PX, (b - half) as f64 * PX);
+            if x * x + y * y > w * w {
+                continue;
+            }
+            let (u, v) = (x - cu, y - cv);
+            let r = (u * u + v * v).sqrt();
+            if r < r0 || r > r1 {
+                continue;
+            }
+            let s = (((v.atan2(u) + std::f64::consts::PI) / (std::f64::consts::TAU / 12.0)) as usize).min(11);
+            tot[s] += 1;
+            if occ[b as usize * side + a as usize] {
+                hit[s] += 1;
+            }
+        }
+    }
+    let (h, t): (u32, u32) = (hit.iter().sum(), tot.iter().sum());
+    t > 0 && h as f64 >= 0.85 * t as f64 && (0..12).all(|s| tot[s] == 0 || hit[s] as f64 >= 0.5 * tot[s] as f64)
 }
 
 fn sectors(s: &[(f64, f64, f64)], cu: f64, cv: f64, k: usize, min: u32) -> usize {

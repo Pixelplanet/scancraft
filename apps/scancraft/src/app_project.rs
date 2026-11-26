@@ -77,9 +77,15 @@ pub enum SolidInput {
 /// A listed marker lies on a pass's surface when one of its points is closer than this (mm).
 pub const MARKER_ON_SURFACE_MM: f32 = 3.0;
 
+/// A listed marker with a known radius below this (mm) is not a sticker: Revo Scan lists ~1 mm
+/// entries on bracket edges and screw bosses (stickers are ~3 mm, see
+/// `docs/protocol/revo-marker-framework.md`). Cutting those would erase real geometry.
+pub const MIN_STICKER_RADIUS_MM: f32 = 2.0;
+
 /// For each marker of `map` (pass frame), the normal Make Solid uses for it, or `None` when it
 /// does not lie on `surfels` (no point within [`MARKER_ON_SURFACE_MM`]; Revo lists markers on
-/// parts it cut from the preview) or its centre is not finite. The normal is the listed one
+/// parts it cut from the preview), its centre is not finite or it is too small for a sticker
+/// ([`MIN_STICKER_RADIUS_MM`]). The normal is the listed one
 /// (Revo's marker file has it), else the sum of the surface normals around it (the solid's marker
 /// stage selects the sticker's points by it, then refines it).
 pub fn markers_on_surface(map: &[PassMarker], surfels: impl Iterator<Item = (Vec3, Vec3)>) -> Vec<Option<Vec3>> {
@@ -114,7 +120,8 @@ pub fn markers_on_surface(map: &[PassMarker], surfels: impl Iterator<Item = (Vec
         .zip(near.into_iter().zip(normal_sum))
         .map(|(m, (near, sum))| {
             let n = m.normal.unwrap_or(sum);
-            (near && m.centre.is_finite() && n.is_finite() && n.length() > 1e-3).then_some(n)
+            let sticker = m.radius_mm.is_none_or(|r| !(r > 0.0 && r < MIN_STICKER_RADIUS_MM));
+            (near && sticker && m.centre.is_finite() && n.is_finite() && n.length() > 1e-3).then_some(n)
         })
         .collect()
 }
@@ -133,7 +140,6 @@ pub struct MarkerUse {
 /// The solid's input points, its listed markers and the scan priority (most trusted first;
 /// `None` when all passes weigh the same). Runs in the background job.
 pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint>, Vec<scancraft_mesh::solid::markers::Marker>, Option<Vec<u8>>), String> {
-    use scancraft_mesh::solid::markers::{Marker, MarkerSource};
     use scancraft_mesh::SolidPoint;
     let ok = |p: Vec3, n: Vec3| p.is_finite() && n.is_finite() && n.length() > 1e-3;
     match input {
@@ -152,28 +158,9 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
             let mut points = Vec::new();
             let mut markers = Vec::new();
             for (scan, t, source, mask, _, map) in &passes {
-                let surfels = source.surfels()?;
-                let surfels = if whole_scene {
-                    surfels
-                } else {
-                    let oriented: Vec<(Vec3, Vec3)> = surfels.iter().map(|s| (s.0, s.1)).collect();
-                    isolation::mask_for(mask, &oriented).keep(surfels)
-                };
+                let surfels = solid_surfels(source, mask, whole_scene)?;
+                markers.extend(placed_markers(*scan, t, map, &surfels));
                 let m = t.to_mat4();
-                let normals = markers_on_surface(map, surfels.iter().map(|s| (s.0, s.1)));
-                for (k, (marker, n)) in map.iter().zip(normals).enumerate() {
-                    if let Some(n) = n {
-                        markers.push(Marker {
-                            id: format!("S{scan}-M{k}"),
-                            center: m.transform_point3(marker.centre),
-                            normal: (t.rotation * n).normalize(),
-                            scan: Some(*scan),
-                            source: MarkerSource::List,
-                            radius_mm: marker.radius_mm.unwrap_or(0.0),
-                            score: 0.0,
-                        });
-                    }
-                }
                 points.extend(surfels.into_iter().map(|(p, n, _)| (m.transform_point3(p), (t.rotation * n).normalize_or_zero())).filter(|(p, n)| ok(*p, *n)).map(|(position, normal)| SolidPoint { position, normal, scan: *scan }));
             }
             let weights: Vec<f32> = passes.iter().map(|p| p.4).collect();
@@ -185,6 +172,50 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
             Ok((points, markers, priority))
         }
     }
+}
+
+/// A pass's surface as Make Solid and Reconstruct's marker removal take it: its object only unless
+/// `whole_scene`.
+fn solid_surfels(source: &PassSource, mask: &MaskCache, whole_scene: bool) -> Result<Vec<(Vec3, Vec3, u32)>, String> {
+    let surfels = source.surfels()?;
+    if whole_scene {
+        return Ok(surfels);
+    }
+    let oriented: Vec<(Vec3, Vec3)> = surfels.iter().map(|s| (s.0, s.1)).collect();
+    Ok(isolation::mask_for(mask, &oriented).keep(surfels))
+}
+
+/// A pass's listed markers that lie on `surfels` ([`markers_on_surface`]), in the project frame.
+fn placed_markers(scan: u8, t: &Transform, map: &[PassMarker], surfels: &[(Vec3, Vec3, u32)]) -> Vec<scancraft_mesh::solid::markers::Marker> {
+    use scancraft_mesh::solid::markers::{Marker, MarkerSource};
+    let m = t.to_mat4();
+    let normals = markers_on_surface(map, surfels.iter().map(|s| (s.0, s.1)));
+    map.iter()
+        .zip(normals)
+        .enumerate()
+        .filter_map(|(k, (marker, n))| {
+            Some(Marker {
+                id: format!("S{scan}-M{k}"),
+                center: m.transform_point3(marker.centre),
+                normal: (t.rotation * n?).normalize(),
+                scan: Some(scan),
+                source: MarkerSource::List,
+                radius_mm: marker.radius_mm.unwrap_or(0.0),
+                score: 0.0,
+            })
+        })
+        .collect()
+}
+
+/// The listed markers Reconstruct removes: those of [`solid_points`], without building the
+/// points. Runs in the background job.
+pub fn listed_markers(input: SolidInput) -> Result<Vec<scancraft_mesh::solid::markers::Marker>, String> {
+    let SolidInput::Passes { passes, whole_scene } = input else { return Ok(Vec::new()) };
+    let mut markers = Vec::new();
+    for (scan, t, source, mask, _, map) in passes.iter().filter(|p| !p.5.is_empty()) {
+        markers.extend(placed_markers(*scan, t, map, &solid_surfels(source, mask, whole_scene)?));
+    }
+    Ok(markers)
 }
 
 /// A pass read from a project (opened or added), shown by `layer`.

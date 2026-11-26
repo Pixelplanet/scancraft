@@ -11,6 +11,13 @@
 //!   --detail X       rimls: support radius in point spacings (default 3.0)
 //!   --zoom U,V[,S]   centre of the close-up in view 1 as fractions of its half-width (right,
 //!                    up), and the close-up's own half-width as such a fraction (default 0.15)
+//!   --no-prep        skip the app's preparation before meshing (laser-line strays, points off
+//!                    the surface, marker removal: `scancraft_mesh::prepare_points`)
+//!   --strays         also drop laser strays directly on the merged model (off, as in the app)
+//!   --markers FILE   listed markers in the project frame, JSON list of {"id", "c": [x,y,z],
+//!                    "n": [x,y,z], "r"}; else each pass's `pass-<id>/markers.json` (markers
+//!                    within 3 mm of the pass's points). Entries with a radius below 2 mm are not
+//!                    stickers and are skipped, as in the app.
 //! ```
 //!
 //! The merged model is rebuilt from each pass's cleaned (or imported) surface and its transform
@@ -27,7 +34,8 @@ use glam::{Mat3, Quat, Vec3};
 use rayon::prelude::*;
 use scancraft_align::{merge, MergeConfig, MergeInput};
 use scancraft_core::{Mesh, Point3D, PointCloud, Transform};
-use scancraft_mesh::{MarchingCubes, Mesher};
+use scancraft_mesh::solid::markers::{Marker, MarkerSource};
+use scancraft_mesh::{MarchingCubes, Mesher, PrepareConfig};
 
 struct Args {
     project: PathBuf,
@@ -53,8 +61,57 @@ fn args() -> Args {
     }
 }
 
-/// Each pass's surface in the project frame, with observation counts.
-fn load_passes(dir: &Path) -> Vec<(String, Vec<(Vec3, Vec3, u32)>, f32)> {
+/// A listed marker with a known radius below this is not a sticker (Revo lists ~1 mm entries on
+/// bracket edges and screw bosses), as in the app.
+const MIN_STICKER_RADIUS_MM: f32 = 2.0;
+
+fn is_sticker(radius_mm: f32) -> bool {
+    !(radius_mm > 0.0 && radius_mm < MIN_STICKER_RADIUS_MM)
+}
+
+/// Markers from a JSON list in the project frame.
+fn markers_from_file(path: &Path) -> Vec<Marker> {
+    let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let v3 = |v: &serde_json::Value| Vec3::new(v[0].as_f64().unwrap() as f32, v[1].as_f64().unwrap() as f32, v[2].as_f64().unwrap() as f32);
+    json.as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+        .map(|(k, m)| Marker {
+            id: m["id"].as_str().map_or(format!("M{k}"), str::to_string),
+            center: v3(&m["c"]),
+            normal: v3(&m["n"]).normalize(),
+            scan: None,
+            source: MarkerSource::List,
+            radius_mm: m["r"].as_f64().unwrap_or(0.0) as f32,
+            score: 0.0,
+        })
+        .filter(|m| is_sticker(m.radius_mm))
+        .collect()
+}
+
+/// A pass's `markers.json` (pass frame) in the project frame: the markers with a normal and a point
+/// of the pass within 3 mm.
+fn pass_markers(dir: &Path, id: u32, t: &Transform, points: &[(Vec3, Vec3, u32)], name: &str) -> Vec<Marker> {
+    let Ok(list) = scancraft_io::project::read_markers(&dir.join(scancraft_io::project::markers_path(id))) else { return Vec::new() };
+    let pos: Vec<Vec3> = points.iter().map(|p| p.0).collect();
+    let grid = Grid::new(&pos, 3.0);
+    let m = t.to_mat4();
+    list.iter()
+        .enumerate()
+        .filter_map(|(k, e)| {
+            let c = m.transform_point3(Vec3::from_array(e.centre));
+            let n = (t.rotation * Vec3::from_array(e.normal?)).normalize();
+            let r = e.radius_mm.unwrap_or(0.0);
+            (grid.nearest(&pos, c, 3.0).is_some() && is_sticker(r))
+                .then(|| Marker { id: format!("{name}-M{k}"), center: c, normal: n, scan: None, source: MarkerSource::List, radius_mm: r, score: 0.0 })
+        })
+        .collect()
+}
+
+/// Each pass's surface in the project frame, with observation counts, and its listed markers.
+fn load_passes(dir: &Path) -> (Vec<(String, Vec<(Vec3, Vec3, u32)>, f32)>, Vec<Marker>) {
+    let mut markers = Vec::new();
     let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("project.json")).unwrap()).unwrap();
     let mut out = Vec::new();
     for p in json["passes"].as_array().unwrap() {
@@ -76,10 +133,12 @@ fn load_passes(dir: &Path) -> Vec<(String, Vec<(Vec3, Vec3, u32)>, f32)> {
                 let c = counts.as_ref().map_or(2, |b| u32::from_le_bytes([b[4 * i], b[4 * i + 1], b[4 * i + 2], b[4 * i + 3]]));
                 (m.transform_point3(Vec3::from(q.position)), (t.rotation * Vec3::from(q.normal)).normalize_or_zero(), c)
             })
-            .collect();
-        out.push((p["name"].as_str().unwrap_or("?").to_string(), points, p["weight"].as_f64().unwrap_or(1.0) as f32));
+            .collect::<Vec<_>>();
+        let name = p["name"].as_str().unwrap_or("?").to_string();
+        markers.extend(pass_markers(dir, id as u32, &t, &points, &format!("P{id}")));
+        out.push((name, points, p["weight"].as_f64().unwrap_or(1.0) as f32));
     }
-    out
+    (out, markers)
 }
 
 /// Median nearest-neighbour distance over a sample (brute force on a hash grid).
@@ -291,14 +350,48 @@ fn main() {
     let a = args();
     std::fs::create_dir_all(&a.out).unwrap();
     let t0 = Instant::now();
-    let passes = load_passes(&a.project);
+    let (passes, pass_markers) = load_passes(&a.project);
     for (name, pts, w) in &passes {
         println!("pass {name}: {} points, weight {w}", pts.len());
     }
+    let markers = match std::env::args().skip_while(|x| x != "--markers").nth(1) {
+        Some(f) => markers_from_file(Path::new(&f)),
+        None => pass_markers,
+    };
     let inputs: Vec<MergeInput> = passes.iter().map(|(_, p, w)| MergeInput { points: p.clone(), weight: *w }).collect();
     let config = MergeConfig { pitch_mm: a.pitch, outliers: Some((12, 3.0)), ..MergeConfig::default() };
     let merged = merge(&inputs, &config);
-    let cloud = PointCloud::from_points(merged.points.clone());
+    let mut cloud = PointCloud::from_points(merged.points.clone());
+    // The app's preparation (Reconstruct's "Suppress scan artefacts" and "Remove markers").
+    let prep_cfg = PrepareConfig { laser_strays: std::env::args().any(|x| x == "--strays"), ..PrepareConfig::default() };
+    let mut sites = Vec::new();
+    if !std::env::args().any(|x| x == "--no-prep") {
+        let t = Instant::now();
+        let (prepared, rep) = scancraft_mesh::prepare_points(&cloud, &markers, &prep_cfg);
+        println!(
+            "prepare: {} -> {} points ({} laser strays, {} off the surface, {} stray layers; wall {:.2} mm), {} listed markers -> {} sites, {} filled ({} cut, {} fill points) in {:.1} s",
+            rep.input_points,
+            prepared.len(),
+            rep.dropped_laser_strays,
+            rep.dropped_off_surface,
+            rep.dropped_ghosts,
+            rep.wall_median_mm,
+            markers.len(),
+            rep.marker_sites.len(),
+            rep.markers_filled(),
+            rep.marker_cut_points,
+            rep.marker_fill_points,
+            t.elapsed().as_secs_f32()
+        );
+        for o in rep.marker_outcomes.iter().filter(|o| !o.fill.starts_with("quadric")) {
+            println!("  marker {} not filled: {}", o.id, o.fill);
+        }
+        cloud = prepared;
+        if std::env::args().any(|x| x == "--dump-prepared") {
+            write_ply(&Mesh::from_geometry(cloud.points.clone(), Vec::new()), &a.out.join("prepared.ply"));
+        }
+        sites = rep.marker_sites.iter().zip(&rep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(s, _)| s.clone()).collect();
+    }
     let positions: Vec<Vec3> = cloud.points.iter().map(|p| Vec3::from(p.position)).collect();
     let sp = spacing(&positions);
     println!("merged: {} points, spacing {:.3} mm ({:.1} s)", cloud.len(), sp, t0.elapsed().as_secs_f32());
@@ -337,6 +430,14 @@ fn main() {
         } else {
             let sigma = std::env::args().skip_while(|x| x != "--sigma").nth(1).map(|v| v.parse().unwrap()).unwrap_or(0.5144);
             scancraft_mesh::FeatureSmoother { iterations: a.smooth, sigma_normal: sigma, ..Default::default() }.smooth(&mut mesh);
+        }
+    }
+    if !sites.is_empty() {
+        let fair = scancraft_mesh::solid::fair_marker_sites(&mut mesh, &sites, &prep_cfg.markers);
+        let faired = fair.iter().filter(|f| f.status == "faired").count();
+        println!("marker fairing: {faired} of {} sites", sites.len());
+        for (s, f) in sites.iter().zip(&fair).filter(|(_, f)| f.status != "faired") {
+            println!("  {} not faired: {}", s.id, f.status);
         }
     }
     let t_smooth = t.elapsed().as_secs_f32();

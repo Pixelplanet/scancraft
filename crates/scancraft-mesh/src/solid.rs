@@ -27,11 +27,11 @@
 
 mod cleanup;
 mod extract;
-mod grid;
+pub(crate) mod grid;
 mod holes;
 pub mod markers;
 mod poisson;
-mod prep;
+pub(crate) mod prep;
 pub mod topo;
 #[cfg(test)]
 mod tests;
@@ -180,6 +180,22 @@ pub struct SolidConfig {
     /// Largest thickness searched when measuring the wall.
     pub wall_search_mm: f32,
     pub ghost_filter: bool,
+    /// Drop laser-line strays: points about a millimetre behind the surface their own scan sees in
+    /// front of them, with an empty gap between (`prep::drop_behind_strays`).
+    pub laser_strays: bool,
+    /// Move each scan back along its normals by its systematic offset from the other scans where
+    /// they overlap (a depth bias of a pass; see `prep::equalise_scan_offsets`).
+    pub equalise_offsets: bool,
+    /// Where another scan covers a sheet at most this times as rough, the rougher scan's points
+    /// there are dropped (the streaked grazing fringe of an inside scan on the outer face; see
+    /// `prep::drop_rough_layers`). 0 disables.
+    pub rough_layer_ratio: f32,
+    /// Feature-preserving smoothing of the extracted surface ([`crate::FeatureSmoother`]
+    /// iterations; 0 = off): removes the scanners' fine hatching and the solve's dimple grain from
+    /// plain areas, keeps edges, ribs and bores. Runs before the marker fairing.
+    pub smooth_surface: usize,
+    /// Crease-keeping scale of that smoothing (the app's "keep edges" 0.7).
+    pub smooth_surface_sigma: f32,
     pub completion: bool,
     pub completion_cfg: CompletionConfig,
     /// Fill enclosed holes of a sheet (then complete the opposite face behind them).
@@ -232,6 +248,11 @@ impl Default for SolidConfig {
             wall_mm: None,
             wall_search_mm: 6.0,
             ghost_filter: true,
+            laser_strays: true,
+            equalise_offsets: true,
+            rough_layer_ratio: 0.4,
+            smooth_surface: 4,
+            smooth_surface_sigma: 0.5144,
             completion: true,
             completion_cfg: CompletionConfig::default(),
             hole_fill: Some(HoleConfig::default()),
@@ -261,6 +282,10 @@ pub struct SolidReport {
     pub dropped_off_surface: usize,
     pub dropped_covered_layers: usize,
     pub dropped_ghosts: usize,
+    pub dropped_laser_strays: usize,
+    /// Shift applied per scan along its normals (mm) by the offset equalisation.
+    pub scan_shifts: Vec<(u8, f32)>,
+    pub dropped_rough_layers: usize,
     pub wall_median_mm: f32,
     pub wall_measurements: usize,
     pub markers_listed: usize,
@@ -331,6 +356,9 @@ impl SolidReport {
         kv(&mut s, "dropped_off_surface", self.dropped_off_surface.to_string());
         kv(&mut s, "dropped_covered_layers", self.dropped_covered_layers.to_string());
         kv(&mut s, "dropped_ghosts", self.dropped_ghosts.to_string());
+        kv(&mut s, "dropped_laser_strays", self.dropped_laser_strays.to_string());
+        kv(&mut s, "scan_shifts_mm", format!("{{{}}}", self.scan_shifts.iter().map(|(k, v)| format!("\"{k}\": {v:.3}")).collect::<Vec<_>>().join(", ")));
+        kv(&mut s, "dropped_rough_layers", self.dropped_rough_layers.to_string());
         kv(&mut s, "wall_median_mm", format!("{:.3}", self.wall_median_mm));
         kv(&mut s, "wall_measurements", self.wall_measurements.to_string());
         kv(&mut s, "markers_listed", self.markers_listed.to_string());
@@ -483,7 +511,7 @@ pub fn remove_markers(points: &[SolidPoint], markers: &[Marker], cfg: &MarkerCon
     MarkerRemoval { samples: pts.iter().map(WorkPoint::sample).collect(), sites, detected, outcomes }
 }
 
-fn marker_stage(
+pub(crate) fn marker_stage(
     pts: &mut Vec<WorkPoint>,
     markers: &[Marker],
     cfg: &MarkerConfig,
@@ -504,7 +532,8 @@ fn marker_stage(
             .collect::<Vec<_>>();
         sites.extend(detected.iter().cloned());
     }
-    let sites = markers::merge_sites(&sites, cfg);
+    let mut sites = markers::merge_sites(&sites, cfg);
+    markers::widen_over_sparse_rings(pts, &mut sites, cfg);
     let outcomes = markers::cut_and_fill(pts, &sites, cfg);
     (sites, detected, outcomes)
 }
@@ -697,7 +726,16 @@ pub fn build_solid(input: &[SolidPoint], markers: &[Marker], cfg: &SolidConfig) 
     if cfg.off_surface_mm > 0.0 {
         rep.dropped_off_surface = prep::drop_off_surface(&mut pts, 1.0, cfg.off_surface_mm, 4.0);
     }
+    if cfg.laser_strays {
+        rep.dropped_laser_strays = prep::drop_behind_strays(&mut pts, 2.0, 0.4, 1.6);
+    }
+    if cfg.equalise_offsets {
+        rep.scan_shifts = prep::equalise_scan_offsets(&mut pts, 0.03, 0.4, 500);
+    }
     rep.dropped_covered_layers = prep::drop_covered_layers(&mut pts, &cfg.scan_priority, cfg.layer_radius_mm, cfg.layer_tolerance_mm);
+    if cfg.rough_layer_ratio > 0.0 {
+        rep.dropped_rough_layers = prep::drop_rough_layers(&mut pts, 1.5, cfg.rough_layer_ratio, 0.06);
+    }
     let map = {
         let pos: Vec<Vec3> = pts.iter().map(|p| p.p).collect();
         let grid = grid::PointGrid::new(&pos, 1.0);
@@ -817,6 +855,10 @@ pub fn build_solid(input: &[SolidPoint], markers: &[Marker], cfg: &SolidConfig) 
             pts.iter().filter(|p| p.kind == PointKind::Measured && cfg.sharp_scans.contains(&p.scan)).copied().collect();
         let vn = vertex_normals(&pos, &tris);
         rep.refined_vertices = refine_to_data(&mut pos, &vn, &origin, &data, cfg.refine_radius_mm, 0.15);
+    }
+    if cfg.smooth_surface > 0 {
+        let sm = crate::FeatureSmoother { iterations: cfg.smooth_surface, sigma_normal: cfg.smooth_surface_sigma, ..Default::default() };
+        sm.smooth_positions(&mut pos, &tris);
     }
     let mut outcomes = std::mem::take(&mut rep.marker_outcomes);
     if cfg.markers.fair_mesh && !sites.is_empty() {

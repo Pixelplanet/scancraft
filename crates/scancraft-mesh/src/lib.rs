@@ -5,6 +5,7 @@ pub mod implicit;
 pub mod marching_cubes;
 pub mod metrics;
 pub mod normals;
+pub mod prepare;
 pub mod smooth;
 pub mod solid;
 pub mod tables;
@@ -19,6 +20,7 @@ pub use implicit::{SurfaceConfig, SurfaceStats};
 pub use marching_cubes::{MarchingCubes, ReconstructionStats};
 pub use metrics::{MeshAnalysis, MeshMetrics};
 pub use normals::NormalEstimator;
+pub use prepare::{prepare_points, PrepareConfig, PrepareReport};
 pub use smooth::LaplacianSmoother;
 pub use solid::{build_solid, fill_holes, remove_markers, Solid, SolidConfig, SolidPoint, SolidReport, VertexOrigin};
 
