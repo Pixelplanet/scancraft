@@ -869,11 +869,11 @@ fn marker_map_layer(app: &ScanCraftApp, t: &Tokens) -> Option<(u64, Arc<Vec<scan
         (_, Some(Node::Pass(id))) | (_, Some(Node::Frame(id, _))) => id,
         _ => return None,
     };
-    let map: &[([f32; 3], bool)] = match (&app.overlay, app.active_pass) {
-        (Some(o), Some(active)) if active == pass_id && !o.map.is_empty() => &o.map,
-        _ => app.marker_maps.get(&pass_id)?,
-    };
     let pass = app.passes.iter().find(|p| p.id == pass_id)?;
+    let map: Vec<([f32; 3], bool)> = match (&app.overlay, app.active_pass) {
+        (Some(o), Some(active)) if active == pass_id && !o.map.is_empty() => o.map.clone(),
+        _ => pass.markers.iter().map(|m| (m.centre.to_array(), m.matched)).collect(),
+    };
     if map.is_empty() || !pass.layer.visible {
         return None;
     }

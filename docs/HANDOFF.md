@@ -41,9 +41,11 @@ solid-model commit:
   `app_project.rs`: object only unless "whole scene", scan id per pass), the merge weights as scan
   priority (equal weights: averaged), optionally the most trusted pass as a sharp scan, and the
   tracker's marker map of each pass as listed markers (normal from the pass's surface). Two-pass
-  shell project: watertight, wall 3.2 mm, 279 holes filled, 6 markers removed. **Next:** keep the
-  tracker marker maps in the project (they are session-only), and read Revo's
-  `marker_framework.mkf` for imported Revo scans.
+  shell project: watertight, wall 3.2 mm, 279 holes filled, 6 markers removed. **Done 2026-11-26:** marker
+  maps are part of each pass (`ScanPass::markers`, saved as `pass-<id>/markers.json`, kept
+  through tabs, undo, Add Project / Add Passes and deletion), and Import Scan reads Revo's
+  `marker_framework.mkf` next to the file (layout: `protocol/revo-marker-framework.md`); a
+  listed normal replaces the surfel average in Make Solid.
 - **Done 2026-11-25:** the orientation tools of merge-and-ai.md §8 — Auto Orient (an
   Accept/Reject proposal), Orient by Datums (plane / axis / point grown from a click onto world
   planes and axes), Scale from Lengths for imported passes, and Horn's start plus a

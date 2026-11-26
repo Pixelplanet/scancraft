@@ -139,7 +139,7 @@ pass, useful for step-wise turntable scans; the frames are tracked like any othe
 
 ## 8. Persistence
 
-Project folder: `project.json` (passes, modes, alignments, settings, output metadata) + per pass `pass-<n>/keyframes.bin` (packed points), `rgb/*.jpg`, `raw.bin` (optional recording) + `outputs/`. Opening a project restores everything editable.
+Project folder: `project.json` (passes, modes, alignments, settings, output metadata) + per pass `pass-<n>/keyframes.bin` (packed points), `rgb/*.jpg`, `raw.bin` (optional recording), `markers.json` (optional marker map: the tracker's, or Revo's `marker_framework.mkf` read with an imported scan) + `outputs/`. Opening a project restores everything editable.
 
 ## 9. Implementation plan (parallel work)
 

@@ -20,7 +20,7 @@ use super::{AlignPreview, PairPicking, PosesPreview, Proposal, ScanCraftApp, Toa
 use crate::alignment::{self, AlignAllOutcome, PassInput, RefineOutcome};
 use crate::isolation::{self, MaskCache};
 use crate::model::*;
-use crate::project::{self, AlignMethod, AlignState, LoadedPass, PassSource, ProjectInfo, StoredPass, StoredProject};
+use crate::project::{self, AlignMethod, AlignState, LoadedPass, PassMarker, PassSource, ProjectInfo, StoredPass, StoredProject};
 
 /// What a background job needs of one pass: (id, project <- pass, placed, reference, surface,
 /// isolation cache).
@@ -67,8 +67,8 @@ fn job_inputs(passes: &[JobPass], whole_scene: bool) -> Result<Vec<PassInput>, S
 /// with only a merged model), the working cloud as one scan.
 pub enum SolidInput {
     Passes {
-        /// (scan id from 1, project <- pass, surface, isolation, merge weight, tracker markers in the pass frame)
-        passes: Vec<(u8, Transform, PassSource, MaskCache, f32, Vec<Vec3>)>,
+        /// (scan id from 1, project <- pass, surface, isolation, merge weight, marker map in the pass frame)
+        passes: Vec<(u8, Transform, PassSource, MaskCache, f32, Vec<PassMarker>)>,
         whole_scene: bool,
     },
     Cloud(PointCloud),
@@ -104,18 +104,26 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
                     isolation::mask_for(mask, &oriented).keep(surfels)
                 };
                 let m = t.to_mat4();
-                // A tracker marker's normal: the pass's own surface around it (the solid's
-                // marker stage selects the sticker's points by it, then refines it).
-                for (k, c) in map.iter().enumerate() {
-                    let n: Vec3 = surfels.iter().filter(|s| s.0.distance_squared(*c) < 9.0).map(|s| s.1).sum();
-                    if n.length() > 1e-3 {
+                // Only markers on the pass's own (object) surface: within 3 mm of its points. A
+                // marker's normal is the listed one (Revo's marker file has it), else the pass's
+                // surface around it (the solid's marker stage selects the sticker's points by it,
+                // then refines it).
+                for (k, marker) in map.iter().enumerate() {
+                    let c = marker.centre;
+                    let near = || surfels.iter().filter(move |s| s.0.distance_squared(c) < 9.0);
+                    let n = match marker.normal {
+                        Some(n) if near().next().is_some() => n,
+                        Some(_) => Vec3::ZERO,
+                        None => near().map(|s| s.1).sum(),
+                    };
+                    if c.is_finite() && n.length() > 1e-3 {
                         markers.push(Marker {
                             id: format!("S{scan}-M{k}"),
-                            center: m.transform_point3(*c),
+                            center: m.transform_point3(c),
                             normal: (t.rotation * n).normalize(),
                             scan: Some(*scan),
                             source: MarkerSource::List,
-                            radius_mm: 0.0,
+                            radius_mm: marker.radius_mm.unwrap_or(0.0),
                             score: 0.0,
                         });
                     }
@@ -148,6 +156,7 @@ fn loaded_pass(lp: LoadedPass, layer: CloudLayer) -> ScanPass {
         surface: lp.stored.surface,
         edit: lp.stored.edit,
         rgb_keyframes: lp.stored.rgb_keyframes,
+        markers: lp.stored.markers,
     }
 }
 
@@ -364,8 +373,7 @@ impl ScanCraftApp {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let map = self.marker_maps.get(&p.id).map(|m| m.iter().map(|(c, _)| Vec3::from_array(*c)).collect()).unwrap_or_default();
-                ((i + 1).min(255) as u8, p.meta.transform, p.source(), p.mask.clone(), p.meta.weight, map)
+                ((i + 1).min(255) as u8, p.meta.transform, p.source(), p.mask.clone(), p.meta.weight, p.markers.clone())
             })
             .collect();
         SolidInput::Passes { passes, whole_scene: self.settings.whole_scene }
@@ -815,7 +823,7 @@ impl ScanCraftApp {
         let passes: Vec<_> = self
             .passes
             .iter()
-            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask)))
+            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask), p.markers.clone()))
             .collect();
         let reference = self.reference_pass();
         let next_pass_id = self.next_pass_id;
@@ -830,9 +838,9 @@ impl ScanCraftApp {
         });
         self.spawn_job("Saving the project", move || {
             let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask) in passes {
+            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask, markers) in passes {
                 let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask });
+                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
             }
             let n = stored.len();
             let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
@@ -1043,7 +1051,9 @@ impl ScanCraftApp {
             surface: Some(scan.surface),
             edit: None,
             rgb_keyframes: Vec::new(),
+            markers: scan.markers,
         };
+        let markers = pass.markers.len();
         let name = pass.name.clone();
         self.append_passes(vec![pass]);
         self.selection = Some(Node::Pass(id));
@@ -1053,9 +1063,16 @@ impl ScanCraftApp {
             scancraft_io::NormalSource::Estimated => "normals estimated",
             scancraft_io::NormalSource::None => "no normals",
         };
-        self.say(Tone::Success, format!("Imported {name} · {} points, {normals}. Next: clean it, then Align All", thousands(points)));
+        let (tone, marker_note) = match &scan.marker_file {
+            None => (Tone::Success, String::new()),
+            Some((file, None)) => (Tone::Success, format!(", {markers} marker{} from {file}", if markers == 1 { "" } else { "s" })),
+            Some((file, Some(e))) => (Tone::Warning, format!("; its {file} could not be read, so it has no markers ({e})")),
+        };
+        self.say(tone, format!("Imported {name} · {} points, {normals}{marker_note}. Next: clean it, then Align All", thousands(points)));
         if scan.likely_metres {
             self.show_choice_toast(format!("{name} is under {} units across, so probably in metres.", crate::imports::METRES_MAX_EXTENT), ToastAction::MetresToMm(id));
+        } else if let Some((file, Some(_))) = &scan.marker_file {
+            self.show_toast(format!("{name} was imported without markers: its {file} could not be read"));
         }
     }
 
@@ -1091,8 +1108,9 @@ impl ScanCraftApp {
             p.meta.alignment = AlignState::Unaligned;
             p.meta.transform = Transform::default();
         }
-        // Its cleaning is scaled with it.
+        // Its cleaning and its markers are scaled with it.
         p.edit = p.edit.as_ref().map(|e| Arc::new(crate::imports::scaled(e, factor)));
+        p.markers = p.markers.iter().map(|m| m.scaled(factor)).collect();
         let shown = p.edit.as_ref().unwrap_or(&surface).points.clone();
         let visible = p.layer.visible;
         p.layer = CloudLayer::new(PointCloud::from_points(project::place(shown, &p.meta.transform)), g);

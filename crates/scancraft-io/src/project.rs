@@ -4,6 +4,7 @@
 //! <project>/project.json            passes, modes, alignments, settings, output metadata
 //! <project>/pass-<id>/keyframes.bin  the pass's keyframes (poses + packed points)
 //! <project>/pass-<id>/raw.bin        optional raw recording (referenced, not written here)
+//! <project>/pass-<id>/markers.json   optional marker map (pass frame, mm)
 //! <project>/outputs/*.ply            derived results (re-computable)
 //! ```
 //!
@@ -148,6 +149,51 @@ pub fn pass_dir(id: u32) -> String {
 /// The keyframe file of a pass, relative to the project folder.
 pub fn keyframes_path(id: u32) -> String {
     format!("{}/keyframes.bin", pass_dir(id))
+}
+
+/// A pass's marker map file, relative to the project folder. Optional: a pass without markers has
+/// none, and versions that do not know it ignore it.
+pub fn markers_path(id: u32) -> String {
+    format!("{}/markers.json", pass_dir(id))
+}
+
+const MARKERS_VERSION: u32 = 1;
+
+/// One marker sticker of a pass's marker map, in the pass frame (mm).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MarkerRecord {
+    pub centre: [f32; 3],
+    /// Unit normal out of the surface, when the source gives one (Revo's marker file does, the
+    /// tracker's map does not).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal: Option<[f32; 3]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub radius_mm: Option<f32>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct MarkersFile {
+    format: u32,
+    markers: Vec<MarkerRecord>,
+}
+
+pub fn write_markers(path: &Path, markers: &[MarkerRecord]) -> Result<(), IoError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&MarkersFile { format: MARKERS_VERSION, markers: markers.to_vec() }).map_err(|e| IoError::Parse(e.to_string()))?;
+    fs::write(path, json)?;
+    Ok(())
+}
+
+/// Reads a marker map; entries with a non-finite centre are dropped.
+pub fn read_markers(path: &Path) -> Result<Vec<MarkerRecord>, IoError> {
+    let text = fs::read_to_string(path)?;
+    let file: MarkersFile = serde_json::from_str(&text).map_err(|e| IoError::Parse(format!("{}: {e}", path.display())))?;
+    if file.format > MARKERS_VERSION {
+        return Err(IoError::Unsupported(format!("{}: marker map format {}", path.display(), file.format)));
+    }
+    Ok(file.markers.into_iter().filter(|m| m.centre.iter().all(|v| v.is_finite())).collect())
 }
 
 pub fn write_keyframes(path: &Path, keyframes: &[KeyframeRecord]) -> Result<(), IoError> {
@@ -329,6 +375,26 @@ mod tests {
         save_project(&dir, &loaded, &loaded_kfs).unwrap();
         assert_eq!(load_project(&dir).unwrap().0, project);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn marker_maps_round_trip() {
+        let path = std::env::temp_dir().join(format!("scancraft-markers-{}", std::process::id())).join(markers_path(7));
+        let markers = vec![
+            MarkerRecord { centre: [1.0, -2.5, 300.25], normal: None, radius_mm: None },
+            MarkerRecord { centre: [4.0, 5.0, 6.0], normal: Some([0.0, 0.6, -0.8]), radius_mm: Some(3.05) },
+        ];
+        write_markers(&path, &markers).unwrap();
+        assert_eq!(read_markers(&path).unwrap(), markers);
+        // A tracker marker stores its centre only.
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("radius_mm").count(), 1, "{text}");
+        // A newer format and a damaged file are errors, not a panic or an empty map.
+        fs::write(&path, r#"{"format": 9, "markers": []}"#).unwrap();
+        assert!(matches!(read_markers(&path), Err(IoError::Unsupported(_))));
+        fs::write(&path, "{").unwrap();
+        assert!(read_markers(&path).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 
     #[test]

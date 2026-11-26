@@ -754,7 +754,7 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             };
             let weights_differ = placed.iter().any(|p| (p.1 - placed[0].1).abs() > 1e-6);
             let top = placed.iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0.clone());
-            let markers: usize = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).filter_map(|p| app.marker_maps.get(&p.id)).map(|m| m.len()).sum();
+            let markers: usize = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).map(|p| p.markers.len()).sum();
             let s = &mut app.settings;
             kit::row(ui, "Input", |ui| kit::value_field(ui, &input, true));
             if !placed.is_empty() {

@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 
 use crate::alignment::{AlignAllOutcome, RefineOutcome};
 use crate::isolation::MaskCache;
-use crate::project::{AlignMethod, PassMeta, PassSource};
+use crate::project::{AlignMethod, PassMarker, PassMeta, PassSource};
 
 pub type SharedDevice = Arc<tokio::sync::Mutex<Box<dyn ScannerDevice>>>;
 
@@ -305,6 +305,8 @@ pub struct ScanPass {
     pub edit: Option<Arc<PointCloud>>,
     /// Calibrated RGB keyframes captured during this pass (for colour projection and AI segmentation).
     pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
+    /// Its marker map (pass frame): the tracker's while capturing, or read with an imported scan.
+    pub markers: Vec<PassMarker>,
 }
 
 impl ScanPass {
@@ -638,6 +640,7 @@ pub struct PassSnapshot {
     pub surface: Option<Arc<PointCloud>>,
     pub edit: Option<Arc<PointCloud>>,
     pub rgb_keyframes: Vec<scancraft_color::RgbKeyframe>,
+    pub markers: Vec<PassMarker>,
 }
 
 /// Undo history: the states before each action (oldest first) and, after an undo, the states
@@ -860,6 +863,7 @@ mod tests {
             surface: None,
             edit: None,
             rgb_keyframes: Vec::new(),
+            markers: Vec::new(),
         };
         let mut h = History::default();
         for i in 0..5 {

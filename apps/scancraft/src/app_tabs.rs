@@ -9,8 +9,6 @@
 //! with any, asks Save / Discard / Cancel first. New Project opens a new tab; Open Project opens
 //! into a new tab unless the current one is empty.
 
-use std::collections::HashMap;
-
 use scancraft_render::{Camera, CameraPreset};
 
 use super::{AlignPreview, DatumPicking, Highlight, OrientPreview, PairPicking, PosesPreview, ScalePicking, ScanCraftApp, Tone};
@@ -43,7 +41,6 @@ pub struct ProjectTab {
     tool: Option<Tool>,
     camera: Camera,
     framed_radius: f32,
-    marker_maps: HashMap<u32, Vec<([f32; 3], bool)>>,
     project_path: String,
     /// Unsaved changes when it was parked (the active tab's are computed live).
     pub dirty: bool,
@@ -79,7 +76,6 @@ impl ProjectTab {
             tool: None,
             camera,
             framed_radius: 0.0,
-            marker_maps: HashMap::new(),
             project_path: String::new(),
             dirty: false,
         }
@@ -129,7 +125,6 @@ impl ScanCraftApp {
         swap(&mut self.tool, &mut tab.tool);
         swap(&mut self.camera, &mut tab.camera);
         swap(&mut self.framed_radius, &mut tab.framed_radius);
-        swap(&mut self.marker_maps, &mut tab.marker_maps);
         swap(&mut self.settings.project_path, &mut tab.project_path);
     }
 
@@ -304,6 +299,7 @@ impl ScanCraftApp {
                 edit: p.edit.clone(),
                 rgb_keyframes: p.rgb_keyframes.clone(),
                 mask: crate::isolation::cached(&p.mask),
+                markers: p.markers.clone(),
             });
         }
         let label = name.clone();

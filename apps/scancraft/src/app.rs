@@ -405,8 +405,6 @@ pub struct ScanCraftApp {
     pub overlay: Option<scancraft_pipeline::ImageOverlay>,
     /// Frame rates reported by the scan worker while capturing.
     pub rates: Option<FrameRates>,
-    /// The last marker map seen per pass (pass frame, mm), shown when the pass is selected.
-    pub marker_maps: HashMap<u32, Vec<([f32; 3], bool)>>,
     /// Width of the camera view's image, points (the user resizes it; kept for the session).
     pub inset_width: f32,
     /// Where the camera view was drawn last frame (the browser makes room for it).
@@ -530,7 +528,6 @@ impl ScanCraftApp {
             relocated_at: None,
             overlay: None,
             rates: None,
-            marker_maps: HashMap::new(),
             inset_width: crate::ui_viewport::INSET_DEFAULT_W,
             inset_rect: None,
         };
@@ -1054,6 +1051,7 @@ impl ScanCraftApp {
                                 surface: None,
                                 edit: None,
                                 rgb_keyframes: Vec::new(),
+                                markers: Vec::new(),
                             });
                             (id, tracker, "Capturing")
                         }
@@ -1081,10 +1079,8 @@ impl ScanCraftApp {
                     self.overlay = None;
                     self.rates = None;
                     // Nothing is matched once the capture is over.
-                    for map in self.marker_maps.values_mut() {
-                        for m in map.iter_mut() {
-                            m.1 = false;
-                        }
+                    for m in self.passes.iter_mut().flat_map(|p| p.markers.iter_mut()) {
+                        m.matched = false;
                     }
                     self.fps.clear();
                     self.tracking = None;
@@ -1178,9 +1174,9 @@ impl ScanCraftApp {
                 self.rates = u.rates;
             }
             if let Some(o) = u.overlay {
-                if let Some(id) = self.active_pass {
+                if let Some(pass) = self.active_pass.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)) {
                     if !o.map.is_empty() {
-                        self.marker_maps.insert(id, o.map.clone());
+                        pass.markers = o.map.iter().map(|(c, matched)| project::PassMarker::tracked(*c, *matched)).collect();
                     }
                 }
                 self.overlay = Some(o);
@@ -1345,6 +1341,7 @@ impl ScanCraftApp {
                     surface: p.surface.clone(),
                     edit: p.edit.clone(),
                     rgb_keyframes: p.rgb_keyframes.clone(),
+                    markers: p.markers.clone(),
                 })
                 .collect(),
             label: label.to_string(),
@@ -1402,7 +1399,7 @@ impl ScanCraftApp {
                 if differs {
                     resync.push((p.id, p.tracker.clone(), flags));
                 }
-                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit, rgb_keyframes: p.rgb_keyframes }
+                ScanPass { id: p.id, name: p.name, layer, frames: p.frames, tracker: p.tracker, keyframes: p.keyframes, meta: p.meta, tinted: None, mask: p.mask, surface: p.surface, edit: p.edit, rgb_keyframes: p.rgb_keyframes, markers: p.markers }
             })
             .collect();
         // The project changed (for unsaved-changes tracking), though no layer is new.
@@ -2810,6 +2807,7 @@ impl ScanCraftApp {
 mod tests {
     use super::*;
     use crate::alignment::{EdgeChange, RefineOutcome};
+    use crate::project::PassMarker;
     use glam::Vec3;
     use scancraft_align::{Alignment, Quality};
     use scancraft_core::{Mesh, Point3D};
@@ -2838,6 +2836,7 @@ mod tests {
             surface: None,
             edit: None,
             rgb_keyframes: Vec::new(),
+            markers: Vec::new(),
         });
     }
 
@@ -3116,6 +3115,7 @@ mod tests {
             surface: Some(surface),
             edit: None,
             rgb_keyframes: Vec::new(),
+            markers: Vec::new(),
         });
     }
 
@@ -3430,7 +3430,7 @@ mod tests {
         add_fixed_pass(&mut app, 2, table_and_block(), moved);
         app.passes[1].meta.weight = 3.0;
         // A marker the tracker saw on top of the block of pass 2 (pass frame).
-        app.marker_maps.insert(2, vec![([0.0, 0.0, 40.0], true)]);
+        app.passes[1].markers = vec![project::PassMarker::tracked([0.0, 0.0, 40.0], true)];
         app.settings.whole_scene = true;
         let (points, markers, priority) = project_ops::solid_points(app.solid_input()).unwrap();
         let total = table_and_block().len();
@@ -3452,6 +3452,81 @@ mod tests {
         // Unplaced passes are left out, as in Merge.
         app.passes[1].meta.alignment = AlignState::Unaligned;
         assert_eq!(project_ops::solid_points(app.solid_input()).unwrap().0.len(), total);
+    }
+
+    #[test]
+    fn make_solid_uses_a_listed_marker_normal_and_only_markers_on_the_surface() {
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let tilted = glam::Vec3::new(0.3, 0.0, 1.0).normalize();
+        app.passes[0].markers = vec![
+            // On the block's top, with Revo's normal (kept, not replaced by the surface's).
+            PassMarker { centre: glam::Vec3::new(5.0, 0.0, 40.0), normal: Some(tilted), radius_mm: Some(3.05), matched: false },
+            // On the table, no normal: from the surface around it.
+            PassMarker::tracked([60.0, 60.0, 0.0], false),
+            // Where the scan has no points (Revo lists markers on parts it cut from the preview).
+            PassMarker { centre: glam::Vec3::new(5.0, 0.0, 90.0), normal: Some(glam::Vec3::Z), radius_mm: Some(3.0), matched: false },
+        ];
+        app.settings.whole_scene = true;
+        let (_, markers, _) = project_ops::solid_points(app.solid_input()).unwrap();
+        assert_eq!(markers.len(), 2, "the marker off the surface is left out");
+        assert!(markers[0].normal.dot(tilted) > 0.9999 && (markers[0].radius_mm - 3.05).abs() < 1e-6);
+        assert!(markers[1].normal.dot(glam::Vec3::Z) > 0.99 && markers[1].radius_mm == 0.0);
+    }
+
+    #[test]
+    fn a_revo_scan_keeps_its_markers_through_saving_tabs_undo_and_adding() {
+        let dir = temp_dir("revo-markers");
+        let folder = dir.join("Shell inside");
+        std::fs::create_dir_all(&folder).unwrap();
+        let scan = folder.join("raw_preview.ply");
+        scancraft_io::save_ply_binary(&PointCloud::from_points(table_and_block()), &scan).unwrap();
+        let mkf = folder.join(scancraft_io::revo::MARKER_FRAMEWORK_FILE);
+        std::fs::write(&mkf, crate::imports::mkf_bytes(&[([5.0, 0.0, 40.0], [0.0, 0.0, 1.0], 3.05), ([60.0, 60.0, 0.0], [0.0, 0.0, 1.0], 3.0)])).unwrap();
+        let mut app = app();
+        app.import_scan(scan.clone());
+        finish_job(&mut app);
+        assert_eq!(app.passes.len(), 1, "{}", app.status);
+        assert_eq!(app.passes[0].markers.len(), 2);
+        assert!(app.status.contains("2 markers from marker_framework.mkf"), "{}", app.status);
+        assert_eq!(app.tone, Tone::Success);
+        // Saved and opened again.
+        let project = dir.join("project");
+        app.save_project(project.clone());
+        finish_job(&mut app);
+        let mut reopened = self::app();
+        reopened.open_project(project);
+        finish_job(&mut reopened);
+        assert_eq!(reopened.passes[0].markers.len(), 2, "{}", reopened.status);
+        assert_eq!(reopened.passes[0].markers[0].radius_mm, Some(3.05));
+        // Another tab has its own passes; switching back finds the markers.
+        app.project.name = "Revo".into();
+        app.new_tab();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.next_pass_id = 2;
+        app.switch_tab(0);
+        assert_eq!(app.passes[0].markers.len(), 2);
+        app.switch_tab(1);
+        assert!(app.passes[0].markers.is_empty());
+        // Added to the other tab, the pass gets a new id and keeps its markers.
+        app.add_tab_passes(0);
+        finish_job(&mut app);
+        assert_eq!(app.passes.iter().map(|p| (p.id, p.markers.len())).collect::<Vec<_>>(), vec![(1, 0), (2, 2)]);
+        // Deleted, the markers go with the pass; Undo brings both back.
+        app.delete_pass(2);
+        assert!(app.passes.iter().all(|p| p.markers.is_empty()));
+        app.undo();
+        assert_eq!(app.passes.iter().find(|p| p.id == 2).map(|p| p.markers.len()), Some(2));
+        // A broken marker file does not stop the import, and says so.
+        std::fs::write(&mkf, b"not a marker file").unwrap();
+        app.import_scan(scan);
+        finish_job(&mut app);
+        assert_eq!(app.passes.len(), 3, "{}", app.status);
+        assert!(app.passes[2].markers.is_empty());
+        assert_eq!(app.tone, Tone::Warning, "{}", app.status);
+        assert!(app.status.contains("could not be read"), "{}", app.status);
+        assert!(app.current_toast().is_some_and(|t| t.contains("without markers")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3658,6 +3733,7 @@ mod tests {
             edit: None,
             rgb_keyframes: kfs,
             mask: None,
+            markers: Vec::new(),
         };
         let stored = crate::project::StoredProject {
             name: "desk-scene".into(),
@@ -3727,6 +3803,7 @@ mod tests {
             edit: None,
             rgb_keyframes: kfs,
             mask: None,
+            markers: Vec::new(),
         };
         crate::project::save(
             &dir,
