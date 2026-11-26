@@ -125,6 +125,21 @@ bracket's screw hole; Revo lists two features with radius about 1 mm (a screw bo
 edge) as markers (left uncut); a line of small beads along the outside crease next to the upper
 hinge and a ring of beads around one inside sticker, both absent or weaker last week.
 
+Correction and fixes (2026-11-26, branch `agent/mesh-fixes`, details in
+[open-issues.md](../open-issues.md) §2.3): the user confirmed the part's top is perfectly smooth.
+There is no moulded lettering or pad on it: every feature on its smooth surfaces is a marker
+sticker site or an artefact of Revo's cross-line laser mode. The "lettering" is a lattice of laser
+strays about 0.8 mm behind the inner surface in scan S3, and the "moulded pad" of the two-pass
+scan is very probably a sticker site.
+
+- Make Solid now drops those strays per scan, equalises S3's 0.15 mm offset, and drops S3's rough
+  grazing fringe where S1 covers the outer face.
+- Marker patches are faired onto the surrounding surface (fit plus the interpolated residual of
+  the ring); the visible disc outlines are gone. The ring of beads round the inside sticker is a
+  hole Isolate Object left in S2.
+- The bracket's screw hole is no longer taken for a marker (bore-wall test) and stays open.
+- Reconstruct removes the listed stickers and the laser pits too.
+
 Research on community exports, the runtime download and integrated-GPU speed: section 5.
 
 ## 5. Model and runtime research (2026-11-24, desk research, not yet tested on hardware)

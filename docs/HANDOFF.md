@@ -10,6 +10,22 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-26 (original PC, branch `agent/mesh-fixes`).**
+
+- **No lettering.** The user confirmed that the Revo shell part's top is smooth. There is no
+  moulded lettering or pad: every feature on its smooth surfaces is a marker sticker site or a
+  cross-line laser artefact.
+- **Fixed:**
+  - Reconstruct now prepares the points: it drops strays and cuts and refills the listed
+    stickers.
+  - Make Solid drops laser strays per scan and equalises a scan's offset.
+  - Marker sites are faired flush in both tools.
+  - The bracket's screw hole stays open.
+- **Still open:** some sites at rim edges, faint lattice dots in the solid, the new mesher
+  filling screw-boss recesses, a sticker cut out of S2 by Isolate Object.
+
+Numbers and the open list are in [open-issues.md](open-issues.md) §2.3.
+
 **Update 2026-11-24 late (original PC): start with [open-issues.md](open-issues.md).** The branch
 below is merged into `main`. A review found bugs in it, and the new mesher was compared with the
 old one on the Revo shell scans. It is smoother on plain areas but destroys small raised detail.

@@ -180,8 +180,11 @@ detail 4 that drops to 1 212.
 
 **Fixed 2026-11-25 (second PC), as far as it can be checked there.** The three Revo scans and
 `E:\Claude\eval` are on the original PC; the second PC has the two-pass shell project (the one
-with pen marks) and a synthetic relief. **Still to do on the original PC:** run `mesh_project`
-on the three-scan project and look at the moulded lettering.
+with pen marks) and a synthetic relief. **Checked on the original PC 2026-11-26: there is no
+lettering.** The user, who owns the part, says its outer top is a perfectly smooth rounded shape
+with nothing on it; every feature on the smooth surfaces is a marker sticker site or an artefact
+of Revo's cross-line laser mode. What was called "moulded lettering" is a lattice of laser-line
+strays in one inside scan (S3). See 2.3.
 
 Causes, each measured (synthetic relief = four ribs 0.3–1 mm high, 1–1.5 mm wide, and a ring on
 a noisy plane, 0.5 mm pitch; test `implicit_surface_keeps_small_relief_without_pits`):
@@ -233,15 +236,17 @@ Two-pass shell project, app defaults (0.7 mm, 4 smoothing passes), `mesh_project
 At 1.0 mm cells and 2 smoothing passes: 179 loops (119 pinholes) against the old mesher's 85
 (45). The support radius on this project is now 1.94 mm instead of 1.52 mm (same `detail` 3, the
 spacing is measured differently); `--detail 2.35` gives the old radius, with about 150 loops and 1.8°.
-The moulded pad in this scan (8 mm across, 0.25–0.3 mm high, flat) comes out as a flat pad; the
+The "moulded pad" in this scan (8 mm across, 0.25–0.3 mm high, flat) is very probably a marker
+sticker site (stickers are flat discs ~10–11 mm across, ~0.4 mm proud), not part geometry; the
 ring-with-bars the old mesher shows there is its grain, not the part.
 
 The list below is the state before these fixes.
 
 - **Better:** large plain areas. The old mesher's woven grain and scaly patches are gone,
   and the fit to the points is closer.
-- **Worse: small raised detail.** The moulded lettering inside the shell is readable with
-  the old mesher and becomes a field of pits and spikes with the new one. This is the main
+- **Worse: small raised detail.** What looked like moulded lettering inside the shell (in fact
+  cross-line laser strays, see 2.3) is "readable" with the old mesher and becomes a field of pits
+  and spikes with the new one. This is the main
   problem before RIMLS can replace the old mesher. Check 1.3 first. Also check the normal
   refit and the robust weights on small relief.
 - **Worse: open edges** are stair-stepped, aligned to the voxel grid; the old ones are
@@ -262,6 +267,112 @@ The list below is the state before these fixes.
   be used to hide the pinholes.
 - The roughness number does not see holes or small pits. Always look at boundary loops and
   at the renders as well.
+
+### 2.3 Laser artefacts and marker sites on the Revo shell scans (2026-11-26, original PC)
+
+Ground truth from the user: the part's top is smooth. Everything on it in our meshes is either a
+marker sticker site or an artefact of the cross-line laser mode the three scans were made in.
+Real geometry: rim, edges, the hinge brackets with their screw holes, screw bosses, ribs.
+
+**What the artefacts are (measured, harness in `E:\Claude\eval\mesh-fixes\scripts\harness.py`):**
+
+1. **Laser-line lattice in S3 (inside scan), the former "lettering".** Two families of curved
+   lines, 9–12 mm apart, about 2 mm wide, near the upper hinge. They are stray points
+   0.6–1.0 mm *behind* the inner surface, inside the wall, with an empty gap in between; 83 % face
+   the wrong way. They are already in Revo's `raw_preview.ply`. S2 covers the same area cleanly.
+   The new mesher turned them into pits up to 1 mm deep (relief std 0.31 mm).
+2. **S3's grazing fringe on the outer face near the lower rim:** streaks of ±0.5 mm along the laser
+   lines, 4 × as rough as S1 there.
+3. **Fine straight hatching** 0.02–0.05 mm over S1 and S2 (also in Revo's fused cloud).
+4. **S3 sits 0.17 mm above S2** (inner face) and 0.10 mm above S1 (outer face): steps where the
+   coverage changes from one scan to the other.
+
+Marker stickers are flat plateaus 0.37–0.46 mm high, flat to r ≈ 4–4.5 mm, back on the surface at
+r ≈ 5.5–6 mm. The mkf radius of 3 mm is only the white dot. Some S2 stickers have an empty ring at
+r 6–9 mm round them.
+
+**What was changed** (branch `agent/mesh-fixes`):
+
+- **Reconstruct** prepares the merged points first (`scancraft_mesh::prepare_points`, settings
+  "Suppress scan artefacts" and "Remove marker stickers", both on by default). It drops points off
+  their sheet and ghost layers (the Make Solid clean-up), then cuts every listed sticker and
+  refills it from the ring. After meshing, the sites are faired.
+- **Marker sites (both tools):**
+  - The cut is at least 6.5 mm. It grows over an empty ring round the sticker (up to 5 mm more,
+    measured by occupancy). Sites that are only partly covered (near the rim) are patched only
+    where the scan has surface.
+  - Where a quadric leaves a rough annulus, the ring fit is a cubic.
+  - Mesh fairing now puts the patch on the fit plus the residual of the mesh in a 2 mm band
+    beyond the cut, interpolated inwards. Before, it blended a 2 mm band onto the fit, which left
+    a visible ring.
+  - Revo entries with a radius below 2 mm are not stickers and are ignored.
+- **Make Solid:**
+  - drops laser strays in each scan's own points (`prep::drop_behind_strays`: a denser sheet of
+    the same scan 0.4–1.6 mm in front of them with an empty gap);
+  - removes S3's offset (`equalise_scan_offsets`: only the scan that is offset the same way
+    against every scan it overlaps is moved, and a moved scan is a reference from then on);
+  - drops the rougher scan where another scan covers the same sheet much more smoothly
+    (`drop_rough_layers`);
+  - smooths with the feature-preserving smoother (4 steps) before the marker fairing.
+- **Screw holes (Make Solid):**
+  - A detected round "hole" whose rim goes on down as a bore wall is no marker. Before, the
+    bracket's screw hole was detected as one and patched shut.
+  - A detected hole needs plain sheet all round it.
+  - The hole filler leaves round openings open when their axis is clear of points on both sides.
+
+**Results** (harness; Reconstruct = app defaults, 0.7 mm, 4 smoothing passes; before = main
+11c54c4, after = `agent/mesh-fixes`; outputs in `E:\Claude\eval\mesh-fixes\v6`):
+
+| | Reconstruct before | after | Make Solid before | after |
+| --- | --- | --- | --- | --- |
+| Inner lattice window, relief std / p99 (mm) | 0.307 / 1.004 | **0.004 / 0.010** (app path 0.013 / 0.038) | 0.015 / 0.059 | **0.005 / 0.020** |
+| Outer S3 band | 0.005 / 0.013 | 0.005 / 0.013 | 0.015 / 0.055 | 0.011 / 0.039 |
+| Outer plain top | 0.004 / 0.010 | 0.004 / 0.010 | 0.006 / 0.016 | 0.004 / 0.011 |
+| Marker disc vs ring fit, median outer / inner (mm) | +0.40 / +0.36 | **+0.010 / +0.002** | +0.004 / +0.005 | +0.014 / +0.007 |
+| Bracket screw hole, free radius (raw S3 2.62 mm) | 0.54 (app path: 2.20 after) | 0.54 | 0.17 (closed) | **1.44 (open)** |
+| Boss recess depth A / B / C / D (raw 1.9–2.6 mm) | 0.86 / −0.15 / −0.27 / −0.20 | 1.24 / −0.13 / −0.26 / −0.23 | 2.14 / 1.82 / 1.77 / 1.73 | 2.20 / 1.94 / 1.54 / 1.69 |
+
+For scale: one good scan's own relief is 0.018–0.038 mm. Make Solid on the three scans now takes
+33 s (was 30 s), with a peak working set of 1.0 GB. The result is watertight and has genus 11
+(was 24).
+
+Comparison images (grazing light): `E:\Claude\eval\mesh-fixes\compare_top.png` (outside top with
+five markers, the inside lattice, two marker close-ups) and `compare_bracket_hole.png`. In them:
+
+- The raised sticker rings are gone in Reconstruct, and the 1 mm pits of the lattice are gone.
+- The disc outlines are gone in Make Solid; the screw hole is open again.
+
+**Still open:**
+
+- **Marker sites still off the ring fit.** The harness still finds seven outer sites more than
+  0.03 mm off a quadric fitted to their own 7–11 mm ring: S1-M1, M4, M6, M20, M21, M36 and M43,
+  up to +0.20 mm. The grazing-light renders show S1-M21, M20 and M3 flush, so on curving areas the
+  harness's quadric is the wrong reference. Three sites are really not right:
+  - S1-M6 is a sticker on the flange step near the lower rim. The patch shows its outline and two
+    slits.
+  - S1-M4 and S1-M36 are stickers at a rim edge. Their annulus RMS is 0.12–0.16 mm, so they are
+    not faired.
+- **Faint dots of the S3 lattice in the solid** are still visible under grazing light (relief
+  p99 0.020 mm).
+- **Make Solid narrows the screw hole** with a small tongue (free radius 1.44 of 3.1 mm): the
+  hole filler patches the shadowed gap beside the bore.
+- **The new mesher fills the boss pilot recesses** (unchanged, a mesher property; the old mesher
+  and Make Solid keep them).
+- **Reconstruct's laser-stray filter is off.** The same direct filter on the *merged* points
+  removed only part of the strays, and the wall test and the mesher's layer test then missed the
+  rest (lattice window 0.004 → 0.064 mm). `PrepareConfig::laser_strays` stays off; Make Solid
+  runs the filter per scan.
+- **Isolate Object cut a sticker out of S2.** It dropped all S2 points within 12 mm of S2-M13, so
+  Reconstruct has a 20 mm opening there and the solid a ring of beads round its hole fill. This
+  is a data gap from the isolation mask, not from the marker cut.
+- **Not asked of the user yet:** is the 0.1 mm "rounded-rectangle" line on the outer dome real?
+  It is in Revo's own fused cloud and was left alone.
+
+**Trade-off** (test `prepare_keeps_small_relief`): the preparation keeps relief on a plain sheet,
+such as the mesher test's synthetic ribs, with "Suppress scan artefacts" on or off. It does drop
+narrow relief that stands 0.6–2.5 mm in front of or behind a thin wall when its thickness
+disagrees with the wall map. Turn the setting off for parts with fine engraving.
+`implicit_surface_keeps_small_relief_without_pits` is unchanged.
 
 ## 3. Found by the user in the app
 

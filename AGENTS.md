@@ -404,3 +404,24 @@ laser model are not built.
   or the `.mkf` beside a raw scan): 0.19–0.27° / 0.36–0.81 mm measured, limits 0.5° / 1.2 mm.
   Tests: `scancraft-io` 29, `scancraft-align` 53 + 4 real-data (ignored, all pass), `scancraft-mesh`
   51, `scancraft` 85.
+- 2026-11-26 (original PC, branch `agent/mesh-fixes`) — **User ground truth:** the Revo shell
+  part's top is perfectly smooth. Every feature on it in our meshes is either a marker sticker site
+  or a cross-line laser artefact. The "moulded lettering" of open-issues 2.2 (and the line about it
+  in the 2026-11-25 entry above) is a lattice of laser strays about 0.8 mm behind S3's inner
+  surface; the two-pass scan's "moulded pad" is very probably a sticker.
+  - **Reconstruct** prepares the merged points: `scancraft_mesh::prepare_points`, with the
+    settings "Suppress scan artefacts" and "Remove marker stickers".
+  - **Make Solid** gets `prep::drop_behind_strays` per scan, `equalise_scan_offsets` (no chained
+    shifts) and `drop_rough_layers`, plus feature smoothing.
+  - **Marker sites** (both tools):
+    - the cut grows over Revo's empty ring;
+    - partly covered sites are patched only where the scan has surface;
+    - the ring fit falls back to a cubic where a quadric leaves a rough annulus;
+    - fairing puts the patch on the fit plus the interpolated ring residual (no blend ring);
+    - Revo entries with r < 2 mm are ignored.
+  - **Screw holes:** a detected "hole" that opens into a bore wall is no marker, and the hole
+    filler keeps through-holes.
+  - **Results:** lattice relief 0.31 → 0.004 mm (Reconstruct) and 0.015 → 0.005 mm (solid); sticker
+    discs +0.40 → +0.01 mm; the bracket screw hole is open in the solid (free radius 0.17 → 1.44 mm).
+    Images are `E:\Claude\eval\mesh-fixes\compare_top.png` and `compare_bracket_hole.png`.
+  - **Open:** see open-issues 2.3.
