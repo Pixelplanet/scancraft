@@ -14,6 +14,11 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio::time::{interval, Duration};
 
+/// How far the simulated scanner orbits the desk scene per frame (0.7°: a full turn in ~45 s at
+/// the simulator's ~11 fps). At 1.8° per frame the camera moved ~9 mm between frames and the
+/// tracker kept reporting "Slow down", keeping only a few keyframes.
+const ORBIT_STEP_RAD: f32 = 0.012;
+
 /// Mock scanner driver generating synthetic multi-object scenes for development and CI testing.
 pub struct MockDriver;
 
@@ -598,7 +603,7 @@ impl ScannerDevice for MockDevice {
             while streaming.load(Ordering::Relaxed) {
                 ticker.tick().await;
                 frame_idx += 1;
-                let yaw = (frame_idx.saturating_sub(1) as f32) * 0.032;
+                let yaw = (frame_idx.saturating_sub(1) as f32) * ORBIT_STEP_RAD;
                 let ts = frame_idx * 66;
                 let frame = Self::render_synthetic_frame(320, 256, yaw, ts);
 
@@ -642,7 +647,7 @@ impl ScannerDevice for MockDevice {
             while streaming.load(Ordering::Relaxed) {
                 ticker.tick().await;
                 frame_idx += 1;
-                let yaw = (frame_idx.saturating_sub(1) as f32) * 0.032;
+                let yaw = (frame_idx.saturating_sub(1) as f32) * ORBIT_STEP_RAD;
                 let ts = frame_idx * 66;
                 let rig = CameraRig::new(640, 512, yaw);
                 let (depth, ir) = Self::render_depth_ir(&rig);
