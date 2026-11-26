@@ -10,8 +10,12 @@
 //! ```
 //!
 //! The running app listens on a loopback TCP port (127.0.0.1 only) chosen by the system. A
-//! request is one JSON line `{"token": …, "open": "<path>" | null}` and gets one line back
-//! (`ok`, or `refused: <why>`). The token is random per launch and only in `instance.json`, which
+//! request is one JSON line `{"token": …, "open": "<path>" | null}`, sent within 3 s, and gets
+//! one line back: `ok`, `refused: <why>`, or `closing` (the app is ending: the second start
+//! waits for its lock and then runs as the new one). A refused start never runs a second app; the
+//! running one shows why the project could not be opened. Each request is answered on its own
+//! thread (a few at once), so a slow client cannot hold up the others. The token is random per
+//! launch and only in `instance.json`, which
 //! lies in the user's own local app data (on Windows only the user, SYSTEM and administrators may
 //! read it; on Unix the file is made 0600): a request without it is refused. The path must be
 //! absolute and name an existing project file (`.scancraft`), bundle (`.scancraftz`) or project
@@ -20,9 +24,10 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use scancraft_io::lock::LockFile;
 use serde::{Deserialize, Serialize};
@@ -32,6 +37,10 @@ const INFO_FILE: &str = "instance.json";
 /// A request line longer than this is refused.
 const MAX_REQUEST: u64 = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long a second start waits for the running app to answer or to end.
+const HANDOVER_WAIT: Duration = Duration::from_secs(15);
+/// Requests answered at the same time; more are dropped (their start tries again).
+const MAX_CLIENTS: usize = 8;
 
 /// What a second start asks of the running app.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +49,9 @@ pub enum Handover {
     Open(PathBuf),
     /// Only come to the front.
     Focus,
+    /// A start with the right token asked to open something that is not a project: come to the
+    /// front and say why (`path` as given).
+    Refused { path: String, why: String },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -62,6 +74,9 @@ pub enum Start {
     Primary(Primary),
     /// A running ScanCraft took the request: this start ends.
     HandedOver,
+    /// The running ScanCraft refused the request (it shows why): this start ends too, never a
+    /// second app.
+    Refused(String),
     /// Neither (no running app could be reached, or the files could not be written): run on
     /// alone, without listening.
     Alone(String),
@@ -75,14 +90,15 @@ pub struct Primary {
     /// Requests from later starts.
     pub requests: mpsc::Receiver<Handover>,
     wake: Arc<Mutex<Option<eframe::egui::Context>>>,
+    closing: Arc<AtomicBool>,
 }
 
 impl Primary {
     /// The receiver and the slot for the window's context (set once it exists, so a request
     /// wakes the otherwise idle window); the guard stays with `main`.
     pub fn split(self) -> (Guard, mpsc::Receiver<Handover>, Arc<Mutex<Option<eframe::egui::Context>>>) {
-        let Primary { _lock, info_path, token, requests, wake } = self;
-        (Guard { _lock, info_path, token }, requests, wake)
+        let Primary { _lock, info_path, token, requests, wake, closing } = self;
+        (Guard { _lock, info_path, token, closing }, requests, wake)
     }
 }
 
@@ -91,6 +107,15 @@ pub struct Guard {
     _lock: LockFile,
     info_path: PathBuf,
     token: String,
+    closing: Arc<AtomicBool>,
+}
+
+impl Guard {
+    /// The app is ending (it reads no more requests): later starts are told so, and wait for the
+    /// lock instead of handing over.
+    pub fn closing_flag(&self) -> Arc<AtomicBool> {
+        self.closing.clone()
+    }
 }
 
 impl Drop for Guard {
@@ -112,24 +137,34 @@ pub fn start(dir: &Path, open: Option<&Path>) -> Start {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Start::Alone(format!("cannot create {}: {e}", dir.display()));
     }
-    match LockFile::acquire(&dir.join(LOCK_FILE)) {
-        Ok(lock) => match listen(dir, lock) {
-            Ok(primary) => Start::Primary(primary),
-            Err(e) => Start::Alone(e),
-        },
-        Err(scancraft_io::IoError::Locked { .. }) => {
-            // Another ScanCraft runs; it may still be writing where it listens.
-            let mut last = String::new();
-            for _ in 0..20 {
-                match hand_over(dir, open) {
-                    Ok(()) => return Start::HandedOver,
-                    Err(e) => last = e,
+    start_waiting(dir, open, HANDOVER_WAIT)
+}
+
+/// [`start`], waiting up to `wait` for a running app that cannot be reached or is ending.
+fn start_waiting(dir: &Path, open: Option<&Path>, wait: Duration) -> Start {
+    let deadline = Instant::now() + wait;
+    loop {
+        match LockFile::acquire(&dir.join(LOCK_FILE)) {
+            Ok(lock) => {
+                return match listen(dir, lock) {
+                    Ok(primary) => Start::Primary(primary),
+                    Err(e) => Start::Alone(e),
                 }
-                std::thread::sleep(Duration::from_millis(150));
             }
-            Start::Alone(format!("the running ScanCraft did not answer ({last})"))
+            Err(scancraft_io::IoError::Locked { .. }) => {}
+            Err(e) => return Start::Alone(e.to_string()),
         }
-        Err(e) => Start::Alone(e.to_string()),
+        // Another ScanCraft runs; it may still be writing where it listens, or be ending (its
+        // lock is free then, and this start becomes the running one).
+        let last = match hand_over(dir, open) {
+            Ok(()) => return Start::HandedOver,
+            Err(Refusal::Refused(why)) => return Start::Refused(why),
+            Err(Refusal::Retry(e)) => e,
+        };
+        if Instant::now() >= deadline {
+            return Start::Alone(format!("the running ScanCraft did not answer ({last})"));
+        }
+        std::thread::sleep(Duration::from_millis(150));
     }
 }
 
@@ -142,51 +177,105 @@ fn listen(dir: &Path, lock: LockFile) -> Result<Primary, String> {
     write_private(&info_path, &serde_json::to_vec_pretty(&info).map_err(|e| e.to_string())?).map_err(|e| format!("cannot write {}: {e}", info_path.display()))?;
     let (tx, requests) = mpsc::channel();
     let wake: Arc<Mutex<Option<eframe::egui::Context>>> = Arc::default();
-    let (serve_token, serve_wake) = (token.clone(), wake.clone());
-    std::thread::Builder::new()
-        .name("single-instance".into())
-        .spawn(move || serve(listener, &serve_token, &tx, &serve_wake))
-        .map_err(|e| e.to_string())?;
-    Ok(Primary { _lock: lock, info_path, token, requests, wake })
+    let closing = Arc::new(AtomicBool::new(false));
+    let server = Server { token: token.clone(), tx, wake: wake.clone(), closing: closing.clone(), clients: Arc::default() };
+    std::thread::Builder::new().name("single-instance".into()).spawn(move || serve(listener, server)).map_err(|e| e.to_string())?;
+    Ok(Primary { _lock: lock, info_path, token, requests, wake, closing })
 }
 
-/// Answers requests until the app ends.
-fn serve(listener: TcpListener, token: &str, tx: &mpsc::Sender<Handover>, wake: &Mutex<Option<eframe::egui::Context>>) {
+/// What the listening thread shares with the threads that answer requests.
+#[derive(Clone)]
+struct Server {
+    token: String,
+    tx: mpsc::Sender<Handover>,
+    wake: Arc<Mutex<Option<eframe::egui::Context>>>,
+    closing: Arc<AtomicBool>,
+    /// Requests being answered now.
+    clients: Arc<AtomicUsize>,
+}
+
+/// Accepts requests until the app ends, each answered on its own thread.
+fn serve(listener: TcpListener, server: Server) {
     for stream in listener.incoming() {
-        let Ok(mut stream) = stream else { continue };
-        let answer = match read_request(&stream).and_then(|r| check(&r, token)) {
-            Ok(h) => {
-                let _ = tx.send(h);
-                if let Some(ctx) = wake.lock().ok().and_then(|w| w.clone()) {
+        let Ok(stream) = stream else { continue };
+        if server.clients.fetch_add(1, Ordering::SeqCst) >= MAX_CLIENTS {
+            server.clients.fetch_sub(1, Ordering::SeqCst);
+            continue;
+        }
+        let s = server.clone();
+        let spawned = std::thread::Builder::new().name("single-instance-request".into()).spawn(move || {
+            answer(stream, &s);
+            s.clients.fetch_sub(1, Ordering::SeqCst);
+        });
+        if spawned.is_err() {
+            server.clients.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Reads one request and answers it.
+fn answer(mut stream: TcpStream, server: &Server) {
+    let answer = match read_request(&stream) {
+        Err(why) => format!("refused: {why}"),
+        Ok(r) if !same_token(&r.token, &server.token) => "refused: wrong token".to_string(),
+        // The app reads no more requests.
+        Ok(_) if server.closing.load(Ordering::SeqCst) => "closing".to_string(),
+        Ok(r) => {
+            let (handover, answer) = match check_path(&r) {
+                Ok(h) => (h, "ok".to_string()),
+                Err(why) => (Handover::Refused { path: r.open.clone().unwrap_or_default(), why: why.clone() }, format!("refused: {why}")),
+            };
+            if server.tx.send(handover).is_ok() {
+                if let Some(ctx) = server.wake.lock().ok().and_then(|w| w.clone()) {
                     ctx.request_repaint();
                 }
-                "ok".to_string()
+                answer
+            } else {
+                "closing".to_string()
             }
-            Err(why) => {
-                log::warn!("refused a request from another start: {why}");
-                format!("refused: {why}")
-            }
-        };
-        let _ = writeln!(stream, "{answer}");
+        }
+    };
+    if answer != "ok" {
+        log::warn!("a request from another start: {answer}");
     }
+    let _ = writeln!(stream, "{answer}");
 }
 
+/// Reads one request line, which must arrive whole within [`IO_TIMEOUT`] (a client sending a
+/// byte now and then is cut off too).
 fn read_request(stream: &TcpStream) -> Result<Request, String> {
-    let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
+    let deadline = Instant::now() + IO_TIMEOUT;
     let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-    let mut line = String::new();
-    BufReader::new(stream.take(MAX_REQUEST)).read_line(&mut line).map_err(|e| e.to_string())?;
-    if !line.ends_with('\n') {
-        return Err("incomplete or too long request".into());
+    let mut line = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err("the request took too long".into());
+        }
+        stream.set_read_timeout(Some(left)).map_err(|e| e.to_string())?;
+        let n = (&mut &*stream).read(&mut buf).map_err(|e| match e.kind() {
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => "the request took too long".to_string(),
+            _ => e.to_string(),
+        })?;
+        if n == 0 {
+            return Err("incomplete request".into());
+        }
+        line.extend_from_slice(&buf[..n]);
+        if let Some(end) = line.iter().position(|&b| b == b'\n') {
+            line.truncate(end);
+            break;
+        }
+        if line.len() as u64 > MAX_REQUEST {
+            return Err("too long request".into());
+        }
     }
+    let line = String::from_utf8(line).map_err(|_| "not a request".to_string())?;
     serde_json::from_str(line.trim()).map_err(|_| "not a request".to_string())
 }
 
-/// The token check, then the path check.
-fn check(request: &Request, token: &str) -> Result<Handover, String> {
-    if !same_token(&request.token, token) {
-        return Err("wrong token".into());
-    }
+/// The path check (after the token check).
+fn check_path(request: &Request) -> Result<Handover, String> {
     match &request.open {
         None => Ok(Handover::Focus),
         Some(p) => validate_path(p).map(Handover::Open),
@@ -220,23 +309,37 @@ pub fn validate_path(path: &str) -> Result<PathBuf, String> {
     }
 }
 
+/// Why a handover did not happen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// The running app answered `refused: <why>`: asking again changes nothing.
+    Refused(String),
+    /// It could not be reached, or it is ending: try again (or take its lock once free).
+    Retry(String),
+}
+
 /// Sends `open` (or a focus request) to the running app.
-fn hand_over(dir: &Path, open: Option<&Path>) -> Result<(), String> {
-    let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+fn hand_over(dir: &Path, open: Option<&Path>) -> Result<(), Refusal> {
+    let retry = |e: String| Refusal::Retry(e);
+    let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).map_err(|e| retry(e.to_string()))?).map_err(|e| retry(e.to_string()))?;
     let request = Request { token: info.token, open: open.map(|p| p.display().to_string()) };
-    send(info.port, &serde_json::to_string(&request).map_err(|e| e.to_string())?)
+    send(info.port, &serde_json::to_string(&request).map_err(|e| retry(e.to_string()))?)
 }
 
 /// Sends one request line to `port` and reads the answer.
-fn send(port: u16, line: &str) -> Result<(), String> {
-    let mut stream = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), IO_TIMEOUT).map_err(|e| e.to_string())?;
+fn send(port: u16, line: &str) -> Result<(), Refusal> {
+    let retry = |e: std::io::Error| Refusal::Retry(e.to_string());
+    let mut stream = TcpStream::connect_timeout(&SocketAddr::from((Ipv4Addr::LOCALHOST, port)), IO_TIMEOUT).map_err(retry)?;
     let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
-    writeln!(stream, "{line}").map_err(|e| e.to_string())?;
+    writeln!(stream, "{line}").map_err(retry)?;
     let mut answer = String::new();
-    BufReader::new(stream).read_line(&mut answer).map_err(|e| e.to_string())?;
+    BufReader::new(stream).read_line(&mut answer).map_err(retry)?;
     match answer.trim() {
         "ok" => Ok(()),
-        other => Err(other.to_string()),
+        a => match a.strip_prefix("refused: ") {
+            Some(why) => Err(Refusal::Refused(why.to_string())),
+            None => Err(Refusal::Retry(if a.is_empty() { "no answer".into() } else { a.to_string() })),
+        },
     }
 }
 
@@ -303,20 +406,79 @@ mod tests {
         assert_eq!(recv(&primary.requests), Handover::Open(project.join("Part.scancraft")));
         assert!(matches!(start(&dir, None), Start::HandedOver));
         assert_eq!(recv(&primary.requests), Handover::Focus);
-        // A project that does not exist is refused by the running app: the start runs alone.
+        // A project that does not exist is refused by the running app, which says why; the
+        // start ends at once and never runs a second app.
+        let gone = dir.join("gone.scancraft");
+        let t0 = Instant::now();
+        assert!(matches!(start(&dir, Some(&gone)), Start::Refused(why) if why.contains("no such file")));
+        assert!(t0.elapsed() < Duration::from_secs(2), "no retrying a definite refusal");
+        assert!(matches!(recv(&primary.requests), Handover::Refused { path, .. } if path == gone.display().to_string()));
+        // Without the token nothing is accepted, and nothing reaches the app.
         let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
-        let missing = Request { token: info.token.clone(), open: Some(dir.join("gone.scancraft").display().to_string()) };
-        assert!(send(info.port, &serde_json::to_string(&missing).unwrap()).unwrap_err().contains("no such file"));
-        // Without the token nothing is accepted.
         let forged = Request { token: "0".repeat(64), open: Some(project.display().to_string()) };
-        assert!(send(info.port, &serde_json::to_string(&forged).unwrap()).unwrap_err().contains("wrong token"));
-        assert!(send(info.port, "not json").unwrap_err().contains("not a request"));
+        assert!(matches!(send(info.port, &serde_json::to_string(&forged).unwrap()), Err(Refusal::Refused(w)) if w.contains("wrong token")));
+        assert!(matches!(send(info.port, "not json"), Err(Refusal::Refused(w)) if w.contains("not a request")));
         assert!(primary.requests.try_recv().is_err(), "refused requests never reach the app");
         // Ending the app removes its files; the next start is the running one again.
         let (guard, _rx, _wake) = primary.split();
         drop(guard);
         assert!(!dir.join(INFO_FILE).exists() && !dir.join(LOCK_FILE).exists());
         assert!(matches!(start(&dir, None), Start::Primary(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_ending_app_is_waited_for_instead_of_handed_to() {
+        let dir = temp("closing");
+        let Start::Primary(primary) = start(&dir, None) else { panic!("the first start runs") };
+        let (guard, rx, _wake) = primary.split();
+        let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
+        let focus = serde_json::to_string(&Request { token: info.token.clone(), open: None }).unwrap();
+        // The app no longer reads its requests: never "ok".
+        guard.closing_flag().store(true, Ordering::SeqCst);
+        assert_eq!(send(info.port, &focus), Err(Refusal::Retry("closing".into())));
+        assert!(rx.try_recv().is_err());
+        // Its receiver gone (dropped before the guard): "closing" too.
+        guard.closing_flag().store(false, Ordering::SeqCst);
+        drop(rx);
+        assert_eq!(send(info.port, &focus), Err(Refusal::Retry("closing".into())));
+        // A start while it ends becomes the running app once the lock is free.
+        let ending = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(500));
+            drop(guard);
+        });
+        assert!(matches!(start_waiting(&dir, None, Duration::from_secs(10)), Start::Primary(_)));
+        ending.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_slow_client_neither_blocks_others_nor_stays_connected() {
+        let dir = temp("slow");
+        let Start::Primary(primary) = start(&dir, None) else { panic!("the first start runs") };
+        let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
+        // A client that sends a byte every 200 ms and never a whole line.
+        let slow = TcpStream::connect((Ipv4Addr::LOCALHOST, info.port)).unwrap();
+        let mut writer = slow.try_clone().unwrap();
+        std::thread::spawn(move || {
+            for _ in 0..50 {
+                if writer.write_all(b" ").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        });
+        // Another start is answered meanwhile.
+        let t0 = Instant::now();
+        assert!(matches!(start(&dir, None), Start::HandedOver));
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert_eq!(recv(&primary.requests), Handover::Focus);
+        // The slow one is cut off after the request time, not after 64 KiB of bytes.
+        let _ = slow.set_read_timeout(Some(Duration::from_secs(10)));
+        let mut answer = String::new();
+        let _ = BufReader::new(&slow).read_line(&mut answer);
+        assert!(answer.contains("too long"), "{answer:?}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

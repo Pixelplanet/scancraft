@@ -3,8 +3,10 @@
 # -RemoveRecordings is given. Settings and caches in %LOCALAPPDATA%\ScanCraft (laser calibration,
 # AI models, settings.json, the working folders of opened bundles under "work") are kept unless
 # -RemoveData is given; even then working folders are only removed after asking, since one may
-# hold unsaved changes of a bundle (ScanCraft offers to recover them at its next start).
-param([switch]$RemoveRecordings, [switch]$RemoveData, [switch]$Quiet)
+# hold unsaved changes of a bundle (ScanCraft offers to recover them at its next start). With
+# -Quiet nobody is asked: they are kept unless -RemoveWorkFolders is given as well. They are always
+# kept while a ScanCraft (from any folder) is running.
+param([switch]$RemoveRecordings, [switch]$RemoveData, [switch]$RemoveWorkFolders, [switch]$Quiet)
 $ErrorActionPreference = 'Stop'
 $target = $PSScriptRoot
 Add-Type -AssemblyName System.Windows.Forms
@@ -51,7 +53,11 @@ if ($RemoveData) {
     $data = Join-Path $env:LOCALAPPDATA 'ScanCraft'
     $work = Join-Path $data 'work'
     $openBundles = (Test-Path $work) -and @(Get-ChildItem $work -Directory -ErrorAction SilentlyContinue).Count -gt 0
-    if ($openBundles -and -not (Ask "$work holds the working folders of opened bundles, which may have unsaved changes.`n`nRemove them too?")) {
+    # Never answered for the user: a quiet uninstall keeps them unless told otherwise. Never
+    # while a ScanCraft started from elsewhere (a dev build, the release zip) may be using them.
+    $otherRunning = [bool](Get-Process -Name scancraft -ErrorAction SilentlyContinue)
+    $removeWork = -not $otherRunning -and ($RemoveWorkFolders -or ($openBundles -and -not $Quiet -and [System.Windows.Forms.MessageBox]::Show("$work holds the working folders of opened bundles, which may have unsaved changes.`n`nRemove them too?", 'Uninstall ScanCraft', 'YesNo', 'Question') -eq 'Yes'))
+    if (($openBundles -or $otherRunning) -and -not $removeWork) {
         Get-ChildItem $data -Force -ErrorAction SilentlyContinue | Where-Object { $_.Name -ne 'work' } | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
     } else {
         Remove-Item $data -Recurse -Force -ErrorAction SilentlyContinue

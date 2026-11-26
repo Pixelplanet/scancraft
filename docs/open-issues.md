@@ -565,6 +565,31 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
   another PC refused, recovery detection / Open / Discard, CLI parsing, the single-instance
   hand-over (token, path checks) without a window, preferences.
 
+**Review fixes 2026-11-26** (each with a test unless noted):
+- A new working folder (*Save as Bundle…* of a folder or new project) counts as complete once the
+  project is written into it (`WorkFolder::project_written`), so a crash while the bundle is
+  written offers it for recovery (it can be the only copy) instead of "nothing to recover".
+- *Save as Bundle…* copies a folder project's raw recordings into the working folder only when
+  the bundle takes them (no NoSpace on the system drive, no unused GB copies).
+- A plain *Save* of a bundle keeps everything the bundle holds (its manifest's contents, recorded
+  in the working-folder state) plus what the settings add; only *Save as Bundle…* to a new file
+  uses the settings alone.
+- A removal whose rename to `.closing` fails (a file held open without delete sharing) marks the
+  state `closing` and removes the state file last; the next start finishes it
+  (`LeftoverStatus::Closing`), never offered as work.
+- Queued opens never replace a tab: an open that cannot get a new tab goes back to the queue
+  (`tabs_held` is the app's own check; `tabs_blocked`, which also counts queued opens and
+  imports, is the user's). Save All never saves another tab in place of the next one, and a
+  project opened during Save All stops the quit.
+- Changing *Unpack into* remembers the earlier root (`Prefs::past_work_roots`) until nothing is
+  left in it: recovery checks it and nothing is saved into it.
+- Single instance: a refused handover ends the second start (the running app shows why) instead
+  of starting a second app; an ending app answers `closing` and the second start waits for its
+  lock (up to 15 s) and becomes the running app; "ok" only when the app got the request; each
+  request on its own thread (up to 8) with a whole-request deadline of 3 s.
+- `uninstall.ps1 -Quiet -RemoveData` keeps working folders unless `-RemoveWorkFolders` is given,
+  and they are always kept while any ScanCraft runs (not run, parsed only).
+
 Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
 is unpacked at disk speed); keeping unknown project-file fields on save; sizes above 4 GiB
 untested; a real Settings window (the bundle options live in the Save card); a "save anyway"

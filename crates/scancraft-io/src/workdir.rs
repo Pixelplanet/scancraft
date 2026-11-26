@@ -17,7 +17,9 @@
 //! it for writing. Closing ([`WorkFolder::close`]) removes the folder. A folder whose owner has
 //! ended without closing it (a crash) is a *leftover*: [`leftovers`] lists them on the next start
 //! with what changed in them, and the app offers to recover ([`WorkFolder::recover`]) or discard
-//! ([`discard`]) each. A folder in use by a running app is listed as such and left alone.
+//! ([`discard`]) each. A folder in use by a running app is listed as such and left alone. A
+//! removal that stopped part-way (a file below the folder was held open) is never offered for
+//! recovery: the next start finishes it.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -54,12 +56,46 @@ pub struct WorkState {
     pub opened: u64,
     #[serde(default)]
     pub saved: Option<u64>,
-    /// Whether unpacking finished (an incomplete folder holds no work and only part of the
-    /// bundle: it can only be discarded).
+    /// Whether the folder holds the whole project: unpacking finished ([`WorkFolder::open`]),
+    /// or the app wrote the project into a new folder ([`WorkFolder::project_written`]). An
+    /// incomplete folder holds no work and only part of the bundle: it can only be discarded.
     #[serde(default)]
     pub complete: bool,
     #[serde(default)]
     pub entries: Vec<EntryState>,
+    /// What the bundle holds (its manifest's contents when it was opened, or what the last save
+    /// wrote); `None`: not known (no manifest, or no save yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contents: Option<BundleContents>,
+    /// The folder is being removed ([`WorkFolder::close`], [`discard`]): a removal that stopped
+    /// part-way is finished at the next start, never offered for recovery.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub closing: bool,
+}
+
+impl WorkState {
+    /// Whether the bundle file is no longer the one opened or last saved (replaced, changed or
+    /// deleted by someone else). A bundle that did not exist when the folder was made (a new
+    /// bundle not saved yet) and still does not is unchanged.
+    pub fn bundle_changed(&self) -> bool {
+        match stamp(&self.bundle) {
+            Some(now) => now != (self.bundle_size, self.bundle_mtime_ns),
+            None => (self.bundle_size, self.bundle_mtime_ns) != (0, 0),
+        }
+    }
+
+    /// What the bundle holds: as recorded, or (for a state without it) the items of the
+    /// extracted entries.
+    pub fn held_contents(&self) -> BundleContents {
+        if let Some(c) = self.contents {
+            return c;
+        }
+        let mut held = BundleContents::nothing();
+        for item in self.entries.iter().filter_map(|e| bundle::classify(&e.path, &[])) {
+            held.set(item, true);
+        }
+        held
+    }
 }
 
 fn read_state(dir: &Path) -> Result<WorkState, IoError> {
@@ -164,6 +200,8 @@ impl WorkFolder {
             saved: None,
             complete: false,
             entries: Vec::new(),
+            contents: bundle.manifest().map(|m| m.contents),
+            closing: false,
         };
         let unpacked = (|| {
             write_state(&dir, &state)?;
@@ -180,10 +218,12 @@ impl WorkFolder {
 
     /// A new, empty working folder under `root` for a bundle that does not exist yet (*Save as
     /// Bundle…* of a project that is not a bundle): locks `dest`, and records it as the folder's
-    /// bundle. The app writes the project into [`WorkFolder::dir`], then [`WorkFolder::save`]
-    /// writes the bundle. Until that first save the folder counts as incomplete (a crash before
-    /// it leaves a folder that can only be discarded). `dest` may exist: the first save replaces
-    /// it.
+    /// bundle. The app writes the project into [`WorkFolder::dir`], calls
+    /// [`WorkFolder::project_written`], then [`WorkFolder::save`] writes the bundle. Until the
+    /// project is written the folder counts as incomplete (a crash before that leaves a folder
+    /// that can only be discarded); after it, a crash (also one while the bundle is written)
+    /// leaves a folder that is offered for recovery, since for a new project it is the only copy.
+    /// `dest` may exist: the first save replaces it.
     pub fn create(dest: &Path, root: &Path) -> Result<WorkFolder, IoError> {
         let dest = std::path::absolute(dest)?;
         let lock = LockFile::lock_project(&dest)?;
@@ -200,6 +240,8 @@ impl WorkFolder {
             saved: None,
             complete: false,
             entries: Vec::new(),
+            contents: None,
+            closing: false,
         };
         if let Err(e) = write_state(&dir, &state) {
             let _ = fs::remove_dir_all(&dir);
@@ -216,6 +258,9 @@ impl WorkFolder {
         if !state.owner.is_this_process() && state.owner.liveness() != Liveness::Dead {
             return Err(IoError::Locked { path: dir.to_path_buf(), owner: Some(Box::new(state.owner.clone())) });
         }
+        if state.closing {
+            return Err(IoError::Unsupported(format!("{}: it was being removed when ScanCraft ended; discard it", dir.display())));
+        }
         if !state.complete {
             return Err(IoError::Unsupported(format!("{}: unpacking stopped part-way, so it holds no changes; discard it and open the bundle again", dir.display())));
         }
@@ -223,6 +268,15 @@ impl WorkFolder {
         state.owner = lock.owner().clone();
         write_state(dir, &state)?;
         Ok(WorkFolder { dir: dir.to_path_buf(), state, lock })
+    }
+
+    /// For a folder made by [`WorkFolder::create`]: the app has written the whole project into
+    /// it (its project file last), so from now on it holds work and is recovered after a crash.
+    /// Refused while the folder has no project file.
+    pub fn project_written(&mut self) -> Result<(), IoError> {
+        self.project_file()?;
+        self.state.complete = true;
+        write_state(&self.dir, &self.state)
     }
 
     /// The working folder (a project folder: open it with [`project::load_project`]).
@@ -251,7 +305,13 @@ impl WorkFolder {
     /// Whether the bundle file is no longer the one opened or last saved (replaced, changed or
     /// deleted by someone else).
     pub fn bundle_changed(&self) -> bool {
-        stamp(&self.state.bundle) != Some((self.state.bundle_size, self.state.bundle_mtime_ns))
+        self.state.bundle_changed()
+    }
+
+    /// What the bundle holds now (see [`WorkState::held_contents`]). A plain *Save* keeps all of
+    /// it: the working folder is the only other copy, and it is removed when the tab closes.
+    pub fn held_contents(&self) -> BundleContents {
+        self.state.held_contents()
     }
 
     fn check_lock(&self) -> Result<(), IoError> {
@@ -302,6 +362,7 @@ impl WorkFolder {
         self.state.bundle_size = size;
         self.state.bundle_mtime_ns = mtime;
         self.state.entries = entries;
+        self.state.contents = Some(*contents);
         self.state.saved = Some(fsutil::unix_now());
         // A folder made by [`WorkFolder::create`] is complete once its bundle exists.
         self.state.complete = true;
@@ -362,15 +423,52 @@ pub fn copy_item_files(from: &Path, to: &Path, item: Item) -> Result<usize, IoEr
 
 /// Removes a working folder: renamed to `<dir>.closing` first, so a removal that stops part-way
 /// (a file held open) never leaves something that looks like a working folder with work in it.
+/// When the rename keeps failing (on Windows: a file below the folder is open), the folder is
+/// marked as closing in its state and removed in place, the state file last: a removal that
+/// stops part-way still has its state, and the next start finishes it
+/// ([`LeftoverStatus::Closing`]).
 fn remove_working_folder(dir: &Path) -> Result<(), IoError> {
     let mut closing = dir.as_os_str().to_os_string();
     closing.push(CLOSING_SUFFIX);
     let closing = PathBuf::from(closing);
-    let target = match fs::rename(dir, &closing) {
-        Ok(()) => closing,
-        Err(_) => dir.to_path_buf(),
-    };
-    fs::remove_dir_all(&target)?;
+    for attempt in 0..3 {
+        if fs::rename(dir, &closing).is_ok() {
+            fs::remove_dir_all(&closing)?;
+            return Ok(());
+        }
+        if attempt < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+    if let Ok(mut state) = read_state(dir) {
+        state.closing = true;
+        write_state(dir, &state)?;
+    }
+    remove_in_place(dir)
+}
+
+/// Removes everything in `dir` but its state file (as much as can be removed), then the state
+/// file and `dir`. On the first error the state file stays.
+fn remove_in_place(dir: &Path) -> Result<(), IoError> {
+    let mut first: Option<std::io::Error> = None;
+    for entry in fs::read_dir(dir)?.flatten() {
+        if entry.file_name() == STATE_FILE {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if entry.file_type().is_ok_and(|t| t.is_dir()) { fs::remove_dir_all(&path) } else { fs::remove_file(&path) };
+        if let Err(e) = removed {
+            first.get_or_insert(e);
+        }
+    }
+    if let Some(e) = first {
+        return Err(e.into());
+    }
+    let state = dir.join(STATE_FILE);
+    if state.exists() {
+        fs::remove_file(&state)?;
+    }
+    fs::remove_dir(dir)?;
     Ok(())
 }
 
@@ -390,9 +488,12 @@ pub enum LeftoverStatus {
     /// Its owner ended without closing it. `changed`: files changed since the last save (empty:
     /// nothing to recover); `bundle_changed`: the bundle was changed by someone else since.
     Orphaned { changed: Vec<String>, bundle_changed: bool },
-    /// Unpacking stopped part-way: nothing to recover, discard it.
+    /// Unpacking stopped part-way (or a new bundle's project was never written): nothing to
+    /// recover, discard it.
     Incomplete,
-    /// No readable state, or a removal that stopped part-way: discard it.
+    /// A removal that stopped part-way (a file was held open): nothing to recover, remove it.
+    Closing,
+    /// No readable state: discard it.
     Damaged(String),
 }
 
@@ -405,7 +506,7 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
         .map(|e| {
             let dir = e.path();
             if dir.to_string_lossy().ends_with(CLOSING_SUFFIX) {
-                return Leftover { dir, state: None, status: LeftoverStatus::Damaged("its removal stopped part-way".into()) };
+                return Leftover { dir, state: None, status: LeftoverStatus::Closing };
             }
             let state = match read_state(&dir) {
                 Ok(s) => s,
@@ -413,11 +514,13 @@ pub fn leftovers(root: &Path) -> Vec<Leftover> {
             };
             let status = if state.owner.is_this_process() || state.owner.liveness() != Liveness::Dead {
                 LeftoverStatus::InUse(state.owner.clone())
+            } else if state.closing {
+                LeftoverStatus::Closing
             } else if !state.complete {
                 LeftoverStatus::Incomplete
             } else {
                 let changed = changed_files(&dir, &state.entries).unwrap_or_else(|e| vec![format!("(cannot be checked: {e})")]);
-                LeftoverStatus::Orphaned { changed, bundle_changed: stamp(&state.bundle) != Some((state.bundle_size, state.bundle_mtime_ns)) }
+                LeftoverStatus::Orphaned { changed, bundle_changed: state.bundle_changed() }
             };
             Leftover { dir, state: Some(state), status }
         })
@@ -582,7 +685,8 @@ mod tests {
         fs::create_dir_all(root.join("Foreign")).unwrap();
         let found = leftovers(&root);
         assert_eq!(found.len(), 3);
-        assert!(found.iter().all(|l| matches!(l.status, LeftoverStatus::Damaged(_))));
+        assert_eq!(found.iter().filter(|l| l.status == LeftoverStatus::Closing).count(), 1);
+        assert_eq!(found.iter().filter(|l| matches!(l.status, LeftoverStatus::Damaged(_))).count(), 2);
         assert!(discard(&root.join("Foreign")).is_err());
         discard(&root.join("Part-1234.closing")).unwrap();
         discard(&root.join("Broken")).unwrap();
@@ -617,6 +721,101 @@ mod tests {
         assert_eq!(b.read("pass-1/raw/stream.bin").unwrap(), b"raw");
         work.close().unwrap();
         assert!(leftovers(&root).is_empty() && !LockFile::path_for(&dest).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Makes the working folder `wd` look as if its app had crashed: owned by a process that is
+    /// gone, with the bundle's lock left behind.
+    fn orphan(work: WorkFolder) -> PathBuf {
+        let wd = work.dir().to_path_buf();
+        std::mem::forget(work);
+        let mut state = read_state(&wd).unwrap();
+        state.owner.pid = dead_pid();
+        state.owner.process_started_ms = None;
+        write_state(&wd, &state).unwrap();
+        fs::write(LockFile::path_for(&state.bundle), serde_json::to_vec(&state.owner).unwrap()).unwrap();
+        wd
+    }
+
+    #[test]
+    fn a_crash_while_the_first_bundle_is_written_keeps_the_project_recoverable() {
+        let dir = temp("first-save");
+        let root = dir.join("root");
+        let dest = dir.join("New part.scancraftz");
+        let mut work = WorkFolder::create(&dest, &root).unwrap();
+        assert!(work.project_written().is_err(), "no project file yet");
+        sample_project(work.dir());
+        work.project_written().unwrap();
+        // The app ends while the bundle is written: no bundle, a complete project in the folder.
+        let wd = orphan(work);
+        assert!(!dest.exists());
+        let found = leftovers(&root);
+        let LeftoverStatus::Orphaned { changed, bundle_changed } = &found[0].status else { panic!("{:?}", found[0].status) };
+        assert!(!changed.is_empty() && !bundle_changed, "{changed:?}: the never-written bundle is not 'changed by someone else'");
+        // Recover and save: the bundle is written from the folder.
+        let mut work = WorkFolder::recover(&wd).unwrap();
+        work.save(&BundleContents::everything()).unwrap();
+        assert!(Bundle::open(&dest).unwrap().verify().unwrap().is_ok());
+        assert!(work.changed_files().unwrap().is_empty());
+        work.close().unwrap();
+        assert!(leftovers(&root).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn what_a_bundle_holds_is_known_from_its_manifest_and_its_saves() {
+        let dir = temp("held");
+        let project = dir.join("Bracket");
+        sample_project(&project);
+        fs::create_dir_all(project.join("pass-1/raw")).unwrap();
+        fs::write(project.join("pass-1/raw/stream.bin"), b"raw").unwrap();
+        let bundle_path = dir.join("Bracket.scancraftz");
+        bundle::write_bundle(&project, &bundle_path, &BundleContents::everything()).unwrap();
+        let root = dir.join("root");
+        let mut work = WorkFolder::open(&bundle_path, &root).unwrap();
+        assert_eq!(work.held_contents(), BundleContents::everything());
+        // A plain Save with settings that leave raw recordings out keeps what the bundle holds.
+        let keep = work.held_contents().union(&BundleContents::default());
+        work.save(&keep).unwrap();
+        assert_eq!(Bundle::open(&bundle_path).unwrap().read("pass-1/raw/stream.bin").unwrap(), b"raw");
+        // A save that does leave them out is what the bundle holds from then on.
+        work.save(&BundleContents::default()).unwrap();
+        assert!(Bundle::open(&bundle_path).unwrap().read("pass-1/raw/stream.bin").is_err());
+        assert_eq!(work.held_contents(), BundleContents::default());
+        // A state without recorded contents: the items of its entries.
+        let state = WorkState { contents: None, ..work.state().clone() };
+        assert!(state.held_contents().keyframes && !state.held_contents().raw_recordings);
+        work.close().unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// On Windows a file opened without delete sharing stops both the rename and the removal of
+    /// the folder: the removal is finished at the next start, never offered as recoverable work.
+    #[cfg(windows)]
+    #[test]
+    fn a_removal_stopped_by_an_open_file_is_finished_later() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp("held-open");
+        let bundle_path = sample_bundle(&dir);
+        let root = dir.join("root");
+        let work = WorkFolder::open(&bundle_path, &root).unwrap();
+        let wd = work.dir().to_path_buf();
+        let held = wd.join("pass-1/keyframes.bin");
+        // FILE_SHARE_READ only, as some viewers and virus scanners open files.
+        let handle = fs::OpenOptions::new().read(true).share_mode(1).open(&held).unwrap();
+        assert!(work.close().is_err());
+        assert!(wd.join(STATE_FILE).is_file(), "the state file is removed last");
+        assert!(!wd.join("Bracket.scancraft").exists(), "everything else that could go is gone");
+        let mut state = read_state(&wd).unwrap();
+        assert!(state.closing);
+        state.owner.pid = dead_pid();
+        state.owner.process_started_ms = None;
+        write_state(&wd, &state).unwrap();
+        assert_eq!(leftovers(&root)[0].status, LeftoverStatus::Closing);
+        assert!(WorkFolder::recover(&wd).is_err(), "nothing to recover");
+        drop(handle);
+        discard(&wd).unwrap();
+        assert!(!wd.exists() && leftovers(&root).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

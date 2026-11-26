@@ -154,6 +154,11 @@ pub struct Prefs {
     /// ([`workdir::default_root`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub work_root: Option<PathBuf>,
+    /// Earlier working-folder roots that may still hold working folders (of bundles open when
+    /// the root was changed): crash recovery looks there too, and nothing is saved into them.
+    /// A root is forgotten once nothing is left in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub past_work_roots: Vec<PathBuf>,
     /// What Save as Bundle… puts into a bundle.
     #[serde(default)]
     pub bundle_contents: BundleContents,
@@ -164,7 +169,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { work_root: None, bundle_contents: BundleContents::default(), other: Default::default() }
+        Prefs { work_root: None, past_work_roots: Vec::new(), bundle_contents: BundleContents::default(), other: Default::default() }
     }
 }
 
@@ -197,6 +202,28 @@ impl Prefs {
     pub fn work_root(&self) -> PathBuf {
         self.work_root.clone().filter(|p| !p.as_os_str().is_empty()).unwrap_or_else(workdir::default_root)
     }
+
+    /// Changes the working-folder root. The one in use so far is remembered (open bundles keep
+    /// their working folders there until their tabs close).
+    pub fn set_work_root(&mut self, root: PathBuf) {
+        let old = self.work_root();
+        if !same_path(&old, &root) && !self.past_work_roots.iter().any(|p| same_path(p, &old)) {
+            self.past_work_roots.push(old);
+        }
+        self.past_work_roots.retain(|p| !same_path(p, &root));
+        self.work_root = Some(root);
+    }
+
+    /// Every root that may hold working folders: the one in use first, then the earlier ones.
+    pub fn work_roots(&self) -> Vec<PathBuf> {
+        let mut roots = vec![self.work_root()];
+        for p in &self.past_work_roots {
+            if !roots.iter().any(|r| same_path(r, p)) {
+                roots.push(p.clone());
+            }
+        }
+        roots
+    }
 }
 
 #[cfg(test)]
@@ -228,6 +255,20 @@ mod tests {
         assert_eq!(Prefs::load(&path), Prefs::default());
         assert_eq!(Prefs { work_root: Some(PathBuf::new()), ..Prefs::default() }.work_root(), workdir::default_root());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn earlier_working_folder_roots_are_remembered() {
+        let mut prefs = Prefs::default();
+        let (a, b) = (PathBuf::from("E:/Work"), PathBuf::from("F:/Work"));
+        prefs.set_work_root(a.clone());
+        assert_eq!(prefs.work_roots(), vec![a.clone(), workdir::default_root()]);
+        prefs.set_work_root(b.clone());
+        prefs.set_work_root(b.clone());
+        assert_eq!(prefs.work_roots(), vec![b.clone(), workdir::default_root(), a.clone()]);
+        // Back to an earlier root: it is the one in use again, listed once.
+        prefs.set_work_root(a.clone());
+        assert_eq!(prefs.work_roots(), vec![a, workdir::default_root(), b]);
     }
 
     #[test]

@@ -134,6 +134,22 @@ impl BundleContents {
         BundleContents { raw_recordings: true, ..Default::default() }
     }
 
+    /// No optional item: [`Item::Core`] only.
+    pub fn nothing() -> Self {
+        BundleContents { keyframes: false, colour_keyframes: false, results: false, marker_maps: false, raw_recordings: false }
+    }
+
+    /// Every item that either holds.
+    pub fn union(&self, other: &BundleContents) -> BundleContents {
+        BundleContents {
+            keyframes: self.keyframes || other.keyframes,
+            colour_keyframes: self.colour_keyframes || other.colour_keyframes,
+            results: self.results || other.results,
+            marker_maps: self.marker_maps || other.marker_maps,
+            raw_recordings: self.raw_recordings || other.raw_recordings,
+        }
+    }
+
     pub fn includes(&self, item: Item) -> bool {
         match item {
             Item::Core => true,

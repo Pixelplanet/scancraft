@@ -41,6 +41,8 @@ struct ScanCraft {
     script: Option<dev::Script>,
     /// Projects handed over by later starts (`single_instance`).
     handovers: Option<std::sync::mpsc::Receiver<single_instance::Handover>>,
+    /// Set when the app ends: later starts are no longer handed over to it.
+    closing: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ScanCraft {
@@ -113,8 +115,10 @@ impl eframe::App for ScanCraft {
         while let Some(h) = self.handovers.as_ref().and_then(|rx| rx.try_recv().ok()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            if let single_instance::Handover::Open(p) = h {
-                self.app.request_open(storage::OpenRequest::Path(p));
+            match h {
+                single_instance::Handover::Open(p) => self.app.request_open(storage::OpenRequest::Path(p)),
+                single_instance::Handover::Refused { path, why } => self.app.say(app::Tone::Error, format!("Could not open {path}: {why}")),
+                single_instance::Handover::Focus => {}
             }
         }
         self.app.poll_picker();
@@ -145,6 +149,15 @@ impl eframe::App for ScanCraft {
     }
 
     fn on_exit(&mut self) {
+        // From here on no request is read: later starts wait for this app to end instead.
+        if let Some(closing) = &self.closing {
+            closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(rx) = &self.handovers {
+            for h in rx.try_iter() {
+                log::warn!("a project handed over while ScanCraft was closing was not opened: {h:?}");
+            }
+        }
         self.app.shutdown();
     }
 }
@@ -166,6 +179,7 @@ fn main() -> eframe::Result<()> {
     // One app per user: a later start hands its project to the running one and ends.
     let mut handovers = None;
     let mut wake = None;
+    let mut closing = None;
     let _instance_guard = if cli.single_instance() {
         match single_instance::start(&single_instance::default_dir(), cli.project.as_deref()) {
             single_instance::Start::HandedOver => {
@@ -174,10 +188,16 @@ fn main() -> eframe::Result<()> {
                 }
                 return Ok(());
             }
+            // The running app refused the project and shows why; never a second app.
+            single_instance::Start::Refused(why) => {
+                eprintln!("scancraft: ScanCraft is already running and could not open the project: {why}");
+                return Ok(());
+            }
             single_instance::Start::Primary(primary) => {
                 let (guard, rx, w) = primary.split();
                 handovers = Some(rx);
                 wake = Some(w);
+                closing = Some(guard.closing_flag());
                 Some(guard)
             }
             single_instance::Start::Alone(why) => {
@@ -221,7 +241,7 @@ fn main() -> eframe::Result<()> {
             if let Some(path) = cli.project.clone() {
                 app.request_open(storage::OpenRequest::Path(path));
             }
-            Ok(Box::new(ScanCraft { app, script, handovers }))
+            Ok(Box::new(ScanCraft { app, script, handovers, closing }))
         }),
     )
 }

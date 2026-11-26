@@ -1046,7 +1046,15 @@ impl ScanCraftApp {
                     let saved = (|| {
                         project::save(&dir, &input.into_project(name.clone())?)?;
                         let mut work = work.lock().map_err(|_| "the working folder is unavailable".to_string())?;
-                        let report = if same_path(work.bundle(), &target) { work.save(&contents) } else { work.save_as(&target, &contents) };
+                        // Save keeps everything the bundle holds (the working folder, its only
+                        // other copy, goes when the tab closes) and adds what the settings ask
+                        // for; Save as Bundle… writes what the settings ask for.
+                        let report = if same_path(work.bundle(), &target) {
+                            let keep = work.held_contents().union(&contents);
+                            work.save(&keep)
+                        } else {
+                            work.save_as(&target, &contents)
+                        };
                         report.map_err(|e| e.to_string())
                     })();
                     match saved {
@@ -1064,7 +1072,11 @@ impl ScanCraftApp {
                     };
                     let saved = (|| {
                         project::save(work.dir(), &input.into_project(name.clone())?)?;
-                        if let Some(old) = &old_dir {
+                        // From now on the folder holds the project (for a new one, its only copy
+                        // on disk): a crash while the bundle is written leaves it recoverable.
+                        work.project_written().map_err(|e| e.to_string())?;
+                        // The raw recordings the app does not hold, only when the bundle takes them.
+                        if let (Some(old), true) = (&old_dir, contents.includes(Item::RawRecordings)) {
                             workdir::copy_item_files(old, work.dir(), Item::RawRecordings).map_err(|e| e.to_string())?;
                         }
                         work.save(&contents).map_err(|e| e.to_string())
@@ -1080,9 +1092,9 @@ impl ScanCraftApp {
             }
             return;
         }
-        // Never into the working folders (closing a bundle tab removes its working folder).
-        let root = self.prefs.work_root();
-        if target.starts_with(&root) || std::path::absolute(&root).is_ok_and(|r| target.starts_with(r)) {
+        // Never into the working folders (closing a bundle tab removes its working folder), also
+        // those under an earlier root.
+        if let Some(root) = self.prefs.work_roots().into_iter().find(|root| target.starts_with(root) || std::path::absolute(root).is_ok_and(|r| target.starts_with(r))) {
             self.say(Tone::Error, format!("{} is where opened bundles are unpacked: choose another folder", root.display()));
             return;
         }
@@ -1134,8 +1146,10 @@ impl ScanCraftApp {
             return;
         };
         if let Some(i) = self.tab_with_path(target.path()) {
-            self.switch_tab(i);
-            self.say(Tone::Normal, format!("{} is already open", self.project.name));
+            // (Also when more opens wait in the queue.)
+            if self.show_tab(i) {
+                self.say(Tone::Normal, format!("{} is already open", self.project.name));
+            }
             return;
         }
         match target {
@@ -1204,7 +1218,7 @@ impl ScanCraftApp {
 
     /// Opens (or recovers) a project now, or once the running operation has finished.
     pub fn request_open(&mut self, request: OpenRequest) {
-        if self.can_edit() && self.pending_open.is_empty() {
+        if self.can_edit() && self.tabs_held().is_none() && self.pending_open.is_empty() {
             match request {
                 OpenRequest::Path(p) => self.open_project(p),
                 OpenRequest::Recover(d) => self.recover_project(d),
@@ -1218,24 +1232,35 @@ impl ScanCraftApp {
         }
     }
 
-    /// At start: the working folders under the working-folder root that a crashed ScanCraft left
-    /// behind. Those with nothing to recover (no change since the last save, bundle unchanged)
-    /// and stopped removals are removed at once; the others are put to the user in one question
-    /// (`recovery`). Folders of a running ScanCraft and folders that are not working folders are
-    /// left alone.
+    /// At start: the working folders that a crashed ScanCraft left behind, under the
+    /// working-folder root and the earlier ones (an earlier root with nothing left in it is
+    /// forgotten). Those with nothing to recover (no change since the last save, bundle
+    /// unchanged) and stopped removals are removed at once; the others are put to the user in one
+    /// question (`recovery`). Folders of a running ScanCraft and folders that are not working
+    /// folders are left alone.
     pub fn check_leftovers(&mut self) {
         use scancraft_io::workdir::LeftoverStatus as S;
         let mut ask = Vec::new();
-        for l in workdir::leftovers(&self.prefs.work_root()) {
-            let closing = l.dir.to_string_lossy().ends_with(".closing");
-            match &l.status {
-                S::InUse(_) => {}
-                S::Orphaned { changed, bundle_changed: false } if changed.is_empty() => discard_quietly(&l.dir),
-                S::Damaged(_) if closing => discard_quietly(&l.dir),
-                // Not a working folder (no state file): never touched.
-                S::Damaged(_) if !l.dir.join(workdir::STATE_FILE).is_file() => {}
-                _ => ask.push(l),
+        let mut emptied = Vec::new();
+        for root in self.prefs.work_roots() {
+            for l in workdir::leftovers(&root) {
+                match &l.status {
+                    S::InUse(_) => {}
+                    S::Orphaned { changed, bundle_changed: false } if changed.is_empty() => discard_quietly(&l.dir),
+                    S::Closing => discard_quietly(&l.dir),
+                    // Not a working folder (no state file): never touched.
+                    S::Damaged(_) if !l.dir.join(workdir::STATE_FILE).is_file() => {}
+                    _ => ask.push(l),
+                }
             }
+            if workdir::leftovers(&root).is_empty() {
+                emptied.push(root);
+            }
+        }
+        let before = self.prefs.past_work_roots.len();
+        self.prefs.past_work_roots.retain(|p| !emptied.iter().any(|e| same_path(e, p)));
+        if self.prefs.past_work_roots.len() != before {
+            self.save_prefs();
         }
         self.recovery = (!ask.is_empty()).then_some(ask);
     }
@@ -1256,7 +1281,8 @@ impl ScanCraftApp {
                     }
                     w
                 }
-                S::Incomplete => "unpacking or the first save stopped part-way: nothing to recover".to_string(),
+                S::Incomplete => "unpacking stopped part-way: nothing to recover".to_string(),
+                S::Closing => "its removal stopped part-way: nothing to recover".to_string(),
                 S::Damaged(why) => format!("cannot be read ({why}): nothing to recover"),
                 S::InUse(_) => "in use".to_string(),
             };
@@ -1292,10 +1318,23 @@ impl ScanCraftApp {
         }
     }
 
-    pub(super) fn install_project(&mut self, opened: OpenedProject) {
-        // Opens into a new tab unless the current one is empty: nothing is replaced.
-        if self.has_geometry() {
-            self.new_tab();
+    pub(super) fn install_project(&mut self, mut opened: OpenedProject) {
+        // Opens into a new tab unless the current one is empty: nothing is replaced. When no tab
+        // can be added now, the open goes back to the front of the queue.
+        if self.has_geometry() && !self.add_empty_tab() {
+            let request = match std::mem::take(&mut opened.store) {
+                // A recovered working folder is kept as it is (its lock let go meanwhile).
+                Store::Bundle { dir, .. } if opened.recovered => OpenRequest::Recover(dir),
+                // A freshly unpacked one holds nothing yet: removed, and unpacked again.
+                store => {
+                    store.close();
+                    OpenRequest::Path(opened.path.clone())
+                }
+            };
+            self.pending_open.push_front(request);
+            let why = self.tabs_held().unwrap_or("the app is free");
+            self.say(Tone::Warning, format!("{} opens when possible: {why}", opened.path.display()));
+            return;
         }
         // An empty tab's own folder or bundle (nothing unsaved in it) is let go.
         std::mem::take(&mut self.project.store).close();

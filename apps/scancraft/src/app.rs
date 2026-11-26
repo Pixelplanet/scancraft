@@ -2682,7 +2682,9 @@ impl ScanCraftApp {
                 self.settings.project_path = path.display().to_string();
             }
             P::WorkRoot => {
-                self.prefs.work_root = Some(first);
+                // Open bundles keep their working folders under the old root, which crash
+                // recovery goes on checking.
+                self.prefs.set_work_root(first);
                 self.save_prefs();
             }
             P::AiPackFolder => self.install_ai_pack_from(first),
@@ -2718,7 +2720,7 @@ impl ScanCraftApp {
 
     pub fn poll_jobs(&mut self) {
         self.next_import();
-        if self.can_edit() {
+        if self.can_edit() && self.tabs_held().is_none() {
             match self.pending_open.pop_front() {
                 Some(crate::storage::OpenRequest::Path(p)) => self.open_project(p),
                 Some(crate::storage::OpenRequest::Recover(d)) => self.recover_project(d),
@@ -4777,6 +4779,155 @@ mod tests {
         assert!(app.recovery.is_some());
         app.discard_leftovers();
         assert!(app.recovery.is_none() && !wd.exists(), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_recordings_are_copied_only_into_bundles_that_take_them_and_save_keeps_them() {
+        let dir = temp_dir("raw-contents");
+        let root = dir.join("work");
+        let mut app = app();
+        app.prefs.work_root = Some(root.clone());
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let folder = dir.join("Bracket");
+        app.save_project(folder.clone());
+        finish_job(&mut app);
+        std::fs::write(folder.join("pass-1").join("raw.bin"), [5u8; 2000]).unwrap();
+        let has_raw = |bundle: &std::path::Path| scancraft_io::bundle::Bundle::open(bundle).unwrap().read("pass-1/raw.bin").is_ok();
+
+        // Default settings leave raw recordings out: nothing is copied into the working folder.
+        let small = dir.join("Small.scancraftz");
+        app.save_project(small.clone());
+        finish_job(&mut app);
+        let work = app.project.store.work_dir().expect("a bundle tab");
+        assert!(!work.join("pass-1").join("raw.bin").exists(), "{}", app.status);
+        assert!(!has_raw(&small));
+
+        // With them switched on they go into the bundle.
+        // (Back to the folder project.)
+        let folder_lock = scancraft_io::lock::LockFile::lock_project(&folder).unwrap();
+        std::mem::replace(&mut app.project.store, crate::storage::Store::Folder(folder_lock)).close();
+        app.prefs.bundle_contents.raw_recordings = true;
+        let full = dir.join("Full.scancraftz");
+        app.save_project(full.clone());
+        finish_job(&mut app);
+        assert!(app.project.store.is_bundle() && has_raw(&full), "{}", app.status);
+
+        // Switched off again, a plain Save of that bundle still keeps what it holds.
+        app.prefs.bundle_contents.raw_recordings = false;
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        app.save_project(full.clone());
+        finish_job(&mut app);
+        assert_eq!(bundle_passes(&full), 2, "{}", app.status);
+        assert!(has_raw(&full), "Save never drops what the bundle holds");
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn queued_opens_never_replace_an_open_tab() {
+        let dir = temp_dir("queued-opens");
+        let root = dir.join("work");
+        // Two folder projects to open.
+        let mut maker = app();
+        let (a, b) = (dir.join("A"), dir.join("B"));
+        for p in [&a, &b] {
+            add_fixed_pass(&mut maker, 1, table_and_block(), Transform::default());
+            maker.save_project(p.clone());
+            finish_job(&mut maker);
+            release(&mut maker);
+            maker.passes.clear();
+        }
+        // A bundle tab with unsaved changes.
+        let mut app = app();
+        app.prefs.work_root = Some(root.clone());
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let bundle = dir.join("T.scancraftz");
+        app.save_project(bundle.clone());
+        finish_job(&mut app);
+        let work = app.project.store.work_dir().unwrap();
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        assert!(app.dirty());
+        // Two projects dropped at once: the first opens, the second waits.
+        app.request_open(crate::storage::OpenRequest::Path(a.clone()));
+        app.request_open(crate::storage::OpenRequest::Path(b.clone()));
+        assert_eq!(app.pending_open.len(), 1);
+        finish_job(&mut app);
+        assert_eq!(app.tabs.len(), 2, "A opened in a new tab although B waits: {}", app.status);
+        assert!(work.exists(), "the bundle tab's working folder is kept");
+        app.poll_jobs();
+        finish_job(&mut app);
+        assert_eq!(app.tabs.len(), 3, "{}", app.status);
+        app.switch_tab(0);
+        assert_eq!(app.passes.len(), 2, "the bundle tab is unchanged");
+        assert!(app.dirty() && app.project.store.work_dir() == Some(work.clone()));
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_all_saves_every_tab_even_when_an_open_arrives_meanwhile() {
+        let dir = temp_dir("save-all-open");
+        let (a, b, c) = (dir.join("A"), dir.join("B"), dir.join("C"));
+        let mut maker = app();
+        add_fixed_pass(&mut maker, 1, table_and_block(), Transform::default());
+        maker.save_project(c.clone());
+        finish_job(&mut maker);
+        release(&mut maker);
+        let mut app = app();
+        for (i, p) in [&a, &b].into_iter().enumerate() {
+            if i > 0 {
+                app.new_tab();
+            }
+            add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+            app.save_project(p.clone());
+            finish_job(&mut app);
+            add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        }
+        assert_eq!(app.dirty_names().len(), 2);
+        app.save_all_then_quit();
+        // A double-click on C while the first save runs.
+        app.request_open(crate::storage::OpenRequest::Path(c.clone()));
+        for _ in 0..4 {
+            finish_job(&mut app);
+            app.poll_jobs();
+        }
+        finish_job(&mut app);
+        assert!(!app.any_dirty(), "both tabs saved: {}", app.status);
+        assert_eq!(scancraft_io::project::load_project(&b).unwrap().0.passes.len(), 2);
+        assert_eq!(scancraft_io::project::load_project(&a).unwrap().0.passes.len(), 2);
+        assert!(!app.close_window && !app.quit_confirmed, "the quit stops for the project that was opened");
+        assert_eq!(app.tabs.len(), 3, "C opened: {}", app.status);
+        app.shutdown();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn working_folders_under_an_earlier_root_are_still_recovered() {
+        let dir = temp_dir("old-root");
+        let (old_root, new_root) = (dir.join("work-old"), dir.join("work-new"));
+        let mut app = app();
+        app.prefs.work_root = Some(old_root.clone());
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let bundle = dir.join("Bracket.scancraftz");
+        app.save_project(bundle.clone());
+        finish_job(&mut app);
+        let work = app.project.store.work_dir().unwrap();
+        // The root is changed while the bundle is open.
+        app.prefs.set_work_root(new_root.clone());
+        // Nothing is saved into the earlier root either.
+        app.save_project(work.join("inside"));
+        assert!(app.busy.is_none() && app.status.contains("unpacked"), "{}", app.status);
+        std::fs::write(work.join("pass-1").join("notes.txt"), b"unsaved").unwrap();
+        crash(std::mem::take(&mut app.project.store), &work, &bundle);
+        let mut next = self::app();
+        next.prefs = app.prefs.clone();
+        next.check_leftovers();
+        assert_eq!(next.recovery.as_ref().map(Vec::len), Some(1), "the earlier root is checked");
+        assert_eq!(next.prefs.past_work_roots, vec![old_root.clone()], "kept while something is left in it");
+        next.discard_leftovers();
+        next.check_leftovers();
+        assert!(next.prefs.past_work_roots.is_empty(), "forgotten once empty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
