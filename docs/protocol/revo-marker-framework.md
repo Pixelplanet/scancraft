@@ -67,3 +67,18 @@ The large maxima are markers at block edges, where the 6 mm plane spans two face
 within 3 mm, normals within 30°), fits the matched markers with Horn's method, matches again
 under that fit and fits once more, then compares the computed pose with the fit: rotation
 difference and RMS displacement of the moving scan's points. Pass limit: 0.5° and 1.0 mm.
+
+Results on 2026-11-26 (`align_all` poses as the app computes them, release build, the three
+projects of section 2; every test reference S1, S2 or S3 gives the same poses):
+
+| Pair | Matched markers | RMS under the pose | RMS under the fit | Pose vs fit |
+| --- | --- | --- | --- | --- |
+| S1 → S3 | 6 | 0.56 mm | 0.11 mm | 0.27° / 0.63 mm |
+| S2 → S3 | 7 | 0.39 mm | 0.06 mm | 0.19° / 0.36 mm |
+| S1 fused → S3 | 6 | 0.77 mm | 0.11 mm | 0.22° / 0.81 mm |
+| S2 fused → S3 | 7 | 0.15 mm | 0.06 mm | 0.07° / 0.15 mm |
+
+S1 and S2 share no markers (outside and inside). The older "verified" transforms are
+1.07° / 2.56 mm (S2 → S1) off the same poses. Limits: 0.5° and 1.2 mm, about 1.5 to 2 times the
+worst pair, still well below the older transforms' error. Whole-scene alignment places nothing,
+so it has no pair to check.

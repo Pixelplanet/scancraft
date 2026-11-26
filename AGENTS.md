@@ -390,3 +390,17 @@ laser model are not built.
   `docs/open-issues.md`. Verified `scancraft-driver` (3), `e2e_pipeline_test` (1), `scancraft` (79),
   and `#[ignore]` `sam21_isolates_vase_in_multi_object_desk_scene` (1 click keeps 37 093 / 132 060
   vase points with 0 turntable, 1 canister, and 262 block boundary points).
+- 2026-11-26 (branch `agent/revo-markers`) — Revo's `marker_framework.mkf` decoded and used.
+  Layout verified on the three shell-part projects (u32 version 3, u32 count, 104-byte records:
+  centre f64x3 @0, unit normal f64x3 @24, radius f32 @92; on-preview markers 0.24–0.28 mm median
+  from `raw_preview.ply`, normals 1.4–2.1° median from the surface; markers off the preview are on
+  blocks Revo cropped): `docs/protocol/revo-marker-framework.md`, reader
+  `scancraft_io::read_marker_framework`. Marker maps moved from the session-only
+  `ScanCraftApp::marker_maps` into `ScanPass::markers` (`PassMarker`: centre, optional normal and
+  radius), saved as optional `pass-<id>/markers.json`, kept through tabs, undo, Add Project / Add
+  Passes, deletion and scaling. Import Scan reads an `.mkf` next to the file (toast says how many;
+  a broken one only warns). Make Solid uses a listed normal and only markers within 3 mm of the
+  pass's points. `real_data.rs` now judges poses against the marker fit (keys `<scan>_markers`,
+  or the `.mkf` beside a raw scan): 0.19–0.27° / 0.36–0.81 mm measured, limits 0.5° / 1.2 mm.
+  Tests: `scancraft-io` 29, `scancraft-align` 53 + 4 real-data (ignored, all pass), `scancraft-mesh`
+  51, `scancraft` 85.
