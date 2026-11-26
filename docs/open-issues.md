@@ -377,3 +377,101 @@ Deferred follow-up to `agent/sam-fast` (after the multi-object test scene in `ag
 - **Pre-capture gating / Live Preview prompting:** `preview_worker` does not accept SAM 2.1 clicks yet, and hitting **Start Capture** starts fusing immediately while `latest_ai` is still `None`, so background points are recorded until the user clicks the object in the Colour inset. Gate recording or allow clicking/locking the object mask in Live Preview first.
 - **Hold on lost mask:** in `worker.rs`, if SAM 2.1 loses tracking or dips below `min_iou`, the worker falls back to passing the unmasked depth frame through instead of holding/skipping fusion for that frame, letting background points leak in.
 - **Discoverability and live controls:** surface the live AI toggle more prominently when enabled, add a **Reset mask** button, and support Shift/right-click **Exclude** points in the live Colour view.
+
+## 4. Planned for later
+
+### 4.1 A real project file that opens with a double-click (user, 2026-11-26)
+
+**Wanted:** the user clicks a project file in Explorer and it opens in ScanCraft. Today a project
+is a folder (`project.json`, `pass-<id>/…`, `outputs/`, `crates/scancraft-io/src/project.rs`),
+and Open Project asks for that folder. Keep the format simple: plain, readable files, no
+encryption, nothing proprietary unless a requirement forces it. The user suggests two forms: a
+simple project file that lives in the project folder next to the scan data, and a full bundle
+that contains all the scan data in one file. Not started; needs a decision on the points at the
+end.
+
+**Form A: project file in the project folder** (for example `Part.scancraft` next to `pass-1/`,
+`outputs/`). The file is today's `project.json` under a registered extension, with relative paths
+only.
+
+| Pros | Cons |
+| --- | --- |
+| Saving stays incremental: only changed passes are rewritten (a project is easily 1–10 GB) | Moving or sharing means taking the whole folder |
+| No copy or extraction on open; large files stay memory-mappable | The file can be separated from its data: Open must say clearly what is missing |
+| Readable and diffable, easy to repair by hand or by an agent | Two files with the same name in one folder would share the data: one project per folder |
+| Backups and cloud sync only move what changed | |
+| Old projects migrate trivially (`project.json` is still read; save writes the new name) | |
+
+**Form B: bundle** (one file with everything). Proposal: a plain ZIP64 of the same folder layout
+(like `.3mf` or `.docx`), entries *stored* (point data barely compresses and stored entries can be
+read in place), the project JSON as the first entry, an optional SHA-256 per entry in it for
+integrity.
+
+| Pros | Cons |
+| --- | --- |
+| One file to send, archive or attach; nothing can go missing | Every save rewrites the whole file (minutes for GBs), needs twice the disk space and a temp-file + rename to be crash-safe |
+| Standard tools open it (any ZIP program); no custom container | Cloud sync and backups re-upload the whole file after each save |
+| Self-describing: the file says what it contains and checks itself | Editing in place is impractical: it has to be unpacked to a working folder anyway |
+| | Antivirus scans of large archives slow opening |
+
+**Recommendation (to discuss):** A is the working format and the default. B is for exchange:
+*Save as Bundle…* writes it from a project, and opening a bundle unpacks it into a project folder
+the user picks (or a cache folder, with a prompt to choose a place on the first save). So nobody
+ever edits a multi-GB archive in place. Raw stream recordings (several MB/s) stay out of bundles
+unless the user ticks them in.
+
+**Needed for either form:**
+- **File association:** the installer registers the extension per user (HKCU `Software\Classes`:
+  ProgID, icon, `scancraft.exe "%1"`). The app takes a project path as its argument.
+- **Single instance:** a second double-click must open the project as a tab in the running app
+  (local pipe or socket), not start a second app. Two apps could both try to talk to the scanner,
+  which breaks the one-client rule (HANDOFF §3).
+- **Project lock:** a lock file in the project folder so two apps (or PCs, via a share) don't save
+  over each other.
+- **Robustness:** atomic saves (write temp, then rename), a format version in the file, unknown
+  fields kept on save, and old folder projects keep opening.
+- **Later:** an Explorer thumbnail (a preview image in the folder or bundle).
+
+Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data folders.
+
+**Decided by the user (2026-11-26): build it as recommended.**
+- Extensions: `.scancraft` for the project file (form A) and `.scancraftz` for the bundle
+  (form B).
+- **Opening a bundle works on a working folder (a temporary form A):**
+  - Open unpacks the bundle into a working folder, and all work goes there.
+  - *Save* writes everything back into the bundle.
+  - Closing the tab removes the working folder.
+- **Bundle contents are chosen in a settings page** (future Settings menu). Each item says what
+  it is needed for (see below).
+
+**Design notes for the working folder:**
+- **Where:** a working-folder root set in Settings. It defaults to the user's local app data,
+  but scans are large, so it must be easy to move to a big drive. Show the space needed (the
+  bundle's size) and refuse with a clear message if it does not fit.
+- **Unpack lazily:** bundle entries are stored, not compressed, so large pass files can be read
+  straight from the bundle. Only files that change are written to the working folder
+  (copy-on-write).
+- **Save:** write a new bundle next to the old one (`*.scancraftz.tmp`), then rename it over
+  the old one.
+  - Changed files come from the working folder.
+  - Unchanged entries are copied raw from the old bundle, without decompressing anything.
+  - That keeps saves at disk speed and crash-safe.
+  - The working folder stays until the tab closes.
+- **Crash recovery:** a working folder records which bundle it belongs to and when that bundle
+  was last saved. On the next start the app offers to recover unsaved work (Open / Discard)
+  rather than deleting it.
+- **Save As Project Folder:** turns an opened bundle into a normal form-A project
+  (and *Save as Bundle…* goes the other way).
+- **The bundle is locked while it is open** (the same lock as for project folders), so a second
+  app or PC cannot open it for writing.
+
+**Bundle contents (settings, with the explanation shown to the user):**
+
+| Item | Needed for | Default |
+| --- | --- | --- |
+| Project file, pass surfaces and alignment, cleaned surfaces, object labels | Opening the project at all, merging, meshing | always |
+| Keyframes (depth frames and poses) | Continuing a pass, discarding frames, re-tracking, Same Position start, adding passes from it | on |
+| Colour keyframes | Colour, AI object segmentation | on |
+| Merged model and mesh | Opening with results ready; otherwise Merge / Reconstruct again (minutes) | on |
+| Marker maps | Make Solid marker removal, marker display | on |
+| Raw stream recordings | Replaying a scan for analysis or bug reports only; several MB per second | off |
