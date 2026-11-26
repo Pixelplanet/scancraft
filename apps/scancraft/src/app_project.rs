@@ -74,6 +74,62 @@ pub enum SolidInput {
     Cloud(PointCloud),
 }
 
+/// A listed marker lies on a pass's surface when one of its points is closer than this (mm).
+pub const MARKER_ON_SURFACE_MM: f32 = 3.0;
+
+/// For each marker of `map` (pass frame), the normal Make Solid uses for it, or `None` when it
+/// does not lie on `surfels` (no point within [`MARKER_ON_SURFACE_MM`]; Revo lists markers on
+/// parts it cut from the preview) or its centre is not finite. The normal is the listed one
+/// (Revo's marker file has it), else the sum of the surface normals around it (the solid's marker
+/// stage selects the sticker's points by it, then refines it).
+pub fn markers_on_surface(map: &[PassMarker], surfels: impl Iterator<Item = (Vec3, Vec3)>) -> Vec<Option<Vec3>> {
+    use std::collections::HashMap;
+    let r = MARKER_ON_SURFACE_MM;
+    let cell = |p: Vec3| (p / r).floor().as_ivec3();
+    // Each marker in the cells around its own, so one lookup per point finds every marker that
+    // can be within `r`.
+    let mut cells: HashMap<glam::IVec3, Vec<usize>> = HashMap::new();
+    let (mut lo, mut hi) = (Vec3::splat(f32::MAX), Vec3::splat(f32::MIN));
+    for (k, m) in map.iter().enumerate().filter(|(_, m)| m.centre.is_finite()) {
+        let c = cell(m.centre);
+        for d in (-1..=1).flat_map(|x| (-1..=1).flat_map(move |y| (-1..=1).map(move |z| glam::IVec3::new(x, y, z)))) {
+            cells.entry(c + d).or_default().push(k);
+        }
+        lo = lo.min(m.centre - r);
+        hi = hi.max(m.centre + r);
+    }
+    let mut near = vec![false; map.len()];
+    let mut normal_sum = vec![Vec3::ZERO; map.len()];
+    if !cells.is_empty() {
+        for (p, n) in surfels.filter(|(p, _)| p.cmpge(lo).all() && p.cmple(hi).all()) {
+            for &k in cells.get(&cell(p)).into_iter().flatten() {
+                if p.distance_squared(map[k].centre) < r * r {
+                    near[k] = true;
+                    normal_sum[k] += n;
+                }
+            }
+        }
+    }
+    map.iter()
+        .zip(near.into_iter().zip(normal_sum))
+        .map(|(m, (near, sum))| {
+            let n = m.normal.unwrap_or(sum);
+            (near && m.centre.is_finite() && n.is_finite() && n.length() > 1e-3).then_some(n)
+        })
+        .collect()
+}
+
+/// Which of a pass's markers Make Solid would use, for the interface (see
+/// [`ScanCraftApp::marker_use`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkerUse {
+    key: u64,
+    /// Per marker: on the pass's scanned surface (table and blocks included).
+    pub on_scan: Vec<bool>,
+    /// Per marker: on the isolated object; `None` until the pass's object has been isolated.
+    pub on_object: Option<Vec<bool>>,
+}
+
 /// The solid's input points, its listed markers and the scan priority (most trusted first;
 /// `None` when all passes weigh the same). Runs in the background job.
 pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint>, Vec<scancraft_mesh::solid::markers::Marker>, Option<Vec<u8>>), String> {
@@ -104,22 +160,12 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
                     isolation::mask_for(mask, &oriented).keep(surfels)
                 };
                 let m = t.to_mat4();
-                // Only markers on the pass's own (object) surface: within 3 mm of its points. A
-                // marker's normal is the listed one (Revo's marker file has it), else the pass's
-                // surface around it (the solid's marker stage selects the sticker's points by it,
-                // then refines it).
-                for (k, marker) in map.iter().enumerate() {
-                    let c = marker.centre;
-                    let near = || surfels.iter().filter(move |s| s.0.distance_squared(c) < 9.0);
-                    let n = match marker.normal {
-                        Some(n) if near().next().is_some() => n,
-                        Some(_) => Vec3::ZERO,
-                        None => near().map(|s| s.1).sum(),
-                    };
-                    if c.is_finite() && n.length() > 1e-3 {
+                let normals = markers_on_surface(map, surfels.iter().map(|s| (s.0, s.1)));
+                for (k, (marker, n)) in map.iter().zip(normals).enumerate() {
+                    if let Some(n) = n {
                         markers.push(Marker {
                             id: format!("S{scan}-M{k}"),
-                            center: m.transform_point3(c),
+                            center: m.transform_point3(marker.centre),
                             normal: (t.rotation * n).normalize(),
                             scan: Some(*scan),
                             source: MarkerSource::List,
@@ -364,6 +410,66 @@ impl ScanCraftApp {
     }
 
     /// Make Solid's input (see [`SolidInput`]): the included, placed passes, as Merge takes them.
+    /// Which of `pass`'s markers lie on its scan and on its isolated object, as Make Solid filters
+    /// them ([`markers_on_surface`]). Computed once per content of the pass (its points, markers
+    /// and isolation) and cached. `None` while the pass is being captured (the tracker's markers
+    /// are triangulated on its surface) or when it has no markers.
+    pub fn marker_use(&self, pass: &ScanPass) -> Option<Arc<MarkerUse>> {
+        use std::hash::{Hash, Hasher};
+        if pass.markers.is_empty() || (self.active_pass == Some(pass.id) && self.capture != super::Capture::Idle) {
+            return None;
+        }
+        let mask = isolation::cached(&pass.mask);
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (pass.layer.generation, pass.layer.len(), mask.as_ref().map(|m| (m.key, m.object.len()))).hash(&mut h);
+        pass.edit.as_ref().map(Arc::as_ptr).hash(&mut h);
+        pass.surface.as_ref().map(Arc::as_ptr).hash(&mut h);
+        for m in &pass.markers {
+            m.centre.to_array().map(f32::to_bits).hash(&mut h);
+            m.normal.map(|n| n.to_array().map(f32::to_bits)).hash(&mut h);
+        }
+        let key = h.finish();
+        let mut cache = self.marker_use.lock().ok()?;
+        if let Some(u) = cache.get(&pass.id).filter(|u| u.key == key) {
+            return Some(Arc::clone(u));
+        }
+        // Without waiting for a tracker a background job holds (asked again next frame).
+        let surfels: Vec<(Vec3, Vec3, u32)> = match pass.source() {
+            PassSource::Tracked(t) => t.try_lock().ok()?.fused_surfels().iter().map(|s| (s.position, s.normal.normalize_or_zero(), s.count)).collect(),
+            source => source.surfels().ok()?,
+        };
+        let on =|normals: Vec<Option<Vec3>>| normals.iter().map(Option::is_some).collect::<Vec<bool>>();
+        let on_scan = on(markers_on_surface(&pass.markers, surfels.iter().map(|s| (s.0, s.1))));
+        // The object as Make Solid isolates it, if it has been isolated for these surfels.
+        let fingerprint = || isolation::fingerprint(surfels.iter().map(|s| s.0));
+        let on_object = mask.filter(|m| m.object.len() == surfels.len() && m.key == fingerprint()).map(|m| {
+            let kept = surfels.iter().zip(&m.object).filter(|(_, o)| **o).map(|(s, _)| (s.0, s.1));
+            on(markers_on_surface(&pass.markers, kept))
+        });
+        let u = Arc::new(MarkerUse { key, on_scan, on_object });
+        cache.insert(pass.id, Arc::clone(&u));
+        Some(u)
+    }
+
+    /// The listed markers Make Solid would use from the included, placed passes, and whether the
+    /// number is exact (`false`: a pass is not isolated yet, so its markers on the table and
+    /// blocks are still counted).
+    pub fn solid_marker_count(&self) -> (usize, bool) {
+        let mut exact = true;
+        let mut count = 0;
+        for p in self.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()) {
+            match self.marker_use(p) {
+                Some(u) => {
+                    let on = if self.settings.whole_scene { Some(&u.on_scan) } else { u.on_object.as_ref() };
+                    exact &= on.is_some();
+                    count += on.unwrap_or(&u.on_scan).iter().filter(|o| **o).count();
+                }
+                None => count += p.markers.len(),
+            }
+        }
+        (count, exact)
+    }
+
     pub(super) fn solid_input(&self) -> SolidInput {
         let placed: Vec<&ScanPass> = self.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).collect();
         if placed.is_empty() {
@@ -1069,10 +1175,22 @@ impl ScanCraftApp {
             Some((file, Some(e))) => (Tone::Warning, format!("; its {file} could not be read, so it has no markers ({e})")),
         };
         self.say(tone, format!("Imported {name} · {} points, {normals}{marker_note}. Next: clean it, then Align All", thousands(points)));
+        let no_markers = match &scan.marker_file {
+            Some((file, Some(_))) => Some(format!("{name} was imported without markers: its {file} could not be read")),
+            _ => None,
+        };
         if scan.likely_metres {
-            self.show_choice_toast(format!("{name} is under {} units across, so probably in metres.", crate::imports::METRES_MAX_EXTENT), ToastAction::MetresToMm(id));
-        } else if let Some((file, Some(_))) = &scan.marker_file {
-            self.show_toast(format!("{name} was imported without markers: its {file} could not be read"));
+            let metres = format!("{name} is under {} units across, so probably in metres.", crate::imports::METRES_MAX_EXTENT);
+            // Both in the one toast, and the marker warning outlasts the choice.
+            match no_markers {
+                Some(note) => {
+                    self.show_choice_toast(format!("{metres} {note}."), ToastAction::MetresToMm(id));
+                    self.toast_note = Some(note);
+                }
+                None => self.show_choice_toast(metres, ToastAction::MetresToMm(id)),
+            }
+        } else if let Some(note) = no_markers {
+            self.show_toast(note);
         }
     }
 

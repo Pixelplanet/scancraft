@@ -31,6 +31,7 @@ mod project_ops;
 #[path = "app_tabs.rs"]
 mod tab_ops;
 pub use orient_ops::{DatumKind, DatumPicking, OrientPreview, ScalePicking};
+pub use project_ops::MarkerUse;
 pub use tab_ops::{ClosePrompt, ProjectTab};
 
 /// Live capture state.
@@ -420,6 +421,9 @@ pub struct ScanCraftApp {
     pub toast: Option<(String, Instant)>,
     /// What the toast offers besides Undo.
     pub toast_action: Option<ToastAction>,
+    /// A warning the choice toast also gives, said again after its choice runs (the choice's own
+    /// status message would otherwise replace it).
+    toast_note: Option<String>,
     /// Dropped scan files and project folders still to add, one job each.
     pending_imports: std::collections::VecDeque<std::path::PathBuf>,
     /// The open file / folder dialog, if any.
@@ -453,6 +457,11 @@ pub struct ScanCraftApp {
     paused_flag: Arc<AtomicBool>,
     /// The pass the next capture continues, if any.
     continue_pass: Option<u32>,
+    /// The marker map the running capture's pass had when the capture started (Continue Pass):
+    /// the new capture's marker tracker starts empty, so its map is merged into this one.
+    capture_markers: Vec<project::PassMarker>,
+    /// Per pass: which of its markers Make Solid would use (see `marker_use`).
+    marker_use: std::sync::Mutex<HashMap<u32, Arc<MarkerUse>>>,
     /// The selected keyframe's points, drawn over the model.
     pub highlight: Option<Highlight>,
     /// When the tracker last reported a re-location.
@@ -557,6 +566,7 @@ impl ScanCraftApp {
             pending_undo: None,
             toast: None,
             toast_action: None,
+            toast_note: None,
             pending_imports: Default::default(),
             picker: Default::default(),
             colour_passes: true,
@@ -580,6 +590,8 @@ impl ScanCraftApp {
             mock_modes: None,
             paused_flag: Arc::new(AtomicBool::new(false)),
             continue_pass: None,
+            capture_markers: Vec::new(),
+            marker_use: Default::default(),
             highlight: None,
             relocated_at: None,
             overlay: None,
@@ -624,6 +636,7 @@ impl ScanCraftApp {
     pub fn show_toast(&mut self, message: impl Into<String>) {
         self.toast = Some((message.into(), Instant::now()));
         self.toast_action = None;
+        self.toast_note = None;
     }
 
     /// A message over the view that also offers `action`.
@@ -642,8 +655,12 @@ impl ScanCraftApp {
     pub fn run_toast_action(&mut self) {
         let Some(action) = self.toast_action.take() else { return };
         self.toast = None;
+        let note = self.toast_note.take();
         match action {
             ToastAction::MetresToMm(id) => self.scale_pass(id, 1000.0),
+        }
+        if let Some(note) = note {
+            self.say(Tone::Warning, format!("{} · {note}", self.status));
         }
     }
 
@@ -1072,9 +1089,11 @@ impl ScanCraftApp {
                     let (id, tracker, verb) = match continued {
                         Some(pass) => {
                             pass.layer.visible = true;
+                            self.capture_markers = pass.markers.iter().map(|m| project::PassMarker { matched: false, ..*m }).collect();
                             (pass.id, pass.tracker.clone(), "Continuing")
                         }
                         None => {
+                            self.capture_markers.clear();
                             let id = self.next_pass_id;
                             self.next_pass_id += 1;
                             let generation = self.generation();
@@ -1177,6 +1196,17 @@ impl ScanCraftApp {
         }
     }
 
+    /// The running capture's marker tracker map (pass frame), merged into the markers its pass had
+    /// when the capture started (see [`project::PassMarker::merged`]).
+    fn apply_capture_marker_map(&mut self, map: &[([f32; 3], bool)]) {
+        if map.is_empty() {
+            return;
+        }
+        if let Some(pass) = self.active_pass.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)) {
+            pass.markers = project::PassMarker::merged(&self.capture_markers, map);
+        }
+    }
+
     pub fn poll_updates(&mut self, ctx: &egui::Context) {
         let Some(rx) = self.updates.as_mut() else { return };
         let mut updates = Vec::new();
@@ -1230,11 +1260,7 @@ impl ScanCraftApp {
                 self.rates = u.rates;
             }
             if let Some(o) = u.overlay {
-                if let Some(pass) = self.active_pass.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)) {
-                    if !o.map.is_empty() {
-                        pass.markers = o.map.iter().map(|(c, matched)| project::PassMarker::tracked(*c, *matched)).collect();
-                    }
-                }
+                self.apply_capture_marker_map(&o.map);
                 self.overlay = Some(o);
             }
             if !u.keyframes.is_empty() {
@@ -3500,6 +3526,56 @@ mod tests {
         assert_eq!(markers.len(), 2, "the marker off the surface is left out");
         assert!(markers[0].normal.dot(tilted) > 0.9999 && (markers[0].radius_mm - 3.05).abs() < 1e-6);
         assert!(markers[1].normal.dot(glam::Vec3::Z) > 0.99 && markers[1].radius_mm == 0.0);
+        // The panel counts and the view draws what Make Solid uses, not the whole list.
+        assert_eq!(app.solid_marker_count(), (2, true));
+        assert_eq!(app.marker_use(&app.passes[0]).unwrap().on_scan, vec![true, true, false]);
+        // On the object only: an upper bound until the pass is isolated, then the solid's number.
+        app.settings.whole_scene = false;
+        *app.passes[0].mask.lock().unwrap() = None;
+        assert_eq!(app.solid_marker_count(), (2, false));
+        let (_, markers, _) = project_ops::solid_points(app.solid_input()).unwrap();
+        assert_eq!(app.solid_marker_count(), (markers.len(), true));
+        // The cache follows the markers.
+        app.passes[0].markers.pop();
+        app.passes[0].markers.push(PassMarker::tracked([5.0, 0.0, 40.0], false));
+        assert_eq!(app.marker_use(&app.passes[0]).unwrap().on_scan, vec![true, true, true]);
+    }
+
+    #[test]
+    fn markers_on_surface_matches_a_brute_force_search() {
+        // Points on a 1 mm grid of the plane z = 0, markers at assorted heights and positions.
+        let points: Vec<(glam::Vec3, glam::Vec3)> = (0..60 * 60).map(|i| (glam::Vec3::new((i % 60) as f32, (i / 60) as f32, 0.0), glam::Vec3::Z)).collect();
+        let map: Vec<PassMarker> = [[10.0, 10.0, 0.5], [10.0, 10.0, 2.9], [10.0, 10.0, 3.1], [-2.5, 30.0, 0.0], [-3.5, 30.0, 0.0], [59.0, 59.0, -2.0], [f32::NAN, 0.0, 0.0], [200.0, 0.0, 0.0]]
+            .iter()
+            .map(|c| PassMarker::tracked(*c, false))
+            .collect();
+        let got = project_ops::markers_on_surface(&map, points.iter().copied());
+        let expected: Vec<bool> = map.iter().map(|m| points.iter().any(|(p, _)| p.distance_squared(m.centre) < 9.0)).collect();
+        assert_eq!(got.iter().map(Option::is_some).collect::<Vec<_>>(), expected);
+        assert_eq!(expected, vec![true, true, false, true, false, true, false, false]);
+        assert!(got[0].unwrap().normalize().dot(glam::Vec3::Z) > 0.999);
+    }
+
+    #[test]
+    fn a_metres_scan_with_a_broken_marker_file_still_says_it_has_no_markers() {
+        let dir = temp_dir("metres-broken-mkf");
+        let scan = write_scan(&dir);
+        std::fs::write(dir.join(scancraft_io::revo::MARKER_FRAMEWORK_FILE), b"not a marker file").unwrap();
+        let mut app = app();
+        app.import_scan(scan);
+        finish_job(&mut app);
+        assert_eq!(app.passes.len(), 1, "{}", app.status);
+        let toast = app.current_toast().unwrap_or_default().to_string();
+        assert!(toast.contains("metres") && toast.contains("without markers"), "{toast}");
+        assert!(app.toast_action.is_some());
+        app.run_toast_action();
+        assert!(app.status.contains("by 1000") && app.status.contains("without markers"), "{}", app.status);
+        assert_eq!(app.tone, Tone::Warning);
+        // Another toast drops the note: it belongs to that choice only.
+        app.show_choice_toast("again", ToastAction::MetresToMm(app.passes[0].id));
+        app.run_toast_action();
+        assert!(!app.status.contains("without markers"), "{}", app.status);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -3727,6 +3803,8 @@ mod tests {
         let peak_after_solid = peak_working_set_mb();
         let analysis = Mesher::analyze(&solid.mesh);
         let r = &solid.report;
+        // The panel's count (now that the passes are isolated) is what Make Solid used.
+        assert_eq!(app.solid_marker_count(), (r.markers_listed, true), "the Make Solid panel's marker count");
         scancraft_io::save_mesh_ply_binary(&solid.mesh, out.join("solid.ply")).unwrap();
         std::fs::write(out.join("solid_report.json"), r.to_json()).unwrap();
         let faired: Vec<&str> = r.marker_outcomes.iter().filter(|o| o.fair.as_ref().is_some_and(|f| f.status == "faired")).map(|o| o.id.as_str()).collect();
@@ -3906,6 +3984,61 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(rgb_count > 0, "expected captured RGB keyframes on MockDevice");
+    }
+
+    #[test]
+    fn continue_pass_adds_to_the_pass_marker_map_instead_of_replacing_it() {
+        let mut app = app();
+        app.connect_mock();
+        let wait = |app: &mut ScanCraftApp, done: &dyn Fn(&ScanCraftApp) -> bool, what: &str| {
+            let t0 = Instant::now();
+            while !done(app) {
+                assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+                app.poll_device_events();
+                app.poll_updates(&egui::Context::default());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+        wait(&mut app, &|a| a.connection.is_some(), "the simulator");
+        app.start_scan();
+        // A pass that fused nothing is dropped when the capture stops.
+        wait(&mut app, &|a| a.passes.first().is_some_and(|p| p.layer.len() > 0), "the first capture's points");
+        app.stop_scan();
+        wait(&mut app, &|a| a.capture == Capture::Idle, "the first capture to stop");
+        let id = app.passes[0].id;
+        // The pass's map as saved (or from the first capture of this session).
+        let saved = [[0.0, 0.0, 0.0], [20.0, 0.0, 0.0], [0.0, 20.0, 0.0]];
+        app.passes[0].markers = saved.iter().map(|c| PassMarker::tracked(*c, false)).collect();
+        app.continue_scan(id);
+        wait(&mut app, &|a| a.capture == Capture::Running, "Continue Pass");
+        assert_eq!(app.active_pass, Some(id));
+        // The new capture's tracker has triangulated two markers: one already in the map (1 mm
+        // off, matched this frame) and a new one.
+        app.apply_capture_marker_map(&[([20.0, 1.0, 0.0], true), ([40.0, 40.0, 0.0], false)]);
+        let markers = &app.passes[0].markers;
+        assert_eq!(markers.len(), 4, "{markers:?}");
+        assert_eq!(markers[..3].iter().map(|m| m.centre.to_array()).collect::<Vec<_>>(), saved.to_vec(), "the saved markers are kept as they were");
+        assert_eq!(markers.iter().map(|m| m.matched).collect::<Vec<_>>(), vec![false, true, false, false]);
+        assert_eq!(markers[3].centre, glam::Vec3::new(40.0, 40.0, 0.0));
+        // A later frame with a larger tracker map still merges into the map the pass started with.
+        app.apply_capture_marker_map(&[([20.0, 1.0, 0.0], false), ([40.0, 40.0, 0.0], true), ([0.0, 40.0, 0.0], true)]);
+        assert_eq!(app.passes[0].markers.len(), 5);
+        app.stop_scan();
+        wait(&mut app, &|a| a.capture == Capture::Idle, "Continue Pass to stop");
+        assert_eq!(app.passes[0].markers.len(), 5);
+        assert!(app.passes[0].markers.iter().all(|m| !m.matched));
+    }
+
+    #[test]
+    fn merged_marker_maps_keep_the_base_and_add_only_new_stickers() {
+        let base = vec![PassMarker { centre: glam::Vec3::new(1.0, 2.0, 3.0), normal: Some(glam::Vec3::Z), radius_mm: Some(3.05), matched: false }];
+        // Within SAME_MARKER_MM: the same sticker (the listed one with its normal is kept).
+        let merged = PassMarker::merged(&base, &[([1.0, 2.0, 5.5], true)]);
+        assert_eq!(merged, vec![PassMarker { matched: true, ..base[0] }]);
+        // Farther: another sticker.
+        assert_eq!(PassMarker::merged(&base, &[([1.0, 2.0, 7.0], true)]).len(), 2);
+        // A first capture (no base) takes the tracker's map as it is.
+        assert_eq!(PassMarker::merged(&[], &[([0.0; 3], true), ([1.0, 0.0, 0.0], false)]).len(), 2);
     }
 
     #[test]

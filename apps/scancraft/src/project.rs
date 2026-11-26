@@ -183,6 +183,10 @@ pub struct PassMarker {
     pub matched: bool,
 }
 
+/// Two marker centres closer than this (mm) are one sticker (stickers are about 6 mm across, so
+/// two different ones are farther apart).
+pub const SAME_MARKER_MM: f32 = 3.0;
+
 impl PassMarker {
     /// A marker of the tracker's map.
     pub fn tracked(centre: [f32; 3], matched: bool) -> Self {
@@ -208,6 +212,21 @@ impl PassMarker {
             radius_mm: self.radius_mm.map(|r| r * factor.abs()),
             matched: self.matched,
         }
+    }
+
+    /// A pass's marker map while capturing: the markers it had when the capture started (`base`,
+    /// kept as they are) and those of the capture's tracker map (`tracked`, pass frame) that are
+    /// not within [`SAME_MARKER_MM`] of one of them. A base marker counts as matched when a
+    /// matched tracker marker lies that close. The capture's tracker starts with an empty map, so
+    /// on Continue Pass its map alone would drop every marker the pass already had.
+    pub fn merged(base: &[PassMarker], tracked: &[([f32; 3], bool)]) -> Vec<PassMarker> {
+        let near = |a: Vec3, b: Vec3| a.distance_squared(b) < SAME_MARKER_MM * SAME_MARKER_MM;
+        let mut out: Vec<PassMarker> = base
+            .iter()
+            .map(|m| PassMarker { matched: tracked.iter().any(|(c, matched)| *matched && near(m.centre, Vec3::from_array(*c))), ..*m })
+            .collect();
+        out.extend(tracked.iter().filter(|(c, _)| !base.iter().any(|m| near(m.centre, Vec3::from_array(*c)))).map(|(c, matched)| PassMarker::tracked(*c, *matched)));
+        out
     }
 
     fn record(&self) -> MarkerRecord {

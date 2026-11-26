@@ -53,7 +53,7 @@ pub fn read_marker_framework(path: &Path) -> Result<Vec<RevoMarker>, IoError> {
 }
 
 /// Parses the bytes of a `marker_framework.mkf`. The length must be exactly the header plus
-/// `count` records, every centre finite and every normal of (nearly) unit length.
+/// `count` records, every centre finite (also as f32) and every normal of (nearly) unit length.
 pub fn parse_marker_framework(bytes: &[u8]) -> Result<Vec<RevoMarker>, IoError> {
     if bytes.len() < HEADER_BYTES {
         return Err(IoError::Truncated(format!("{} bytes, shorter than the {HEADER_BYTES}-byte header", bytes.len())));
@@ -78,8 +78,9 @@ pub fn parse_marker_framework(bytes: &[u8]) -> Result<Vec<RevoMarker>, IoError> 
         let normal = [f64_at(24), f64_at(32), f64_at(40)];
         let radius_mm = f32_at(92);
         let length = normal.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if !centre.iter().all(|v| v.is_finite()) {
-            return Err(IoError::Parse(format!("marker {k} has no finite centre")));
+        // The app keeps centres as f32: a value past its range would become infinite there.
+        if !centre.iter().all(|v| v.is_finite() && v.abs() <= f32::MAX as f64) {
+            return Err(IoError::Parse(format!("marker {k} has no finite centre in the f32 range")));
         }
         let unit = (length - 1.0).abs() < 1e-3;
         if !unit {
@@ -161,8 +162,14 @@ mod tests {
         let mut b = good.clone();
         b[0..4].copy_from_slice(&4u32.to_le_bytes());
         assert!(matches!(parse_marker_framework(&b), Err(IoError::Unsupported(_))));
-        // A normal that is not a unit vector, a centre that is not finite, a negative radius.
-        for bad in [([1.0, 2.0, 3.0], [0.0, 0.0, 2.0], 3.0), ([f64::NAN, 2.0, 3.0], [0.0, 0.0, 1.0], 3.0), ([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], -1.0)] {
+        // A normal that is not a unit vector, a centre that is not finite (as f64 or as f32), a
+        // negative radius.
+        for bad in [
+            ([1.0, 2.0, 3.0], [0.0, 0.0, 2.0], 3.0),
+            ([f64::NAN, 2.0, 3.0], [0.0, 0.0, 1.0], 3.0),
+            ([1.0, -1e300, 3.0], [0.0, 0.0, 1.0], 3.0),
+            ([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], -1.0),
+        ] {
             assert!(parse_marker_framework(&mkf(&[bad])).is_err(), "{bad:?}");
         }
         // Random bytes of every length up to a few records never panic.
