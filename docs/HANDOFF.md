@@ -10,6 +10,16 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-26 (branch `agent/project-file`, not merged): projects open with a
+double-click.** A project is a folder with `<name>.scancraft` (older `project.json` folders still
+open) or one `.scancraftz` bundle, which the app unpacks into a working folder while its tab is
+open and writes back on Save. Open Project… takes either; the Save Project card saves as a folder
+or a bundle (and moves the tab there); projects are locked while open; working folders left by a
+crash are offered for recovery at start; `scancraft.exe <path>` opens a project and a second start
+hands it to the running app (one app per user, so two apps never use the scanner). The installer
+registers both file types. Details, decisions and what is left: [open-issues.md](open-issues.md)
+4.1; layout: [architecture/scan-sessions.md](architecture/scan-sessions.md) section 8.
+
 **Update 2026-11-24 late (original PC): start with [open-issues.md](open-issues.md).** The branch
 below is merged into `main`. A review found bugs in it, and the new mesher was compared with the
 old one on the Revo shell scans. It is smoother on plain areas but destroys small raised detail.

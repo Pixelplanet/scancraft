@@ -258,17 +258,20 @@ pub fn tracker_config(scan_config: &ScanConfig, device: Option<&DeviceInfo>) -> 
     }
 }
 
-/// Name, folder and save state of the open project.
+/// Name, place on disk and save state of the open project.
 pub struct ProjectInfo {
     pub name: String,
+    /// The project folder, or the bundle file of a bundle tab; `None` until first saved.
     pub path: Option<PathBuf>,
     /// The geometry generation when it was last saved or opened.
     pub saved_generation: u64,
+    /// Its lock, and a bundle's working folder (`crate::storage`).
+    pub store: crate::storage::Store,
 }
 
 impl Default for ProjectInfo {
     fn default() -> Self {
-        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0 }
+        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0, store: crate::storage::Store::None }
     }
 }
 

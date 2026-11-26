@@ -410,3 +410,14 @@ laser model are not built.
   manifest, contents filter, save-back with raw copies of unchanged entries), working folders
   with crash recovery, lock files. `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`;
   status and what is left in `docs/open-issues.md` 4.1.
+- 2026-11-26 (later) — Project file format, step 2 (app side, branch `agent/project-file`, not
+  merged or pushed): Open Project… takes `.scancraft` / `.scancraftz` / `project.json`; bundle
+  tabs work in a working folder (`apps/scancraft/src/storage.rs`, `app_project.rs`); the Save
+  Project card saves as folder or bundle (Save As Project Folder / Save as Bundle… move the tab);
+  locks taken on open and save; tab close and quit remove working folders; crash recovery
+  question at start; bundle contents and working-folder root kept in
+  `%LOCALAPPDATA%\ScanCraft\settings.json`; `scancraft.exe <path>` (`cli.rs`); single instance
+  over loopback with a per-launch token (`single_instance.rs`); file association in
+  `packaging/windows/install.ps1` / `uninstall.ps1` (not run). Not tested with a real window or
+  double-click. Status in `docs/open-issues.md` 4.1. The user's report about marker depressions
+  and cross-line laser artifacts on the top surface of the part was not addressed in this track.

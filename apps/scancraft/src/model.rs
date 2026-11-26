@@ -554,7 +554,9 @@ pub enum JobResult {
         ok: bool,
     },
     Merged { cloud: PointCloud, passes: Vec<u32>, message: String },
-    Saved { path: std::path::PathBuf, name: String, message: String },
+    /// `store`: the project's new place on disk (it moved to another folder or bundle), `None`
+    /// when it was saved where it already was.
+    Saved { path: std::path::PathBuf, name: String, message: String, store: Option<crate::storage::Store> },
     Opened(Box<OpenedProject>),
     /// A scan file read as a new pass.
     Imported(Box<crate::imports::ImportedScan>),
@@ -564,7 +566,12 @@ pub enum JobResult {
 
 /// A project read from disk with its trackers rebuilt.
 pub struct OpenedProject {
+    /// The project folder, or the bundle file.
     pub path: std::path::PathBuf,
+    /// Its lock, or the bundle's working folder.
+    pub store: crate::storage::Store,
+    /// Recovered from a working folder left by a crash: it holds unsaved changes.
+    pub recovered: bool,
     pub name: String,
     pub next_pass_id: u32,
     pub passes: Vec<crate::project::LoadedPass>,

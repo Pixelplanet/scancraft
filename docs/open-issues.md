@@ -380,15 +380,15 @@ Deferred follow-up to `agent/sam-fast` (after the multi-object test scene in `ag
 
 ## 4. Planned for later
 
-### 4.1 A real project file that opens with a double-click (user, 2026-11-26)
+### 4.1 A real project file that opens with a double-click (user, 2026-11-26) — done (steps 1 and 2)
 
 **Wanted:** the user clicks a project file in Explorer and it opens in ScanCraft. Today a project
 is a folder (`project.json`, `pass-<id>/…`, `outputs/`, `crates/scancraft-io/src/project.rs`),
 and Open Project asks for that folder. Keep the format simple: plain, readable files, no
 encryption, nothing proprietary unless a requirement forces it. The user suggests two forms: a
 simple project file that lives in the project folder next to the scan data, and a full bundle
-that contains all the scan data in one file. Not started; needs a decision on the points at the
-end.
+that contains all the scan data in one file. (Built: see the two status notes at the end of this
+section.)
 
 **Form A: project file in the project folder** (for example `Part.scancraft` next to `pass-1/`,
 `outputs/`). The file is today's `project.json` under a registered extension, with relative paths
@@ -508,9 +508,67 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
   holds it (`IoError::Locked`), another host's lock counts as live until `take_over`.
 - Zip crate: `zip` 0.6.6 (MIT, already in the lock file), recorded in `apps/scancraft/ATTRIBUTION.md`.
 
+**Status 2026-11-26: step 2 (app side, `apps/scancraft`) done.**
+- **Open Project…** picks a `.scancraft` file, a `.scancraftz` bundle or an older project's
+  `project.json` (the dialog picks files; `storage::OpenTarget`). A bundle is unpacked into a
+  working folder under the working-folder root and the tab works there; the tab shows a small box
+  before its name and names the bundle and the working folder on hover. A project that is open in
+  a tab already is switched to. Project files and bundles dropped on the window open the same way
+  (scan files and project folders are still added as passes).
+- **Save Project** card: *Save as* Project folder / Bundle (one file). Saving where the project
+  is writes it there (a bundle tab: into the working folder, then `WorkFolder::save` back into the
+  bundle). Saving anywhere else moves the tab there: **Save As Project Folder** of a bundle tab
+  (the working folder is removed, the bundle unlocked) and **Save as Bundle…** of any project (a
+  folder project or a new one gets a new working folder, `WorkFolder::create`). Files the app does
+  not hold in memory (raw recordings) are copied over (`workdir::copy_item_files`). A save into
+  the working-folder root is refused (closing a tab removes its working folder). A bundle replaced
+  behind the app's back refuses Save (`Conflict`) with a message; Save as Bundle… under a new name
+  keeps both (there is no "save anyway" button yet).
+- **Closing a tab** (after the Save / Discard / Cancel question when it has changes) releases the
+  lock and removes a bundle's working folder; quitting does the same for every tab. Quit's
+  **Save All** saves bundle tabs into their bundles.
+- **Locks:** opening or saving a folder project takes `.scancraft.lock`; opening a bundle takes
+  `<bundle>.lock` (through `WorkFolder`). A project open in another app or on another PC is
+  refused with who holds it; one open in another window of this process says "already open".
+- **Settings:** there is no Settings window yet, so the bundle contents (each item with its
+  "Needed for" text as the tooltip; the core item shown ticked and disabled) and the
+  working-folder root (*Unpack into*, with a Browse button and the free space in the tooltip) are
+  in the Save Project card when *Bundle* is chosen. They are kept in
+  `%LOCALAPPDATA%\ScanCraft\settings.json` (`storage::Prefs`; unknown keys kept). The app had no
+  persisted settings before; the other settings still are not kept.
+- **Crash recovery:** at start (not in `--auto` runs) the working folders under the root are
+  checked (`check_leftovers`). Leftovers with nothing unsaved (and an unchanged bundle) and
+  stopped removals are removed quietly; the others are listed in one question (*Recover Unsaved
+  Work*: Open / Later / Discard, `kit::confirm_modal`). Open opens each as a tab with its changes
+  (marked unsaved; Save writes them into the bundle). Folders of a running ScanCraft and folders
+  without a state file are never touched.
+- **Command line:** `scancraft.exe <path>` opens a project file, bundle or project folder
+  (`cli.rs`; `--open <path>` still works; `--mock`, `--connect`, `--replay`, `--auto`,
+  `--mock-modes`, `--demo-project` unchanged).
+- **Single instance** (`single_instance.rs`): the first app takes
+  `%LOCALAPPDATA%\ScanCraft\instance.lock` and listens on a loopback port (127.0.0.1, chosen by
+  the system), with port and a 256-bit per-launch token in `instance.json` (the user's own
+  folder; 0600 on Unix). A later start sends `{token, open}` and ends; the running app checks the
+  token and accepts only an absolute, existing `.scancraft` / `.scancraftz` / project folder, then
+  opens it as a tab (queued like a picked project while busy) and comes to the front. A start
+  without a path only brings the window to the front. `--new-instance`, `--auto` and
+  `--demo-project` skip this. If the running app does not answer, the new start runs alone (and
+  says so in the log). **Scanner:** with two apps (only possible with `--new-instance`), the
+  driver's scanner lock (`scanner_lock.rs`, taken when a stream starts) still refuses the second
+  stream, so the one-client rule holds; connecting (control CGI only) is not locked.
+- **Installer:** `install.ps1` registers `.scancraft` (`ScanCraft.Project`) and `.scancraftz`
+  (`ScanCraft.Bundle`) under `HKCU\Software\Classes` (icon, `"scancraft.exe" "%1"`,
+  `OpenWithProgids`) and tells Explorer (`SHChangeNotify`); `uninstall.ps1` removes them, and with
+  `-RemoveData` asks before deleting working folders. Neither was run (parsed only).
+- Tests (`cargo test --release -p scancraft -p scancraft-io`): open / save of both forms through
+  the app, tab close and quit clean the working folder, Save All on a bundle tab, a lock from
+  another PC refused, recovery detection / Open / Discard, CLI parsing, the single-instance
+  hand-over (token, path checks) without a window, preferences.
+
 Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
-is unpacked at disk speed), keeping unknown project-file fields on save, tested sizes above 4 GiB
-(ZIP64 is written by the zip crate but not exercised by a test), and all of the app side: Open /
-Save / Save as Bundle… / Save As Project Folder in the UI, the contents settings page, the
-crash-recovery prompt, locking form-A folders when a tab opens them, file association in
-`install.ps1`, the command-line path and single instance.
+is unpacked at disk speed); keeping unknown project-file fields on save; sizes above 4 GiB
+untested; a real Settings window (the bundle options live in the Save card); a "save anyway"
+answer to a bundle changed by someone else and a "take over" answer to a lock from another PC
+(`LockFile::take_over` exists); Add Project with a bundle (refused: not a project folder); the
+single-instance check and the file association are not tested by a real double-click (no GUI runs
+on this PC during the benchmarks); an Explorer thumbnail.

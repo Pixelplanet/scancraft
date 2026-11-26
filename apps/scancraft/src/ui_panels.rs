@@ -795,13 +795,86 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         Tool::Scale(id) => crate::ui_orient::scale_form(app, ui, id),
         Tool::IsolateObject => isolate_form(app, ui),
         Tool::AiSegment => crate::ui_ai::ai_segment_form(app, ui),
-        Tool::SaveProject => {
-            kit::row(ui, "Folder", |ui| path_field(app, ui, PickPurpose::SaveFolder));
-            let n = app.passes.len();
-            kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
-            kit::note(ui, "Saves the project file (<name>.scancraft) and each pass's data into the folder (created if needed). Saving again overwrites it.");
+        Tool::SaveProject => save_project_form(app, ui),
+    }
+}
+
+/// `path` turned into the other form's path: `<path>.scancraftz` for a bundle, the same path
+/// without that extension for a folder.
+pub(crate) fn switch_save_form(path: &str, bundle: bool) -> String {
+    let ext = format!(".{}", scancraft_io::project::BUNDLE_EXTENSION);
+    let path = path.trim().trim_matches('"').trim().trim_end_matches(['\\', '/']);
+    let has = path.len() > ext.len() && path.is_char_boundary(path.len() - ext.len()) && path[path.len() - ext.len()..].eq_ignore_ascii_case(&ext);
+    match (bundle, has) {
+        (true, false) if !path.is_empty() => format!("{path}{ext}"),
+        (false, true) => path[..path.len() - ext.len()].to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// The Save Project card: a project folder or a bundle file and, for a bundle, what goes into it
+/// and where opened bundles are unpacked. (Both become part of Settings once there is a Settings
+/// window; they are kept across starts.)
+fn save_project_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    use scancraft_io::bundle::Item;
+    let t = Tokens::get();
+    let as_bundle = scancraft_io::project::has_extension(std::path::Path::new(app.settings.project_path.trim().trim_matches('"')), scancraft_io::project::BUNDLE_EXTENSION);
+    let mut index = usize::from(as_bundle);
+    let is_bundle_tab = app.project.store.is_bundle();
+    kit::row(ui, "Save as", |ui| {
+        if kit::dropdown(ui, "save_project_form", &mut index, &["Project folder", "Bundle (one file)"], &[true, true]) {
+            app.settings.project_path = switch_save_form(&app.settings.project_path, index == 1);
+        }
+    });
+    let as_bundle = index == 1;
+    kit::row(ui, if as_bundle { "File" } else { "Folder" }, |ui| path_field(app, ui, if as_bundle { PickPurpose::SaveBundle } else { PickPurpose::SaveFolder }));
+    let n = app.passes.len();
+    kit::row(ui, "Passes", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
+    if !as_bundle {
+        ui.add_space(t.space_4);
+        let note = if is_bundle_tab {
+            "Saves the project file (<name>.scancraft) and each pass's data into the folder; the tab then works on the folder instead of the bundle."
+        } else {
+            "Saves the project file (<name>.scancraft) and each pass's data into the folder (created if needed). Saving again overwrites it."
+        };
+        kit::note(ui, note);
+        return;
+    }
+    ui.add_space(t.space_6);
+    kit::section_heading(ui, "Bundle contents");
+    let mut core = true;
+    ui.add_enabled_ui(false, |ui| kit::checkbox(ui, Item::Core.label(), &mut core)).response.on_disabled_hover_text(format!("Always in a bundle. Needed for: {}", Item::Core.needed_for()));
+    let mut changed = false;
+    for item in Item::ALL.into_iter().filter(|i| *i != Item::Core) {
+        let mut on = app.prefs.bundle_contents.includes(item);
+        if kit::checkbox(ui, item.label(), &mut on).on_hover_text(format!("Needed for: {}", item.needed_for())).changed() {
+            app.prefs.bundle_contents.set(item, on);
+            changed = true;
         }
     }
+    if changed {
+        app.save_prefs();
+    }
+    ui.add_space(t.space_6);
+    let root = app.prefs.work_root();
+    let free = scancraft_io::fsutil::free_space(&root);
+    let browsing = app.picker.is_open();
+    let tip = format!(
+        "Where an opened bundle is unpacked while its tab is open (it needs room for the whole bundle). Pick a big drive for large scans.{}",
+        free.map(|f| format!(" {} free there now.", scancraft_io::fsutil::format_bytes(f))).unwrap_or_default()
+    );
+    kit::row(ui, "Unpack into", |ui| {
+        ui.horizontal(|ui| {
+            let button = ui.add_enabled(!browsing, egui::Button::new("Browse…")).on_hover_text("Choose the folder with the Windows file browser");
+            let w = (ui.available_width() - button.rect.width() - ui.spacing().item_spacing.x).max(40.0);
+            ui.allocate_ui(vec2(w, t.control_height), |ui| kit::value_field(ui, &root.display().to_string(), true)).inner.on_hover_text(&tip);
+            if button.clicked() {
+                app.pick(&ui.ctx().clone(), PickPurpose::WorkRoot);
+            }
+        });
+    });
+    ui.add_space(t.space_4);
+    kit::note(ui, "Writes one .scancraftz file with the ticked contents (hover an item: what it is needed for). These choices are kept and move to Settings later.");
 }
 
 /// The point-pair card: the picked pairs and how to pick.

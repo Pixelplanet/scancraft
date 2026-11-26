@@ -95,7 +95,10 @@ pub enum ClosePrompt {
 pub struct TabLabel {
     pub name: String,
     pub dirty: bool,
+    /// Its project folder or bundle file.
     pub path: Option<std::path::PathBuf>,
+    /// A bundle's working folder (`None`: not a bundle).
+    pub work_dir: Option<std::path::PathBuf>,
     pub active: bool,
 }
 
@@ -161,7 +164,7 @@ impl ScanCraftApp {
             Some("Stop the capture first")
         } else if self.picker.is_open() {
             Some("Close the file dialog first")
-        } else if !self.pending_imports.is_empty() || self.pending_open.is_some() {
+        } else if !self.pending_imports.is_empty() || !self.pending_open.is_empty() {
             Some("Wait for the imports to finish")
         } else {
             None
@@ -175,9 +178,9 @@ impl ScanCraftApp {
             .enumerate()
             .map(|(i, t)| {
                 if i == self.active_tab {
-                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), active: true }
+                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), work_dir: self.project.store.work_dir(), active: true }
                 } else {
-                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), active: false }
+                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), work_dir: t.project.store.work_dir(), active: false }
                 }
             })
             .collect()
@@ -237,13 +240,17 @@ impl ScanCraftApp {
     }
 
     /// Closes the active tab without asking; the neighbour to its left (or right) becomes active.
-    /// Closing the last tab leaves one empty project.
+    /// Closing the last tab leaves one empty project. The project's lock is released and a
+    /// bundle's working folder removed (unsaved changes in it are lost: the caller asked first).
     pub fn close_active_tab(&mut self) {
         self.close_prompt = None;
         self.pending_close = false;
         let closing = self.project.name.clone();
+        std::mem::take(&mut self.project.store).close();
         if self.tabs.len() == 1 {
             let name = ProjectInfo::default().name;
+            // Park the closing project in its slot, then replace it there.
+            self.park_active();
             self.tabs[0] = ProjectTab::empty(name);
             self.activate(0);
             self.say(Tone::Normal, format!("Closed {closing}"));

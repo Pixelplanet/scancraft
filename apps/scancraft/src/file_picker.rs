@@ -13,10 +13,15 @@ pub enum PickPurpose {
     ImportScans,
     /// One or more ScanCraft project folders whose passes are appended.
     AddProjects,
-    /// A project folder that replaces what is open.
+    /// A project file (`.scancraft`), bundle (`.scancraftz`) or older project (`project.json`)
+    /// to open in a tab.
     OpenProject,
     /// The folder Save Project writes into.
     SaveFolder,
+    /// The bundle file Save Project writes (`.scancraftz`).
+    SaveBundle,
+    /// The folder bundles are unpacked into while open (the working-folder root).
+    WorkRoot,
     /// The file an export writes.
     ExportFile,
     /// A folder holding pre-downloaded AI pack files (models and/or ONNX Runtime DLLs).
@@ -90,8 +95,22 @@ impl FilePicker {
                     .pick_files()
                     .unwrap_or_default(),
                 PickPurpose::AddProjects => dialog.set_title("Add ScanCraft Projects").pick_folders().unwrap_or_default(),
-                PickPurpose::OpenProject => dialog.set_title("Open ScanCraft Project").pick_folder().into_iter().collect(),
+                PickPurpose::OpenProject => dialog
+                    .set_title("Open ScanCraft Project")
+                    .add_filter("ScanCraft projects and bundles", &["scancraft", "scancraftz", "json"])
+                    .add_filter("All files", &["*"])
+                    .pick_file()
+                    .into_iter()
+                    .collect(),
                 PickPurpose::SaveFolder => dialog.set_title("Save Project into Folder").pick_folder().into_iter().collect(),
+                PickPurpose::SaveBundle => {
+                    let mut dialog = dialog.set_title("Save as Bundle").add_filter("ScanCraft bundle", &["scancraftz"]);
+                    if let Some(name) = &name {
+                        dialog = dialog.set_file_name(name);
+                    }
+                    dialog.save_file().into_iter().collect()
+                }
+                PickPurpose::WorkRoot => dialog.set_title("Folder for Opened Bundles").pick_folder().into_iter().collect(),
                 PickPurpose::AiPackFolder => dialog.set_title("Select AI Pack Folder (Models or ONNX Runtime)").pick_folder().into_iter().collect(),
                 PickPurpose::ExportFile => {
                     let (label, ext) = export_filter(&extension);

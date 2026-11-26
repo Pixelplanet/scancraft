@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::bundle::{self, Bundle, BundleContents, BundleReport, EntryState};
+use crate::bundle::{self, Bundle, BundleContents, BundleReport, EntryState, Item};
 use crate::lock::{self, Liveness, LockFile, Owner};
 use crate::{fsutil, project, IoError};
 
@@ -178,6 +178,36 @@ impl WorkFolder {
         Ok(WorkFolder { dir, state, lock })
     }
 
+    /// A new, empty working folder under `root` for a bundle that does not exist yet (*Save as
+    /// Bundle…* of a project that is not a bundle): locks `dest`, and records it as the folder's
+    /// bundle. The app writes the project into [`WorkFolder::dir`], then [`WorkFolder::save`]
+    /// writes the bundle. Until that first save the folder counts as incomplete (a crash before
+    /// it leaves a folder that can only be discarded). `dest` may exist: the first save replaces
+    /// it.
+    pub fn create(dest: &Path, root: &Path) -> Result<WorkFolder, IoError> {
+        let dest = std::path::absolute(dest)?;
+        let lock = LockFile::lock_project(&dest)?;
+        let stem = dest.file_stem().and_then(|s| project::file_stem_for(&s.to_string_lossy())).unwrap_or_else(|| "Project".into());
+        let dir = create_unique(root, &stem)?;
+        let (bundle_size, bundle_mtime_ns) = stamp(&dest).unwrap_or_default();
+        let state = WorkState {
+            format: STATE_FORMAT,
+            bundle: dest,
+            bundle_size,
+            bundle_mtime_ns,
+            owner: lock.owner().clone(),
+            opened: fsutil::unix_now(),
+            saved: None,
+            complete: false,
+            entries: Vec::new(),
+        };
+        if let Err(e) = write_state(&dir, &state) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        Ok(WorkFolder { dir, state, lock })
+    }
+
     /// Takes over a leftover working folder (its owner ended without closing it): takes the
     /// bundle's lock (refused while another running app holds it) and becomes its owner. Refused
     /// for a folder still in use and for one whose unpacking did not finish.
@@ -273,6 +303,8 @@ impl WorkFolder {
         self.state.bundle_mtime_ns = mtime;
         self.state.entries = entries;
         self.state.saved = Some(fsutil::unix_now());
+        // A folder made by [`WorkFolder::create`] is complete once its bundle exists.
+        self.state.complete = true;
         write_state(&self.dir, &self.state)?;
         Ok(report)
     }
@@ -304,6 +336,28 @@ impl WorkFolder {
     pub fn close(self) -> Result<(), IoError> {
         remove_working_folder(&self.dir)
     }
+}
+
+/// Copies the files of `item` (for example [`Item::RawRecordings`], which the app does not write
+/// itself) from the project folder `from` into the project folder `to`, where `to` has no file
+/// of that name yet. Used when a project is saved as another form (folder to bundle, bundle to
+/// folder) from memory: the app writes everything it holds, and this brings along what it does
+/// not hold. Returns the number of files copied.
+pub fn copy_item_files(from: &Path, to: &Path, item: Item) -> Result<usize, IoError> {
+    let raw = match project::locate(from) {
+        Ok(l) => project::read_project_file(&l.file).map(|p| bundle::raw_recording_paths(&p)).unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let files: Vec<_> = fsutil::walk_files(from)?.into_iter().filter(|f| bundle::classify(&f.rel, &raw) == Some(item) && !to.join(&f.rel).exists()).collect();
+    fsutil::check_free_space(to, files.iter().map(|f| f.size).sum())?;
+    for f in &files {
+        let target = to.join(&f.rel);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&f.path, &target)?;
+    }
+    Ok(files.len())
 }
 
 /// Removes a working folder: renamed to `<dir>.closing` first, so a removal that stops part-way
@@ -532,6 +586,37 @@ mod tests {
         assert!(discard(&root.join("Foreign")).is_err());
         discard(&root.join("Part-1234.closing")).unwrap();
         discard(&root.join("Broken")).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_bundle_is_written_from_a_created_folder() {
+        let dir = temp("create");
+        let root = dir.join("root");
+        let dest = dir.join("New part.scancraftz");
+        let mut work = WorkFolder::create(&dest, &root).unwrap();
+        assert!(matches!(WorkFolder::create(&dest, &root), Err(IoError::Locked { .. })), "the new bundle is locked");
+        // Before the first save it holds nothing to recover.
+        assert_eq!(leftovers(&root)[0].status, LeftoverStatus::InUse(work.state().owner.clone()));
+        assert!(!work.state().complete);
+        sample_project(work.dir());
+        fs::create_dir_all(dir.join("Old/pass-1/raw")).unwrap();
+        fs::write(dir.join("Old/pass-1/raw/stream.bin"), b"raw").unwrap();
+        fs::write(dir.join("Old/pass-1/keyframes.bin"), b"old keyframes").unwrap();
+        // Only the item's files that are missing are copied (the keyframes are the app's own).
+        let before = fs::read(work.dir().join("pass-1/keyframes.bin")).unwrap();
+        assert_eq!(copy_item_files(&dir.join("Old"), work.dir(), Item::RawRecordings).unwrap(), 1);
+        assert_eq!(fs::read(work.dir().join("pass-1/raw/stream.bin")).unwrap(), b"raw");
+        assert_eq!(fs::read(work.dir().join("pass-1/keyframes.bin")).unwrap(), before);
+        let mut everything = BundleContents::default();
+        everything.raw_recordings = true;
+        work.save(&everything).unwrap();
+        assert!(work.state().complete && work.changed_files().unwrap().is_empty());
+        let mut b = Bundle::open(&dest).unwrap();
+        assert!(b.verify().unwrap().is_ok());
+        assert_eq!(b.read("pass-1/raw/stream.bin").unwrap(), b"raw");
+        work.close().unwrap();
+        assert!(leftovers(&root).is_empty() && !LockFile::path_for(&dest).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

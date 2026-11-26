@@ -54,7 +54,7 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         }
         x += 32.0;
         let open = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, open, "open", app.edit_blocked().unwrap_or("Open Project…"), app.can_edit()).clicked() {
+        if kit::app_bar_button(ui, open, "open", app.edit_blocked().unwrap_or("Open Project… (.scancraft project or .scancraftz bundle)"), app.can_edit()).clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::OpenProject);
         }
         x += 32.0;
@@ -179,7 +179,16 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
         };
         ui.painter().rect_filled(tab, t.radius_sm, fill);
         let ink = if l.active { t.app_bar_text } else { t.app_bar_text.gamma_multiply(0.7) };
-        let text_rect = Rect::from_min_max(pos2(tab.left() + pad, tab.top()), pos2(tab.right() - dot_w - close_w - 4.0, tab.bottom()));
+        // A bundle tab: a small box before the name (one file holding the whole project).
+        let mut text_left = tab.left() + pad;
+        if l.work_dir.is_some() {
+            let b = Rect::from_center_size(pos2(text_left + 4.0, tab.center().y), vec2(9.0, 9.0));
+            let stroke = egui::Stroke::new(1.1, ink);
+            ui.painter().rect_stroke(b, 1.5, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment([pos2(b.left(), b.top() + 3.0), pos2(b.right(), b.top() + 3.0)], stroke);
+            text_left += 13.0;
+        }
+        let text_rect = Rect::from_min_max(pos2(text_left, tab.top()), pos2(tab.right() - dot_w - close_w - 4.0, tab.bottom()));
         kit::paint_text(ui.painter(), text_rect, &l.name, font.clone(), ink);
         if l.dirty {
             ui.painter().circle_filled(pos2(tab.right() - close_w - dot_w / 2.0 - 2.0, tab.center().y), 3.0, ink);
@@ -194,10 +203,11 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
         let stroke = egui::Stroke::new(1.3, ink);
         ui.painter().line_segment([pos2(c.x - s, c.y - s), pos2(c.x + s, c.y + s)], stroke);
         ui.painter().line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], stroke);
-        let state = match &l.path {
-            Some(p) => format!("{}{}", p.display(), if l.dirty { " · unsaved changes" } else { "" }),
-            None if l.dirty => "Not saved yet · unsaved changes".to_string(),
-            None => "Not saved yet".to_string(),
+        let state = match (&l.path, &l.work_dir) {
+            (Some(p), Some(work)) => format!("Bundle {}{}\nWorking folder {}", p.display(), if l.dirty { " · unsaved changes" } else { "" }, work.display()),
+            (Some(p), None) => format!("{}{}", p.display(), if l.dirty { " · unsaved changes" } else { "" }),
+            (None, _) if l.dirty => "Not saved yet · unsaved changes".to_string(),
+            (None, _) => "Not saved yet".to_string(),
         };
         let tip = match blocked {
             Some(why) if !l.active => format!("{}\n{state}\n{why}", l.name),
@@ -299,6 +309,24 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         _ => {}
+    }
+}
+
+/// The crash-recovery question at start (`kit::confirm_modal`): working folders of bundles a
+/// crashed ScanCraft left with unsaved changes. Open opens them as tabs, Discard removes them,
+/// Later (and the header's ×, a click outside, Esc) keeps them for the next start.
+pub fn recovery_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    if app.recovery.is_none() {
+        return;
+    }
+    let message = app.recovery_message();
+    let recoverable = app.recovery.as_ref().is_some_and(|l| l.iter().any(|l| matches!(l.status, scancraft_io::workdir::LeftoverStatus::Orphaned { .. })));
+    let actions = kit::Actions { primary: Some(("Open", recoverable)), cancel: Some("Later"), destructive: Some(("Discard", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("recovery_prompt"), "save", "Recover Unsaved Work", &message, &actions) {
+        Some(kit::Choice::Primary) => app.recover_leftovers(),
+        Some(kit::Choice::Destructive) => app.discard_leftovers(),
+        Some(kit::Choice::Cancel) => app.recovery = None,
+        None => {}
     }
 }
 

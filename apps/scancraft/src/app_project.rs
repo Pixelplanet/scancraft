@@ -21,6 +21,10 @@ use crate::alignment::{self, AlignAllOutcome, PassInput, RefineOutcome};
 use crate::isolation::{self, MaskCache};
 use crate::model::*;
 use crate::project::{self, AlignMethod, AlignState, LoadedPass, PassMarker, PassSource, ProjectInfo, StoredPass, StoredProject};
+use crate::storage::{same_path, OpenRequest, OpenTarget, Store};
+use scancraft_io::bundle::Item;
+use scancraft_io::lock::LockFile;
+use scancraft_io::workdir::{self, WorkFolder};
 
 /// What a background job needs of one pass: (id, project <- pass, placed, reference, surface,
 /// isolation cache).
@@ -184,6 +188,76 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
             });
             Ok((points, markers, priority))
         }
+    }
+}
+
+/// One pass as Save Project collects it: (id, name, frames, shown, meta, tracker, imported
+/// surface, cleaned surface, colour keyframes, object mask, marker map).
+type SavePass = (u32, String, u64, bool, project::PassMeta, SharedTracker, Option<Arc<PointCloud>>, Option<Arc<PointCloud>>, Vec<scancraft_color::RgbKeyframe>, Option<Arc<isolation::ObjectMask>>, Vec<PassMarker>);
+
+/// What Save Project writes, collected from the app (see `ScanCraftApp::save_input`).
+struct SaveInput {
+    passes: Vec<SavePass>,
+    reference: Option<u32>,
+    next_pass_id: u32,
+    merged: Option<(PointCloud, Vec<u32>)>,
+    mesh: Option<scancraft_core::Mesh>,
+    settings: serde_json::Value,
+}
+
+impl SaveInput {
+    /// The project to write, named `name` (runs in the job: it locks the passes' trackers).
+    fn into_project(self, name: String) -> Result<StoredProject, String> {
+        let mut stored = Vec::with_capacity(self.passes.len());
+        for (id, pass_name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask, markers) in self.passes {
+            let Ok(t) = tracker.lock() else { return Err("A pass's tracker is unavailable".into()) };
+            stored.push(StoredPass { id, name: pass_name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
+        }
+        Ok(StoredProject { name, reference: self.reference, next_pass_id: self.next_pass_id, passes: stored, merged: self.merged, cleaned: None, mesh: self.mesh, settings: self.settings })
+    }
+}
+
+/// The status message of a bundle save.
+fn bundle_message(passes: &str, report: &scancraft_io::bundle::BundleReport) -> String {
+    let mut message = format!("Saved {passes} to {} ({})", report.path.display(), scancraft_io::fsutil::format_bytes(report.bytes));
+    if !report.left_out.is_empty() {
+        let items: Vec<&str> = report.left_out.iter().map(|l| l.item.label()).collect();
+        message.push_str(&format!(" · left out: {}", items.join(", ")));
+    }
+    message
+}
+
+/// Reads the project in `dir` and rebuilds its passes (runs in a job). The caller fills in the
+/// path shown and the store.
+fn read_opened(dir: &std::path::Path) -> Result<OpenedProject, String> {
+    let stored = project::load(dir)?;
+    let passes: Vec<LoadedPass> = {
+        use rayon::prelude::*;
+        stored.passes.into_par_iter().map(project::rebuild).collect()
+    };
+    let mesh = stored.mesh.map(|m| {
+        let a = Mesher::analyze(&m);
+        (m, a)
+    });
+    Ok(OpenedProject {
+        path: dir.to_path_buf(),
+        store: Store::None,
+        recovered: false,
+        name: stored.name,
+        next_pass_id: stored.next_pass_id,
+        passes,
+        merged: stored.merged,
+        cleaned: stored.cleaned,
+        mesh,
+        settings: stored.settings,
+    })
+}
+
+/// Removes a leftover working folder that holds nothing to recover.
+fn discard_quietly(dir: &std::path::Path) {
+    match workdir::discard(dir) {
+        Ok(()) => log::info!("removed the working folder {} (nothing unsaved in it)", dir.display()),
+        Err(e) => log::warn!("could not remove the working folder {}: {e}", dir.display()),
     }
 }
 
@@ -920,73 +994,302 @@ impl ScanCraftApp {
 
     // ------------------------------------------------------------------ project files
 
-    pub fn save_project(&mut self, dir: PathBuf) {
-        if self.tool_blocked(Tool::SaveProject).is_some() || dir.as_os_str().is_empty() {
-            self.say(Tone::Error, "Enter a folder for the project");
+    /// What a save writes, collected on the UI thread (the job reads the trackers).
+    fn save_input(&self) -> SaveInput {
+        SaveInput {
+            passes: self
+                .passes
+                .iter()
+                .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask), p.markers.clone()))
+                .collect(),
+            reference: self.reference_pass(),
+            next_pass_id: self.next_pass_id,
+            merged: self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone())),
+            mesh: self.mesh.as_ref().map(|m| (*m.mesh).clone()),
+            settings: serde_json::json!({
+                "min_mm": self.settings.min_mm,
+                "max_mm": self.settings.max_mm,
+                "merge_outliers": self.settings.merge_outliers,
+                "merge_sigma": self.settings.merge_sigma,
+                "whole_scene": self.settings.whole_scene,
+            }),
+        }
+    }
+
+    /// Save Project into `target`: a project folder, or a bundle when `target` ends in
+    /// `.scancraftz`. Saving where the project already is writes it there (a bundle tab: into its
+    /// working folder, then back into the bundle). Saving anywhere else moves the tab there
+    /// (Save As Project Folder, Save as Bundle…): the new place is locked, the old one unlocked,
+    /// and a bundle's old working folder removed. The project is named after the folder or file.
+    pub fn save_project(&mut self, target: PathBuf) {
+        if self.tool_blocked(Tool::SaveProject).is_some() || target.as_os_str().is_empty() {
+            self.say(Tone::Error, "Enter a folder or bundle file for the project");
             return;
         }
-        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
-        let passes: Vec<_> = self
-            .passes
-            .iter()
-            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask), p.markers.clone()))
-            .collect();
-        let reference = self.reference_pass();
-        let next_pass_id = self.next_pass_id;
-        let merged = self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone()));
-        let mesh = self.mesh.as_ref().map(|m| (*m.mesh).clone());
-        let settings = serde_json::json!({
-            "min_mm": self.settings.min_mm,
-            "max_mm": self.settings.max_mm,
-            "merge_outliers": self.settings.merge_outliers,
-            "merge_sigma": self.settings.merge_sigma,
-            "whole_scene": self.settings.whole_scene,
-        });
-        self.spawn_job("Saving the project", move || {
-            let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask, markers) in passes {
-                let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
+        let target = std::path::absolute(&target).unwrap_or(target);
+        let as_bundle = scancraft_io::project::has_extension(&target, scancraft_io::project::BUNDLE_EXTENSION);
+        if !as_bundle && target.is_file() {
+            self.say(Tone::Error, format!("{} is a file: enter a folder, or a .scancraftz file to save a bundle", target.display()));
+            return;
+        }
+        let name = if as_bundle { target.file_stem() } else { target.file_name() }.map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
+        let input = self.save_input();
+        let contents = self.prefs.bundle_contents;
+        let old_dir = self.project.store.data_dir();
+        let n = input.passes.len();
+        let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
+        if as_bundle {
+            if let Store::Bundle { work, dir } = &self.project.store {
+                // A bundle tab: into its working folder, then back into this or another bundle.
+                let (work, dir) = (work.clone(), dir.clone());
+                self.spawn_job("Saving the bundle", move || {
+                    let saved = (|| {
+                        project::save(&dir, &input.into_project(name.clone())?)?;
+                        let mut work = work.lock().map_err(|_| "the working folder is unavailable".to_string())?;
+                        let report = if same_path(work.bundle(), &target) { work.save(&contents) } else { work.save_as(&target, &contents) };
+                        report.map_err(|e| e.to_string())
+                    })();
+                    match saved {
+                        Ok(report) => JobResult::Saved { message: bundle_message(&passes, &report), path: target, name, store: None },
+                        Err(e) => JobResult::Failed(format!("Could not save the bundle: {e}")),
+                    }
+                });
+            } else {
+                // Save as Bundle… of a project folder or a new project: a new working folder.
+                let root = self.prefs.work_root();
+                self.spawn_job("Saving the bundle", move || {
+                    let mut work = match WorkFolder::create(&target, &root) {
+                        Ok(w) => w,
+                        Err(e) => return JobResult::Failed(format!("Could not save the bundle: {e}")),
+                    };
+                    let saved = (|| {
+                        project::save(work.dir(), &input.into_project(name.clone())?)?;
+                        if let Some(old) = &old_dir {
+                            workdir::copy_item_files(old, work.dir(), Item::RawRecordings).map_err(|e| e.to_string())?;
+                        }
+                        work.save(&contents).map_err(|e| e.to_string())
+                    })();
+                    match saved {
+                        Ok(report) => JobResult::Saved { message: bundle_message(&passes, &report), path: target, name, store: Some(Store::bundle(work)) },
+                        Err(e) => {
+                            let _ = work.close();
+                            JobResult::Failed(format!("Could not save the bundle: {e}"))
+                        }
+                    }
+                });
             }
-            let n = stored.len();
-            let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
-            match project::save(&dir, &project) {
-                Ok(()) => JobResult::Saved { message: format!("Saved {n} pass{} to {}", if n == 1 { "" } else { "es" }, dir.display()), path: dir, name },
+            return;
+        }
+        // Never into the working folders (closing a bundle tab removes its working folder).
+        let root = self.prefs.work_root();
+        if target.starts_with(&root) || std::path::absolute(&root).is_ok_and(|r| target.starts_with(r)) {
+            self.say(Tone::Error, format!("{} is where opened bundles are unpacked: choose another folder", root.display()));
+            return;
+        }
+        // A project folder: locked first unless it is this tab's folder already.
+        let lock = if self.project.store.is_folder(&target) {
+            None
+        } else {
+            let locked = std::fs::create_dir_all(&target).map_err(scancraft_io::IoError::from).and_then(|_| LockFile::lock_project(&target));
+            match locked {
+                Ok(lock) => Some(lock),
+                Err(e) => {
+                    self.say(Tone::Error, format!("Could not save the project: {e}"));
+                    return;
+                }
+            }
+        };
+        self.spawn_job("Saving the project", move || {
+            let saved = (|| {
+                project::save(&target, &input.into_project(name.clone())?)?;
+                // From a bundle (or another folder): bring the files the app does not hold.
+                if let (Some(_), Some(old)) = (&lock, &old_dir) {
+                    workdir::copy_item_files(old, &target, Item::RawRecordings).map_err(|e| e.to_string())?;
+                }
+                Ok::<_, String>(())
+            })();
+            match saved {
+                Ok(()) => JobResult::Saved { message: format!("Saved {passes} to {}", target.display()), path: target, name, store: lock.map(Store::Folder) },
                 Err(e) => JobResult::Failed(format!("Could not save the project: {e}")),
             }
         });
     }
 
-    pub fn open_project(&mut self, dir: PathBuf) {
+    /// The tab that has `path` open (its project folder or bundle).
+    pub fn tab_with_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.tab_labels().iter().position(|t| t.path.as_deref().is_some_and(|p| same_path(p, path)))
+    }
+
+    /// Opens a project folder, project file or bundle in a new tab (or in the current one when it
+    /// is empty). A project that is open in a tab already is switched to. The project is locked
+    /// while open; one open elsewhere (another app or PC) is refused. A bundle is unpacked into a
+    /// working folder (under the working-folder root) and the tab works there.
+    pub fn open_project(&mut self, path: PathBuf) {
         if !self.can_edit() {
             return;
         }
-        // A `.scancraft` file opens its folder (the project is saved there again).
-        let dir = scancraft_io::project::project_root(&dir).unwrap_or(dir);
-        self.spawn_job("Opening the project", move || {
-            let stored = match project::load(&dir) {
-                Ok(s) => s,
-                Err(e) => return JobResult::Failed(format!("Could not open the project: {e}")),
+        let Some(target) = OpenTarget::of(&path) else {
+            let why = scancraft_io::project::locate(&path).err().map(|e| e.to_string()).unwrap_or_else(|| format!("{} is not a ScanCraft project", path.display()));
+            self.say(Tone::Error, format!("Could not open the project: {why}"));
+            return;
+        };
+        if let Some(i) = self.tab_with_path(target.path()) {
+            self.switch_tab(i);
+            self.say(Tone::Normal, format!("{} is already open", self.project.name));
+            return;
+        }
+        match target {
+            OpenTarget::Bundle(bundle) => {
+                let root = self.prefs.work_root();
+                self.spawn_job("Opening the bundle", move || {
+                    let work = match WorkFolder::open(&bundle, &root) {
+                        Ok(w) => w,
+                        Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    };
+                    match read_opened(work.dir()) {
+                        Ok(mut opened) => {
+                            opened.path = bundle;
+                            opened.store = Store::bundle(work);
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => {
+                            let _ = work.close();
+                            JobResult::Failed(format!("Could not open the bundle: {e}"))
+                        }
+                    }
+                });
+            }
+            OpenTarget::Folder(dir) => {
+                let lock = match LockFile::lock_project(&dir) {
+                    Ok(lock) => lock,
+                    Err(e) => {
+                        self.say(Tone::Error, format!("Could not open the project: {e}"));
+                        return;
+                    }
+                };
+                self.spawn_job("Opening the project", move || match read_opened(&dir) {
+                    Ok(mut opened) => {
+                        opened.store = Store::Folder(lock);
+                        JobResult::Opened(Box::new(opened))
+                    }
+                    Err(e) => JobResult::Failed(format!("Could not open the project: {e}")),
+                });
+            }
+        }
+    }
+
+    /// Opens a working folder left behind by a crash as a tab with its unsaved changes (Save
+    /// writes them into its bundle).
+    pub fn recover_project(&mut self, dir: PathBuf) {
+        if !self.can_edit() {
+            return;
+        }
+        self.spawn_job("Recovering unsaved work", move || {
+            let work = match WorkFolder::recover(&dir) {
+                Ok(w) => w,
+                Err(e) => return JobResult::Failed(format!("Could not recover {}: {e}", dir.display())),
             };
-            let passes: Vec<LoadedPass> = {
-                use rayon::prelude::*;
-                stored.passes.into_par_iter().map(project::rebuild).collect()
-            };
-            let mesh = stored.mesh.map(|m| {
-                let a = Mesher::analyze(&m);
-                (m, a)
-            });
-            JobResult::Opened(Box::new(OpenedProject {
-                path: dir,
-                name: stored.name,
-                next_pass_id: stored.next_pass_id,
-                passes,
-                merged: stored.merged,
-                cleaned: stored.cleaned,
-                mesh,
-                settings: stored.settings,
-            }))
+            match read_opened(work.dir()) {
+                Ok(mut opened) => {
+                    opened.path = work.bundle().to_path_buf();
+                    opened.store = Store::bundle(work);
+                    opened.recovered = true;
+                    JobResult::Opened(Box::new(opened))
+                }
+                // The folder stays (listed again at the next start).
+                Err(e) => JobResult::Failed(format!("Could not recover {}: {e}", dir.display())),
+            }
         });
+    }
+
+    /// Opens (or recovers) a project now, or once the running operation has finished.
+    pub fn request_open(&mut self, request: OpenRequest) {
+        if self.can_edit() && self.pending_open.is_empty() {
+            match request {
+                OpenRequest::Path(p) => self.open_project(p),
+                OpenRequest::Recover(d) => self.recover_project(d),
+            }
+        } else {
+            let name = match &request {
+                OpenRequest::Path(p) | OpenRequest::Recover(p) => p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            };
+            self.pending_open.push_back(request);
+            self.say(Tone::Normal, format!("{name} opens when the running operation has finished"));
+        }
+    }
+
+    /// At start: the working folders under the working-folder root that a crashed ScanCraft left
+    /// behind. Those with nothing to recover (no change since the last save, bundle unchanged)
+    /// and stopped removals are removed at once; the others are put to the user in one question
+    /// (`recovery`). Folders of a running ScanCraft and folders that are not working folders are
+    /// left alone.
+    pub fn check_leftovers(&mut self) {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        let mut ask = Vec::new();
+        for l in workdir::leftovers(&self.prefs.work_root()) {
+            let closing = l.dir.to_string_lossy().ends_with(".closing");
+            match &l.status {
+                S::InUse(_) => {}
+                S::Orphaned { changed, bundle_changed: false } if changed.is_empty() => discard_quietly(&l.dir),
+                S::Damaged(_) if closing => discard_quietly(&l.dir),
+                // Not a working folder (no state file): never touched.
+                S::Damaged(_) if !l.dir.join(workdir::STATE_FILE).is_file() => {}
+                _ => ask.push(l),
+            }
+        }
+        self.recovery = (!ask.is_empty()).then_some(ask);
+    }
+
+    /// The recovery question's message.
+    pub fn recovery_message(&self) -> String {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        let Some(list) = &self.recovery else { return String::new() };
+        let mut lines = vec!["ScanCraft did not close normally. These opened bundles have changes that were not saved:".to_string()];
+        for l in list {
+            let bundle = l.state.as_ref().and_then(|s| s.bundle.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| l.dir.display().to_string());
+            let what = match &l.status {
+                S::Orphaned { changed, bundle_changed } => {
+                    let n = changed.len();
+                    let mut w = format!("{n} changed file{}", if n == 1 { "" } else { "s" });
+                    if *bundle_changed {
+                        w.push_str("; the bundle was changed or moved since, so save it under a new name");
+                    }
+                    w
+                }
+                S::Incomplete => "unpacking or the first save stopped part-way: nothing to recover".to_string(),
+                S::Damaged(why) => format!("cannot be read ({why}): nothing to recover"),
+                S::InUse(_) => "in use".to_string(),
+            };
+            lines.push(format!("• {bundle}: {what}"));
+        }
+        lines.push("Open them as tabs to save them, discard them, or decide at the next start.".into());
+        lines.join("\n")
+    }
+
+    /// The recovery question's Open: the recoverable folders open as tabs, one after another.
+    pub fn recover_leftovers(&mut self) {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        for l in self.recovery.take().unwrap_or_default() {
+            if matches!(l.status, S::Orphaned { .. }) {
+                self.request_open(OpenRequest::Recover(l.dir));
+            }
+        }
+    }
+
+    /// The recovery question's Discard: removes every listed working folder.
+    pub fn discard_leftovers(&mut self) {
+        let mut failed = Vec::new();
+        let list = self.recovery.take().unwrap_or_default();
+        for l in &list {
+            if let Err(e) = workdir::discard(&l.dir) {
+                failed.push(format!("{} ({e})", l.dir.display()));
+            }
+        }
+        if failed.is_empty() {
+            self.say(Tone::Normal, format!("Discarded {} working folder{}", list.len(), if list.len() == 1 { "" } else { "s" }));
+        } else {
+            self.say(Tone::Error, format!("Could not remove {}", failed.join(", ")));
+        }
     }
 
     pub(super) fn install_project(&mut self, opened: OpenedProject) {
@@ -994,6 +1297,8 @@ impl ScanCraftApp {
         if self.has_geometry() {
             self.new_tab();
         }
+        // An empty tab's own folder or bundle (nothing unsaved in it) is let go.
+        std::mem::take(&mut self.project.store).close();
         self.clear_previews();
         self.picking = None;
         self.object_picking = None;
@@ -1058,12 +1363,19 @@ impl ScanCraftApp {
         }
         self.settings.whole_scene = opened.settings.get("whole_scene").and_then(|v| v.as_bool()).unwrap_or(false);
         self.settings.project_path = opened.path.display().to_string();
-        self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation: self.next_generation };
+        // A recovered project holds changes its bundle does not have yet.
+        let saved_generation = if opened.recovered { 0 } else { self.next_generation };
+        self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store };
         self.selection = None;
         self.tool = None;
         self.framed_radius = 0.0;
         self.fit_view();
-        self.say(Tone::Success, format!("Opened {} · {n} pass{}", self.project.name, if n == 1 { "" } else { "es" }));
+        let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
+        if opened.recovered {
+            self.say(Tone::Success, format!("Recovered {} · {passes} · Save writes the changes into the bundle", self.project.name));
+        } else {
+            self.say(Tone::Success, format!("Opened {} · {passes}", self.project.name));
+        }
     }
 
     // ------------------------------------------------------------------ imports
