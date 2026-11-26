@@ -196,6 +196,62 @@ fn smoother(strength: usize, keep_edges: f32) -> scancraft_mesh::FeatureSmoother
     scancraft_mesh::FeatureSmoother { iterations: strength, sigma_normal: 1.2 + (0.22 - 1.2) * keep, ..Default::default() }
 }
 
+/// Make Solid's settings, taken from the panel when the tool runs.
+#[derive(Clone, Debug)]
+pub(crate) struct SolidJob {
+    config: scancraft_mesh::SolidConfig,
+    remove_markers: bool,
+    sharp_top: bool,
+}
+
+impl SolidJob {
+    pub(crate) fn from_settings(s: &Settings) -> Self {
+        SolidJob {
+            config: scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() },
+            remove_markers: s.solid_remove_markers,
+            sharp_top: s.solid_sharp_top,
+        }
+    }
+}
+
+/// The Make Solid job's work (off the UI thread): the passes' points and markers into a closed
+/// solid.
+pub(crate) fn make_solid(input: project_ops::SolidInput, job: SolidJob) -> Result<scancraft_mesh::Solid, String> {
+    let SolidJob { mut config, remove_markers, sharp_top } = job;
+    let (points, markers, priority) = project_ops::solid_points(input)?;
+    if points.len() < 100 {
+        return Err("Make Solid needs points with normals: align the passes (or merge them) first".into());
+    }
+    // The most trusted pass wins where passes cover the same surface; with equal weights all
+    // passes are averaged (`SolidConfig::scan_priority`).
+    if let Some(order) = priority {
+        if sharp_top {
+            config.sharp_scans = vec![order[0]];
+        }
+        config.scan_priority = order;
+    }
+    let markers = if remove_markers { markers } else { Vec::new() };
+    let solid = scancraft_mesh::build_solid(&points, &markers, &config);
+    if solid.mesh.triangles.is_empty() {
+        return Err("No solid could be built from these points; try a larger cell size".into());
+    }
+    Ok(solid)
+}
+
+/// The status line after Make Solid.
+pub(crate) fn solid_message(r: &scancraft_mesh::SolidReport, analysis: &scancraft_mesh::MeshAnalysis) -> String {
+    format!(
+        "Solid of {} triangles, wall {:.1} mm · {} hole{} filled, {} marker{} removed · {}",
+        thousands(analysis.triangle_count),
+        r.wall_median_mm,
+        r.holes_filled,
+        if r.holes_filled == 1 { "" } else { "s" },
+        r.marker_sites.len(),
+        if r.marker_sites.len() == 1 { "" } else { "s" },
+        if analysis.is_watertight { "watertight" } else { "not watertight: check the open edges" }
+    )
+}
+
 fn default_project_path() -> String {
     default_project_path_for(&ProjectInfo::default().name)
 }
@@ -2471,42 +2527,14 @@ impl ScanCraftApp {
             }
             Tool::MakeSolid => {
                 let input = self.solid_input();
-                let mut config = scancraft_mesh::SolidConfig { cell_mm: s.solid_cell_mm, detect: s.solid_remove_markers.then(Default::default), ..Default::default() };
-                let (remove_markers, sharp_top) = (s.solid_remove_markers, s.solid_sharp_top);
-                self.spawn_undoable("Making the solid", "Make Solid", move || {
-                    let (points, markers, priority) = match project_ops::solid_points(input) {
-                        Ok(v) => v,
-                        Err(e) => return JobResult::Failed(e),
-                    };
-                    if points.len() < 100 {
-                        return JobResult::Failed("Make Solid needs points with normals: align the passes (or merge them) first".into());
+                let job = SolidJob::from_settings(s);
+                self.spawn_undoable("Making the solid", "Make Solid", move || match make_solid(input, job) {
+                    Ok(solid) => {
+                        let analysis = Mesher::analyze(&solid.mesh);
+                        let message = solid_message(&solid.report, &analysis);
+                        JobResult::Mesh { mesh: solid.mesh, analysis, message }
                     }
-                    // The most trusted pass wins where passes cover the same surface; with equal
-                    // weights all passes are averaged (`SolidConfig::scan_priority`).
-                    if let Some(order) = priority {
-                        if sharp_top {
-                            config.sharp_scans = vec![order[0]];
-                        }
-                        config.scan_priority = order;
-                    }
-                    let markers = if remove_markers { markers } else { Vec::new() };
-                    let solid = scancraft_mesh::build_solid(&points, &markers, &config);
-                    if solid.mesh.triangles.is_empty() {
-                        return JobResult::Failed("No solid could be built from these points; try a larger cell size".into());
-                    }
-                    let analysis = Mesher::analyze(&solid.mesh);
-                    let r = &solid.report;
-                    let message = format!(
-                        "Solid of {} triangles, wall {:.1} mm · {} hole{} filled, {} marker{} removed · {}",
-                        thousands(analysis.triangle_count),
-                        r.wall_median_mm,
-                        r.holes_filled,
-                        if r.holes_filled == 1 { "" } else { "s" },
-                        r.marker_sites.len(),
-                        if r.marker_sites.len() == 1 { "" } else { "s" },
-                        if analysis.is_watertight { "watertight" } else { "not watertight: check the open edges" }
-                    );
-                    JobResult::Mesh { mesh: solid.mesh, analysis, message }
+                    Err(e) => JobResult::Failed(e),
                 });
             }
             Tool::Decimate => {
@@ -3527,6 +3555,243 @@ mod tests {
         assert!(app.status.contains("could not be read"), "{}", app.status);
         assert!(app.current_toast().is_some_and(|t| t.contains("without markers")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `S1`, `S2`, `S3` scans of `SCANCRAFT_ALIGN_DATA` (the list of
+    /// `crates/scancraft-align/tests/real_data.rs`: `key = path` lines, or a folder with
+    /// `S1.ply` ...). Revo's `marker_framework.mkf` beside each scan comes in through the import.
+    fn revo_scans(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let keys = ["S1", "S2", "S3"];
+        if root.is_dir() {
+            return keys.iter().map(|k| root.join(format!("{k}.ply"))).collect();
+        }
+        let text = std::fs::read_to_string(root).expect("read SCANCRAFT_ALIGN_DATA");
+        let base = root.parent().unwrap_or(std::path::Path::new("."));
+        let lines: HashMap<&str, &str> = text.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')).filter_map(|l| l.split_once('=')).map(|(k, v)| (k.trim(), v.trim())).collect();
+        keys.iter().map(|k| base.join(lines.get(k).unwrap_or_else(|| panic!("no {k} in SCANCRAFT_ALIGN_DATA")))).collect()
+    }
+
+    /// Runs the app's jobs until none is busy.
+    fn wait_for_jobs(app: &mut ScanCraftApp, limit: Duration) {
+        let t0 = Instant::now();
+        while app.busy.is_some() && t0.elapsed() < limit {
+            app.poll_jobs();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.busy.is_none(), "the job did not finish in {limit:?}: {}", app.status);
+    }
+
+    #[cfg(windows)]
+    fn peak_working_set_mb() -> Option<f64> {
+        #[repr(C)]
+        struct Pmc {
+            cb: u32,
+            page_fault_count: u32,
+            peak_working_set: usize,
+            working_set: usize,
+            quota_peak_paged: usize,
+            quota_paged: usize,
+            quota_peak_nonpaged: usize,
+            quota_nonpaged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> isize;
+            fn K32GetProcessMemoryInfo(process: isize, pmc: *mut Pmc, cb: u32) -> i32;
+        }
+        // SAFETY: a plain-data struct filled by the OS for the current process.
+        let mut p: Pmc = unsafe { std::mem::zeroed() };
+        p.cb = std::mem::size_of::<Pmc>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut p, p.cb) };
+        (ok != 0).then(|| p.peak_working_set as f64 / 1048576.0)
+    }
+    #[cfg(not(windows))]
+    fn peak_working_set_mb() -> Option<f64> {
+        None
+    }
+
+    /// Revo's markers of two placed passes, compared under their poses: mutual nearest within
+    /// 3 mm facing the same way (as `real_data.rs`), the RMS of the pairs, and the pose of `a`
+    /// against the best fit of the pairs (degrees, and RMS over `a`'s points in mm).
+    fn marker_check(a: &ScanPass, b: &ScanPass) -> serde_json::Value {
+        let world = |p: &ScanPass| -> Vec<(Vec3, Vec3)> {
+            let m = p.meta.transform.to_mat4();
+            p.markers.iter().filter_map(|k| k.normal.map(|n| (m.transform_point3(k.centre), (p.meta.transform.rotation * n).normalize()))).collect()
+        };
+        let (wa, wb) = (world(a), world(b));
+        let nearest = |q: &(Vec3, Vec3), set: &[(Vec3, Vec3)]| set.iter().enumerate().filter(|(_, s)| s.1.dot(q.1) > 0.866).min_by(|x, y| x.1 .0.distance(q.0).total_cmp(&y.1 .0.distance(q.0))).map(|(i, s)| (i, s.0.distance(q.0)));
+        let mut pairs = Vec::new();
+        for (i, qa) in wa.iter().enumerate() {
+            if let Some((j, d)) = nearest(qa, &wb) {
+                if d < 3.0 && nearest(&wb[j], &wa).map(|r| r.0) == Some(i) {
+                    pairs.push((i, j, d));
+                }
+            }
+        }
+        let rms = (pairs.iter().map(|p| p.2 * p.2).sum::<f32>() / pairs.len().max(1) as f32).sqrt();
+        let mut out = serde_json::json!({"from": a.name, "to": b.name, "markers": [wa.len(), wb.len()], "matched": pairs.len(), "rms_mm": rms});
+        if pairs.len() >= 4 {
+            // project <- a as the markers place it: fit a's own (pass frame) markers onto b's placed ones.
+            let own: Vec<Vec3> = a.markers.iter().filter(|k| k.normal.is_some()).map(|k| k.centre).collect();
+            if let Some(fit) = scancraft_align::horn::horn(&pairs.iter().map(|p| (own[p.0], wb[p.1].0)).collect::<Vec<_>>()) {
+                let pose = a.meta.transform;
+                let deg = (pose.rotation * fit.rotation.inverse()).angle_between(glam::Quat::IDENTITY).to_degrees();
+                let (pm, fm) = (pose.to_mat4(), fit.to_mat4());
+                let pts: Vec<Vec3> = a.source().surfels().map(|s| s.iter().step_by(50).map(|s| s.0).collect()).unwrap_or_default();
+                let mm = (pts.iter().map(|p| pm.transform_point3(*p).distance_squared(fm.transform_point3(*p))).sum::<f32>() / pts.len().max(1) as f32).sqrt();
+                let fit_rms = (pairs.iter().map(|p| fm.transform_point3(own[p.0]).distance_squared(wb[p.1].0)).sum::<f32>() / pairs.len() as f32).sqrt();
+                out["fit_rms_mm"] = serde_json::json!(fit_rms);
+                out["pose_vs_fit_deg"] = serde_json::json!(deg);
+                out["pose_vs_fit_mm"] = serde_json::json!(mm);
+            }
+        }
+        out
+    }
+
+    /// Make Solid of the three Revo Scan scans of the thin shell part, end to end through the app
+    /// (Import Scan with Revo's markers, Align All, Accept, Make Solid with the default settings,
+    /// Save, Open). Writes `solid.ply`, `solid_report.json` (the solid's own report), `app_report.json`
+    /// and the project folder `project/` to `SCANCRAFT_SOLID_OUT`. Release build, one test:
+    ///
+    /// ```text
+    /// SCANCRAFT_ALIGN_DATA=<list> SCANCRAFT_SOLID_OUT=<folder> cargo test -p scancraft --release make_solid_of_the_revo_scans -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "needs the Revo scans (SCANCRAFT_ALIGN_DATA) and an output folder (SCANCRAFT_SOLID_OUT)"]
+    fn make_solid_of_the_revo_scans_end_to_end() {
+        let (Some(data), Some(out)) = (std::env::var_os("SCANCRAFT_ALIGN_DATA"), std::env::var_os("SCANCRAFT_SOLID_OUT")) else {
+            eprintln!("SCANCRAFT_ALIGN_DATA or SCANCRAFT_SOLID_OUT is not set; skipping");
+            return;
+        };
+        let out = std::path::PathBuf::from(out);
+        std::fs::create_dir_all(&out).unwrap();
+        let t_all = Instant::now();
+        let mut app = app();
+
+        // Import Scan, as the button does: Revo's marker_framework.mkf beside each file comes along.
+        let mut imports = Vec::new();
+        for path in revo_scans(std::path::Path::new(&data)) {
+            let t = Instant::now();
+            app.import_scan(path);
+            wait_for_jobs(&mut app, Duration::from_secs(300));
+            let p = app.passes.last().expect("imported");
+            eprintln!("import: {}", app.status);
+            assert_ne!(app.tone, Tone::Error, "{}", app.status);
+            assert!(!p.markers.is_empty(), "no markers read for {}: {}", p.name, app.status);
+            imports.push(serde_json::json!({"pass": p.id, "name": p.name, "points": p.layer.len(), "markers": p.markers.len(), "status": app.status, "seconds": t.elapsed().as_secs_f32()}));
+        }
+        assert_eq!(app.passes.len(), 3);
+
+        // Align All, then Accept.
+        let t = Instant::now();
+        assert_eq!(app.align_all_blocked(), None);
+        app.align_all();
+        wait_for_jobs(&mut app, Duration::from_secs(1200));
+        let align_status = app.status.clone();
+        eprintln!("align all: {align_status}");
+        let Some(PosesPreview { proposal: Proposal::AlignAll(outcome), .. }) = &app.poses_preview else { panic!("Align All proposed nothing: {align_status}") };
+        let outcome = (**outcome).clone();
+        let placements: Vec<serde_json::Value> = outcome
+            .placements
+            .iter()
+            .map(|p| {
+                let q = p.quality;
+                serde_json::json!({
+                    "pass": p.id, "name": app.pass_name(p.id), "reference": p.reference, "placed": p.pose.is_some(), "parent": p.parent,
+                    "rotation_deg": p.pose.map(|t| t.rotation.angle_between(glam::Quat::IDENTITY).to_degrees()),
+                    "translation_mm": p.pose.map(|t| t.translation.to_array()),
+                    "verdict": q.map(|q| format!("{:?}", q.verdict())),
+                    "overlap": q.map(|q| q.overlap), "rmse_mm": q.map(|q| q.rmse_mm), "visibility_conflict": q.map(|q| q.visibility_conflict),
+                    "wall_offset_mm": q.and_then(|q| q.shell).map(|s| s.offset_mm), "piercing": q.and_then(|q| q.shell).map(|s| s.piercing),
+                })
+            })
+            .collect();
+        let edges: Vec<String> = outcome.edges.iter().map(|e| format!("{} -> {}: {:?}, {:?}, {:?}", app.pass_name(e.from), app.pass_name(e.to), e.kind, e.verdict, e.quality.map(|q| (q.overlap, q.rmse_mm)))).collect();
+        app.accept_poses();
+        let align_s = t.elapsed().as_secs_f32();
+        assert!(app.passes.iter().all(|p| p.meta.alignment.is_placed()), "not every pass was placed: {align_status}");
+        let mut markers = Vec::new();
+        for i in 0..app.passes.len() {
+            for j in i + 1..app.passes.len() {
+                markers.push(marker_check(&app.passes[j], &app.passes[i]));
+            }
+        }
+        let peak_after_align = peak_working_set_mb();
+
+        // Make Solid with the default settings: the tool's own job, run here so its report is kept.
+        let job = SolidJob::from_settings(&app.settings);
+        let t = Instant::now();
+        let solid = make_solid(app.solid_input(), job.clone()).expect("Make Solid");
+        let solid_s = t.elapsed().as_secs_f32();
+        let peak_after_solid = peak_working_set_mb();
+        let analysis = Mesher::analyze(&solid.mesh);
+        let r = &solid.report;
+        scancraft_io::save_mesh_ply_binary(&solid.mesh, out.join("solid.ply")).unwrap();
+        std::fs::write(out.join("solid_report.json"), r.to_json()).unwrap();
+        let faired: Vec<&str> = r.marker_outcomes.iter().filter(|o| o.fair.as_ref().is_some_and(|f| f.status == "faired")).map(|o| o.id.as_str()).collect();
+        let not_faired: Vec<String> = r.marker_outcomes.iter().filter(|o| !o.fair.as_ref().is_some_and(|f| f.status == "faired")).map(|o| format!("{} ({:.1}, {:.1}, {:.1}): {} / {}", o.id, o.center.x, o.center.y, o.center.z, o.fill, o.fair.as_ref().map_or("no fairing", |f| f.status.as_str()))).collect();
+        let t = &r.topology;
+        let summary = serde_json::json!({
+            "watertight": t.watertight, "manifold": t.manifold, "components": t.components.len(), "genus": t.genus_total(),
+            "triangles": t.triangles, "volume_mm3": t.total_volume_mm3, "area_mm2": t.total_area_mm2,
+            "wall_median_mm": r.wall_median_mm, "measured_fraction": r.origin_fractions()[0],
+            "markers_listed": r.markers_listed, "markers_detected": r.markers_detected.len(), "marker_sites": r.marker_sites.len(),
+            "sites_faired": r.sites_faired, "faired": faired, "not_faired": not_faired, "holes_filled": r.holes_filled,
+            "solid_seconds": solid_s, "solid_stage_seconds": r.total_seconds(),
+        });
+        eprintln!("solid: {summary:#}");
+
+        // Into the app as the tool's result, then saved and opened again.
+        let message = solid_message(r, &analysis);
+        let triangles = solid.mesh.triangles.len();
+        let mesh = solid.mesh;
+        app.spawn_undoable("Making the solid", "Make Solid", move || JobResult::Mesh { mesh, analysis, message });
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        assert!(app.mesh.is_some(), "{}", app.status);
+        let project_dir = out.join("project");
+        let _ = std::fs::remove_dir_all(&project_dir);
+        app.save_project(project_dir.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(600));
+        let mut reopened = self::app();
+        reopened.open_project(project_dir);
+        wait_for_jobs(&mut reopened, Duration::from_secs(600));
+        let reopen: Vec<serde_json::Value> = app
+            .passes
+            .iter()
+            .map(|p| {
+                let q = reopened.passes.iter().find(|q| q.id == p.id);
+                // (Opening normalises the normals again: equal to a few ulp, not bit for bit.)
+                let same = |a: &PassMarker, b: &PassMarker| {
+                    a.centre.distance(b.centre) < 1e-4
+                        && match (a.normal, b.normal) {
+                            (Some(x), Some(y)) => x.dot(y) > 1.0 - 1e-6,
+                            (x, y) => x == y,
+                        }
+                        && match (a.radius_mm, b.radius_mm) {
+                            (Some(x), Some(y)) => (x - y).abs() < 1e-5,
+                            (x, y) => x == y,
+                        }
+                };
+                let same = q.is_some_and(|q| q.markers.len() == p.markers.len() && q.markers.iter().zip(&p.markers).all(|(a, b)| same(a, b)));
+                serde_json::json!({"pass": p.id, "markers": p.markers.len(), "reopened": q.map(|q| q.markers.len()), "same": same, "pose_same": q.is_some_and(|q| q.meta.transform == p.meta.transform)})
+            })
+            .collect();
+        let reopened_mesh = reopened.mesh.as_ref().map(|m| m.mesh.triangles.len());
+
+        let report = serde_json::json!({
+            "imports": imports, "align": {"status": align_status, "seconds": align_s, "refine": format!("{:?}", outcome.refine), "placements": placements, "edges": edges},
+            "markers_under_poses": markers, "solid": summary, "settings": format!("{job:?}"),
+            "reopened": {"passes": reopen, "mesh_triangles": reopened_mesh, "saved_triangles": triangles},
+            "peak_working_set_mb": {"after_align": peak_after_align, "after_solid": peak_after_solid},
+            "total_seconds": t_all.elapsed().as_secs_f32(),
+        });
+        std::fs::write(out.join("app_report.json"), serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        eprintln!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+        assert!(t.watertight, "the solid is not watertight");
+        assert!(reopen.iter().all(|p| p["same"] == true && p["pose_same"] == true), "the marker maps or poses did not come back: {reopen:?}");
+        assert_eq!(reopened_mesh, Some(triangles));
     }
 
     #[test]

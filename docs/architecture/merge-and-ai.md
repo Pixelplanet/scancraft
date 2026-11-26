@@ -113,6 +113,18 @@ hinge bracket only partly bridged, a few marker sites at edges and ridges not sm
 accuracy limited by the remaining S2/S3 misfit, marker positions come from Revo's
 `marker_framework.mkf` (read by Import Scan since 2026-11-26) or a geometric detector.
 
+End to end through the app (2026-11-26, ignored test `make_solid_of_the_revo_scans_end_to_end` in
+`apps/scancraft/src/app.rs`, data via `SCANCRAFT_ALIGN_DATA`, output via `SCANCRAFT_SOLID_OUT`):
+Import Scan reads 69 / 67 / 72 Revo markers, Align All places S2 and S3 (both Good), Make Solid
+with the app's default settings (equal pass weights, so no scan priority and no sharp scan, unlike
+the run above) gives a watertight, manifold single component, genus 24, wall 3.08 mm, 82.1 %
+measured, 31 listed markers on the object surface plus 2 detected, 26 sites, 19 faired; solve
+about 30 s, peak working set of the whole test 1.0 GB. Save and Open keep the marker maps and poses.
+Seen in CPU renders: a detected "hole" marker on the upper hinge bracket partly closes the
+bracket's screw hole; Revo lists two features with radius about 1 mm (a screw boss, a bracket
+edge) as markers (left uncut); a line of small beads along the outside crease next to the upper
+hinge and a ring of beads around one inside sticker, both absent or weaker last week.
+
 Research on community exports, the runtime download and integrated-GPU speed: section 5.
 
 ## 5. Model and runtime research (2026-11-24, desk research, not yet tested on hardware)
