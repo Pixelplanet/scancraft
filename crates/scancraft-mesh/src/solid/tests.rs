@@ -1009,3 +1009,322 @@ fn marker_near_a_rounded_rim_leaves_the_rolled_edge() {
     let raised = out.samples.iter().filter(|p| p.kind == PointKind::Measured && p.position.z > 0.2).count();
     assert_eq!(raised, 0, "sticker points left");
 }
+
+// ---- curvature continuity of the marker-site fills ------------------------------------------
+//
+// A fill that does not continue the surface round it shows under a grazing light: a flat disc on a
+// dome reads as a dent, a slope step at the cut as a ring. The fills must follow the surface's
+// curvature (spheres, cylinders) and what a ring quadric cannot follow (a ridge or a bump crossing
+// the site), with value and slope continuous at the cut.
+
+type Surface = fn(f32, f32) -> f32;
+
+fn sphere_r(r: f32, x: f32, y: f32) -> f32 {
+    -(r - (r * r - x * x - y * y).sqrt())
+}
+fn cylinder_r(r: f32, x: f32) -> f32 {
+    -(r - (r * r - x * x).sqrt())
+}
+fn sphere60(x: f32, y: f32) -> f32 {
+    sphere_r(60.0, x, y)
+}
+fn sphere100(x: f32, y: f32) -> f32 {
+    sphere_r(100.0, x, y)
+}
+fn sphere150(x: f32, y: f32) -> f32 {
+    sphere_r(150.0, x, y)
+}
+fn cylinder40(x: f32, _y: f32) -> f32 {
+    cylinder_r(40.0, x)
+}
+/// Axis at 30 degrees to y.
+fn cylinder80(x: f32, y: f32) -> f32 {
+    cylinder_r(80.0, 0.866 * x - 0.5 * y)
+}
+/// A dome with a ridge (Gaussian, sigma 5 mm, 0.15 mm high) running through the site.
+fn ridge(x: f32, y: f32) -> f32 {
+    -0.004 * (x * x + y * y) + 0.15 * (-(x - 1.5).powi(2) / 50.0).exp()
+}
+/// A dome with a bump (0.2 mm, sigma 4 mm) beside the site.
+fn bump(x: f32, y: f32) -> f32 {
+    -0.002 * (x * x + y * y) + 0.2 * (-((x - 8.0).powi(2) + (y - 3.0).powi(2)) / 32.0).exp()
+}
+
+fn surface_normal(f: &dyn Fn(f32, f32) -> f32, x: f32, y: f32) -> Vec3 {
+    let e = 0.01;
+    Vec3::new(-(f(x + e, y) - f(x - e, y)) / (2.0 * e), -(f(x, y + e) - f(x, y - e)) / (2.0 * e), 1.0).normalize()
+}
+
+/// Flatness ratio of `pts` against the surface `f` at the same (x, y): a quadric fitted to each,
+/// <H_pts, H_f> / <H_f, H_f> (1: the curvature is continued, 0: flat).
+fn flatness_ratio(pts: &[Vec3], f: &dyn Fn(f32, f32) -> f32) -> f64 {
+    let a: Vec<(f64, f64, f64)> = pts.iter().map(|p| (p.x as f64, p.y as f64, p.z as f64)).collect();
+    let b: Vec<(f64, f64, f64)> = pts.iter().map(|p| (p.x as f64, p.y as f64, f(p.x, p.y) as f64)).collect();
+    let keep = vec![true; a.len()];
+    let qa = Quadric::fit_once_n::<6>(&a, &keep).unwrap().0;
+    let qb = Quadric::fit_once_n::<6>(&b, &keep).unwrap().0;
+    let h = |c: &[f64; 10]| [2.0 * c[3], c[4], c[4], 2.0 * c[5]];
+    let (ha, hb) = (h(&qa), h(&qb));
+    ha.iter().zip(&hb).map(|(x, y)| x * y).sum::<f64>() / hb.iter().map(|y| y * y).sum::<f64>()
+}
+
+fn site_at_origin() -> Marker {
+    Marker { id: "S".into(), center: Vec3::ZERO, normal: Vec3::Z, scan: None, source: MarkerSource::List, radius_mm: 3.0, score: 0.0 }
+}
+
+#[test]
+fn marker_fill_continues_the_curvature_of_spheres_cylinders_ridges_and_bumps() {
+    // (Surface, worst height error, flatness ratio range.) The bump beside the site is not
+    // biharmonic: its thin-plate continuation is close, not exact (the ring quadric alone is 0.08 mm
+    // off).
+    let cases: [(&str, Surface, f32, (f64, f64)); 7] = [
+        ("sphere R60", sphere60, 0.01, (0.95, 1.05)),
+        ("sphere R100", sphere100, 0.01, (0.95, 1.05)),
+        ("sphere R150", sphere150, 0.01, (0.95, 1.05)),
+        ("cylinder R40", cylinder40, 0.01, (0.95, 1.05)),
+        ("cylinder R80", cylinder80, 0.01, (0.95, 1.05)),
+        ("ridge", ridge, 0.015, (0.9, 1.1)),
+        ("bump", bump, 0.025, (0.75, 1.25)),
+    ];
+    let mut failed = Vec::new();
+    for (name, f, tol, fr_ok) in cases {
+        let pts = sheet_with_sticker(f, (0.0, 0.0));
+        let out = remove_markers(&pts, &[site_at_origin()], &MarkerConfig::default(), None);
+        assert!(out.outcomes[0].fill.starts_with("quadric"), "{name}: {:?}", out.outcomes[0]);
+        let fill: Vec<Vec3> = out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill).map(|p| p.position).collect();
+        assert!(fill.len() > 1000, "{name}: {} fill points", fill.len());
+        let worst = fill.iter().map(|p| (p.z - f(p.x, p.y)).abs()).fold(0f32, f32::max);
+        let inner: Vec<Vec3> = fill.iter().copied().filter(|p| p.x.hypot(p.y) < 6.0).collect();
+        let fr = flatness_ratio(&inner, &f);
+        eprintln!("{name}: fill worst {worst:.4} mm, flatness ratio {fr:.3}");
+        if worst >= tol || !(fr_ok.0..fr_ok.1).contains(&fr) {
+            failed.push(format!("{name}: fill {worst} mm off the surface, flatness ratio {fr}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A triangulated height field of `f` over [-20, 20]² (0.4 mm grid); inside radius `rc` of the
+/// origin the heights are those of a flat disc (the plane through the circle r = rc), as a fill
+/// that ignores the curvature leaves them, meeting the surface at the cut over a ramp
+/// ((r / rc)^8 of the gap; continuous, as the solve leaves it).
+fn height_mesh_with_flat_disc(f: &dyn Fn(f32, f32) -> f32, rc: f32) -> Mesh {
+    let (n, s) = (101usize, 0.4f32);
+    let half = (n / 2) as f32;
+    // Plane through the circle: least squares over 360 points of it.
+    let ring: Vec<(f64, f64, f64)> = (0..360)
+        .map(|k| {
+            let t = k as f32 / 360.0 * std::f32::consts::TAU;
+            let (x, y) = (rc * t.cos(), rc * t.sin());
+            (x as f64, y as f64, f(x, y) as f64)
+        })
+        .collect();
+    let m = ring.len() as f64;
+    let (sx, sy, sz) = ring.iter().fold((0.0, 0.0, 0.0), |a, p| (a.0 + p.0 * p.0, a.1 + p.1 * p.1, a.2 + p.2));
+    let (bx, by) = ring.iter().fold((0.0, 0.0), |a, p| (a.0 + p.0 * p.2, a.1 + p.1 * p.2));
+    let plane = |x: f32, y: f32| (sz / m + bx / sx * x as f64 + by / sy * y as f64) as f32;
+    let mut verts = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let (x, y) = ((i as f32 - half) * s, (j as f32 - half) * s);
+            let r = x.hypot(y);
+            let z = if r < rc {
+                let (bx, by) = (x / r.max(1e-6) * rc, y / r.max(1e-6) * rc);
+                plane(x, y) + (f(bx, by) - plane(bx, by)) * (r / rc).powi(8)
+            } else {
+                f(x, y)
+            };
+            verts.push(scancraft_core::Point3D { position: [x, y, z], normal: [0.0, 0.0, 1.0], color: ColorRgba::WHITE, confidence: 1.0 });
+        }
+    }
+    let mut tris = Vec::new();
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = (j * n + i) as u32;
+            tris.push(Triangle::new(a, a + 1, a + n as u32 + 1));
+            tris.push(Triangle::new(a, a + n as u32 + 1, a + n as u32));
+        }
+    }
+    let mut mesh = Mesh::from_geometry(verts, tris);
+    mesh.recompute_normals();
+    mesh
+}
+
+/// Over the faces of `mesh` on the front face whose centroid lies within `r0 .. r1` of the z
+/// axis: the worst height error of their vertices against `f`, and the 99th percentile of the
+/// angle between the face normal and the surface normal at the centroid (mrad).
+fn site_errors(mesh: &Mesh, f: &dyn Fn(f32, f32) -> f32, r0: f32, r1: f32) -> (f32, f32) {
+    let p = |i: u32| Vec3::from_array(mesh.vertices[i as usize].position);
+    let mut worst = 0f32;
+    let mut ang = Vec::new();
+    for t in &mesh.triangles {
+        let [a, b, c] = t.indices.map(p);
+        let g = (a + b + c) / 3.0;
+        let r = g.x.hypot(g.y);
+        if r < r0 || r >= r1 || g.z < f(g.x, g.y) - 1.5 {
+            continue;
+        }
+        for v in [a, b, c] {
+            worst = worst.max((v.z - f(v.x, v.y)).abs());
+        }
+        let nt = surface_normal(f, g.x, g.y);
+        let nf = (b - a).cross(c - a).normalize();
+        if nf.dot(nt) < 0.0 {
+            continue;
+        }
+        ang.push(nf.angle_between(nt) * 1000.0);
+    }
+    if ang.is_empty() {
+        return (f32::INFINITY, f32::INFINITY);
+    }
+    ang.sort_by(|a, b| a.total_cmp(b));
+    (worst, pct(&ang, 0.99))
+}
+
+/// The ring a slope step at the cut (r = 6.5) leaves: the 99th percentile normal error of the faces
+/// across the cut (5 .. 8 mm) over that of the faces further out (9 .. 12 mm, the mesh's own).
+fn kink_mrad(mesh: &Mesh, f: &dyn Fn(f32, f32) -> f32) -> f32 {
+    site_errors(mesh, f, 5.0, 8.0).1 - site_errors(mesh, f, 9.0, 12.0).1
+}
+
+#[test]
+fn faired_marker_site_continues_the_surface_without_a_kink() {
+    // A mesh whose fill is a flat disc (how the depressions on the Revo part look under a grazing
+    // light): the fairing puts it back on the surface, with no slope step at the cut.
+    // (Surface, worst height error, flatness ratio range, normal error at the cut in mrad.)
+    let cases: [(&str, Surface, f32, (f64, f64), f32); 4] = [
+        ("sphere R60", sphere60, 0.01, (0.95, 1.05), 3.0),
+        ("cylinder R40", cylinder40, 0.01, (0.95, 1.05), 3.0),
+        ("ridge", ridge, 0.015, (0.9, 1.1), 3.0),
+        ("bump", bump, 0.025, (0.75, 1.25), 6.0),
+    ];
+    let mut failed = Vec::new();
+    for (name, f, tol, fr_ok, kink_max) in cases {
+        let mut mesh = height_mesh_with_flat_disc(&f, 6.5);
+        let (flat, _) = site_errors(&mesh, &f, 0.0, 6.4);
+        let out = fair_marker_sites(&mut mesh, &[site_at_origin()], &MarkerConfig::default());
+        assert_eq!(out[0].status, "faired", "{name}: {:?}", out[0]);
+        let (worst, _) = site_errors(&mesh, &f, 0.0, 6.4);
+        let kink = kink_mrad(&mesh, &f);
+        let inner: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).filter(|p| p.x.hypot(p.y) < 6.0).collect();
+        let fr = flatness_ratio(&inner, &f);
+        eprintln!("{name}: flat disc {flat:.3} mm -> faired worst {worst:.4} mm, normal error p99 at the cut {kink:.1} mrad over the mesh's own, flatness ratio {fr:.3}");
+        if worst >= tol || kink >= kink_max || !(fr_ok.0..fr_ok.1).contains(&fr) {
+            failed.push(format!("{name}: faired patch {worst} mm off the surface, normals {kink} mrad off at the cut, flatness ratio {fr}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A curved plate: the front face `f` (scan 1, with a sticker 0.4 mm proud, r 5.5 mm, at the
+/// origin) over r < 20 mm and the back face 3 mm behind (scan 2).
+fn plate_with_sticker(f: Surface) -> Vec<SolidPoint> {
+    let mut pts = sheet_with_sticker(f, (0.0, 0.0));
+    let s = 0.35;
+    for i in -57..=57 {
+        for j in -57..=57 {
+            let (x, y) = (i as f32 * s + 0.17, j as f32 * s + 0.11);
+            if x.hypot(y) > 20.0 {
+                continue;
+            }
+            pts.push(SolidPoint { position: Vec3::new(x, y, f(x, y) - WALL), normal: -surface_normal(&f, x, y), scan: 2 });
+        }
+    }
+    pts
+}
+
+#[test]
+fn make_solid_fills_a_marker_site_with_the_surface_curvature() {
+    let mut failed = Vec::new();
+    for (name, f, tol, fr_ok) in [("sphere R60", sphere60 as Surface, 0.015f32, (0.9, 1.1)), ("ridge", ridge as Surface, 0.02, (0.9, 1.1)), ("bump", bump as Surface, 0.03, (0.75, 1.25))] {
+        let pts = plate_with_sticker(f);
+        let res = build_solid(&pts, &[site_at_origin()], &SolidConfig { cell_mm: 0.4, detect: None, ..Default::default() });
+        let o = &res.report.marker_outcomes[0];
+        assert!(o.fill.starts_with("quadric") && o.fair.as_ref().is_some_and(|f| f.status == "faired"), "{name}: {o:?}");
+        let (worst, _) = site_errors(&res.mesh, &f, 0.0, 6.4);
+        let kink = kink_mrad(&res.mesh, &f);
+        let (around, _) = site_errors(&res.mesh, &f, 8.0, 12.0);
+        let inner: Vec<Vec3> = res.mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).filter(|p| p.x.hypot(p.y) < 6.0 && p.z > f(p.x, p.y) - 1.5).collect();
+        let fr = flatness_ratio(&inner, &f);
+        eprintln!("{name}: solid inside the cut worst {worst:.4} mm (around it {around:.4}), normal error p99 at the cut {kink:.1} mrad over the mesh's own, flatness ratio {fr:.3}");
+        if worst >= tol.max(around + 0.005) || kink >= 4.0 || !(fr_ok.0..fr_ok.1).contains(&fr) {
+            failed.push(format!("{name}: site {worst} mm off the surface (around it {around}), normals {kink} mrad off at the cut, flatness ratio {fr}"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn sticker_hanging_over_the_rim_gives_no_bulge_past_it() {
+    // The sheet (a dome, R 100 mm) ends at a straight rim x = 0 with a side face going down; a
+    // sticker centred 1 mm in from the rim hangs 3.5 mm over it (the Revo part's S1-M36). The fill
+    // must end at the rim, not carry the sheet out under the overhanging sticker.
+    let s = 0.35;
+    let mut pts = Vec::new();
+    for i in -57..=57 {
+        for j in -57..=57 {
+            let (x, y) = (i as f32 * s, j as f32 * s);
+            let r = (x + 1.0).hypot(y);
+            let lift = 0.4 * ((5.5 - r) / 0.5).clamp(0.0, 1.0);
+            if (x > 0.0 && lift <= 0.0) || x.hypot(y) > 20.0 {
+                continue;
+            }
+            pts.push(SolidPoint { position: Vec3::new(x, y, sphere100(x, y) + lift), normal: surface_normal(&sphere100, x, y), scan: 1 });
+        }
+        let y = i as f32 * s;
+        for k in 1..=10 {
+            pts.push(SolidPoint { position: Vec3::new(0.0, y, sphere100(0.0, y) - k as f32 * s), normal: Vec3::X, scan: 1 });
+        }
+    }
+    let m = Marker { center: Vec3::new(-1.0, 0.0, sphere100(-1.0, 0.0)), ..site_at_origin() };
+    let out = remove_markers(&pts, &[m], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    let o = &out.outcomes[0];
+    assert!(o.fill.starts_with("quadric, partial") && o.fill_points > 100, "{o:?}");
+    let past = out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill && p.position.x > 0.45).count();
+    let worst = out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill).map(|p| (p.position.z - sphere100(p.position.x, p.position.y)).abs()).fold(0f32, f32::max);
+    eprintln!("overhang: {past} fill points past the rim, fill worst {worst:.4} mm ({:?})", o.fill);
+    assert_eq!(past, 0, "{past} fill points past the rim");
+    assert!(worst < 0.02, "fill {worst} mm off the dome");
+    let raised = out.samples.iter().filter(|p| p.kind == PointKind::Measured && p.position.z > sphere100(p.position.x, p.position.y) + 0.2).count();
+    assert_eq!(raised, 0, "sticker points left");
+}
+
+#[test]
+fn rim_roll_off_in_the_annulus_does_not_pull_the_fill_down() {
+    // A dome (R 80 mm) rolling over a 2 mm radius edge 8 mm from the site (the roll-off starts at
+    // x = 6, inside the annulus): the fill follows the dome, not a fit dragged down by the edge.
+    let dome = |x: f32, y: f32| -(x * x + y * y) / 160.0;
+    let s = 0.35;
+    let (x0, re) = (6.0f32, 2.0f32);
+    let mut pts = Vec::new();
+    for j in -57..=57 {
+        let y = j as f32 * s;
+        for i in -57..=17 {
+            let x = i as f32 * s;
+            if x > x0 || x.hypot(y) > 20.0 {
+                continue;
+            }
+            let lift = 0.4 * ((5.5 - x.hypot(y)) / 0.5).clamp(0.0, 1.0);
+            pts.push(SolidPoint { position: Vec3::new(x, y, dome(x, y) + lift), normal: surface_normal(&dome, x, y), scan: 1 });
+        }
+        if y.abs() < 20.0 {
+            for k in 1..=17 {
+                let phi = k as f32 / 18.0 * std::f32::consts::FRAC_PI_2;
+                let n = Vec3::new(phi.sin(), 0.0, phi.cos());
+                let c = Vec3::new(x0, y, dome(x0, y) - re);
+                pts.push(SolidPoint { position: c + n * re, normal: n, scan: 1 });
+            }
+            for k in 0..=12 {
+                pts.push(SolidPoint { position: Vec3::new(x0 + re, y, dome(x0, y) - re - k as f32 * s), normal: Vec3::X, scan: 1 });
+            }
+        }
+    }
+    let out = remove_markers(&pts, &[site_at_origin()], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    let o = &out.outcomes[0];
+    assert!(o.fill.starts_with("quadric") && o.fill_points > 500, "{o:?}");
+    let fill: Vec<Vec3> = out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill).map(|p| p.position).collect();
+    let worst = fill.iter().filter(|p| p.x < x0 - 0.5).map(|p| (p.z - dome(p.x, p.y)).abs()).fold(0f32, f32::max);
+    eprintln!("roll-off: fill worst {worst:.4} mm ({:?})", o.fill);
+    assert!(worst < 0.02, "fill {worst} mm off the dome");
+}
+

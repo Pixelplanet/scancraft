@@ -15,9 +15,10 @@
 //!    Solid also recognises them directly in each scan (`prep::drop_behind_strays`, see
 //!    [`PrepareConfig::laser_strays`]).
 //! 2. **Marker stickers:** flat discs ~0.4 mm proud, ~11 mm across. Every listed marker is cut out
-//!    to ≥ 6.5 mm and refilled from a quadric fitted to the ring around it (the solid's marker
-//!    stage, [`crate::solid::markers`]); after meshing [`crate::solid::fair_marker_sites`] blends the
-//!    mesh inside the cut onto the ring fit of the mesh, so the site ends flush.
+//!    to ≥ 6.5 mm and refilled from the fill surface of the ring around it (the solid's marker
+//!    stage, [`crate::solid::markers`]: a robust quadric of the sheet, so the fill carries on the
+//!    surface's curvature); after meshing [`crate::solid::fair_marker_sites_on_fills`] puts the mesh
+//!    inside the cut onto that surface, met by the mesh round the cut, so the site ends flush.
 //!
 //! **Trade-off** ([`PrepareConfig::suppress_artefacts`]): the clean-up drops points standing more
 //! than max(0.15 mm, 4 × local noise) off their local sheet within 1 mm, and a second layer
@@ -62,8 +63,12 @@ impl Default for PrepareConfig {
             wall_search_mm: 6.0,
             remove_markers: true,
             // The merged model has a 0.5 mm pitch: a denser fill would outweigh the points around
-            // it in the implicit surface.
-            markers: MarkerConfig { fill_spacing_mm: 0.45, ..MarkerConfig::default() },
+            // it in the implicit surface. Its passes cannot be told apart (no pass ids), so where two
+            // overlap a fraction of a millimetre apart the band round a site has seams, not a
+            // curvature band: on the Revo scans the continued band slopes made every site they
+            // switched on at worse (M16, M20, M21, M43, S2-M20, S2-M44, S2-M12), so the fill is the
+            // ring fit (which already continues the curvature to second order).
+            markers: MarkerConfig { fill_spacing_mm: 0.45, continue_band_slopes: false, ..MarkerConfig::default() },
         }
     }
 }

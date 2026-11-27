@@ -390,7 +390,7 @@ fn main() {
         if std::env::args().any(|x| x == "--dump-prepared") {
             write_ply(&Mesh::from_geometry(cloud.points.clone(), Vec::new()), &a.out.join("prepared.ply"));
         }
-        sites = rep.marker_sites.iter().zip(&rep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(s, _)| s.clone()).collect();
+        sites = rep.marker_sites.iter().zip(&rep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(s, o)| (s.clone(), o.clone())).collect();
     }
     let positions: Vec<Vec3> = cloud.points.iter().map(|p| Vec3::from(p.position)).collect();
     let sp = spacing(&positions);
@@ -433,10 +433,11 @@ fn main() {
         }
     }
     if !sites.is_empty() {
-        let fair = scancraft_mesh::solid::fair_marker_sites(&mut mesh, &sites, &prep_cfg.markers);
+        let (sm, so): (Vec<_>, Vec<_>) = sites.iter().cloned().unzip();
+        let fair = scancraft_mesh::solid::fair_marker_sites_on_fills(&mut mesh, &sm, &so, &prep_cfg.markers);
         let faired = fair.iter().filter(|f| f.status == "faired").count();
         println!("marker fairing: {faired} of {} sites", sites.len());
-        for (s, f) in sites.iter().zip(&fair).filter(|(_, f)| f.status != "faired") {
+        for ((s, _), f) in sites.iter().zip(&fair).filter(|(_, f)| f.status != "faired") {
             println!("  {} not faired: {}", s.id, f.status);
         }
     }

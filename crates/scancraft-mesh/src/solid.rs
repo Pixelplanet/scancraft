@@ -31,6 +31,8 @@ pub(crate) mod grid;
 mod holes;
 pub mod markers;
 mod poisson;
+pub(crate) mod sitefit;
+use sitefit as markers_fill;
 pub(crate) mod prep;
 pub mod topo;
 #[cfg(test)]
@@ -541,11 +543,24 @@ pub(crate) fn marker_stage(
 /// Mesh-level marker fairing on its own (any closed or open mesh): see [`markers::MarkerConfig`]
 /// `fair_*`. Returns one outcome per site.
 pub fn fair_marker_sites(mesh: &mut Mesh, sites: &[Marker], cfg: &MarkerConfig) -> Vec<FairOutcome> {
+    fair_mesh_sites(mesh, sites, None, cfg)
+}
+
+/// Mesh-level marker fairing after a marker removal ([`crate::prepare_points`],
+/// [`remove_markers`]): `outcomes` are the removal's, one per site in `sites`. The mesh inside
+/// each filled cut goes onto the site's fill surface from the scan points, met by the mesh round
+/// the cut; sites that were not filled are left alone.
+pub fn fair_marker_sites_on_fills(mesh: &mut Mesh, sites: &[Marker], outcomes: &[MarkerOutcome], cfg: &MarkerConfig) -> Vec<FairOutcome> {
+    let fills: Vec<Option<markers_fill::SiteSurface>> = sites.iter().enumerate().map(|(k, _)| outcomes.get(k).and_then(|o| o.surface.clone())).collect();
+    fair_mesh_sites(mesh, sites, Some(&fills), cfg)
+}
+
+fn fair_mesh_sites(mesh: &mut Mesh, sites: &[Marker], fills: Option<&[Option<markers_fill::SiteSurface>]>, cfg: &MarkerConfig) -> Vec<FairOutcome> {
     let mut pos: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).collect();
     let tris: Vec<[u32; 3]> = mesh.triangles.iter().map(|t| t.indices).collect();
     let vn = vertex_normals(&pos, &tris);
     let mut inside = vec![false; pos.len()];
-    let out = markers::fair_sites(&mut pos, &vn, sites, cfg, &mut inside);
+    let out = markers::fair_sites(&mut pos, &vn, sites, fills, cfg, &mut inside);
     for (v, p) in mesh.vertices.iter_mut().zip(&pos) {
         v.position = p.to_array();
     }
@@ -864,7 +879,8 @@ pub fn build_solid(input: &[SolidPoint], markers: &[Marker], cfg: &SolidConfig) 
     if cfg.markers.fair_mesh && !sites.is_empty() {
         let vn = vertex_normals(&pos, &tris);
         let mut inside = vec![false; pos.len()];
-        let fair = markers::fair_sites(&mut pos, &vn, &sites, &cfg.markers, &mut inside);
+        let fills: Vec<Option<markers_fill::SiteSurface>> = outcomes.iter().map(|o| o.surface.clone()).collect();
+        let fair = markers::fair_sites(&mut pos, &vn, &sites, Some(&fills), &cfg.markers, &mut inside);
         rep.sites_faired = fair.iter().filter(|f| f.status == "faired").count();
         for (o, f) in outcomes.iter_mut().zip(fair) {
             o.fair = Some(f);

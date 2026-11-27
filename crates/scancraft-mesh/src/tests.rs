@@ -682,3 +682,99 @@ fn prepare_removes_a_listed_marker_flush_with_the_surface() {
     let removed = site_error(&mesh_of(true));
     assert!(removed < 0.03, "the site is {removed} mm off the surface around it");
 }
+
+/// A 3 mm wall whose front face is a dome with a ridge running through a marker sticker (a flat
+/// disc 0.4 mm proud, r 5.5 mm, listed with Revo's 3 mm radius), 0.03 mm noise.
+fn ridged_wall_with_sticker() -> (PointCloud, Vec3, fn(f32, f32) -> f32) {
+    fn surface(x: f32, y: f32) -> f32 {
+        let (dx, dy) = (x - 20.0, y - 15.0);
+        -0.004 * (dx * dx + dy * dy) + 0.15 * (-(dx - 1.5).powi(2) / 50.0).exp()
+    }
+    let site = Vec3::new(20.0, 15.0, surface(20.0, 15.0));
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            let (x, y) = (i as f32 * 0.5 + jitter(idx, 71, 0.1), j as f32 * 0.5 + jitter(idx, 72, 0.1));
+            let e = 0.05;
+            let n = Vec3::new(-(surface(x + e, y) - surface(x - e, y)) / (2.0 * e), -(surface(x, y + e) - surface(x, y - e)) / (2.0 * e), 1.0).normalize();
+            let r = Vec3::new(x - site.x, y - site.y, 0.0).length();
+            let lift = 0.4 * ((5.5 - r) / 0.5).clamp(0.0, 1.0);
+            c.push(pt(Vec3::new(x, y, surface(x, y) + lift + jitter(idx, 73, 0.03)), n));
+        }
+    }
+    back_face(&mut c, 40.0, 30.0);
+    (noisy(c, 0.0, 6.0), site, surface)
+}
+
+#[test]
+fn reconstruct_fills_a_marker_site_with_the_surface_curvature() {
+    // Reconstruct's path: prepare_points (cut and fill from the scan points), the implicit surface,
+    // the app's smoothing, then the fairing onto the fill surfaces. With the band slopes continued
+    // the site follows the ridge (a ring quadric alone is ~0.04 mm off at the centre); with the
+    // default (ring fit only, see `PrepareConfig`) it is the quadric. Either way no ring at the cut.
+    for slopes in [true, false] {
+        reconstruct_site_check(slopes);
+    }
+}
+
+fn reconstruct_site_check(slopes: bool) {
+    use crate::solid::markers::{Marker, MarkerSource};
+    let (cloud, site, surface) = ridged_wall_with_sticker();
+    let marker = Marker { id: "M1".into(), center: site, normal: Vec3::Z, scan: Some(1), source: MarkerSource::List, radius_mm: 3.0, score: 0.0 };
+    let mut cfg = crate::PrepareConfig::default();
+    cfg.markers.continue_band_slopes = slopes;
+    let (prepared, rep) = crate::prepare_points(&cloud, std::slice::from_ref(&marker), &cfg);
+    assert_eq!(rep.markers_filled(), 1, "{:?}", rep.marker_outcomes);
+    let local = |p: Vec3| (p.x - site.x, p.y - site.y);
+    let fill_worst = prepared
+        .points
+        .iter()
+        .map(|p| Vec3::from_array(p.position))
+        .filter(|p| p.z > -1.5 && local(*p).0.hypot(local(*p).1) < 6.0)
+        .map(|p| (p.z - surface(p.x, p.y)).abs())
+        .fold(0f32, f32::max);
+    let (mut mesh, _) = crate::implicit::reconstruct(&prepared, &crate::SurfaceConfig::default());
+    crate::FeatureSmoother { iterations: 4, sigma_normal: 0.5144, ..Default::default() }.smooth(&mut mesh);
+    let fair = crate::solid::fair_marker_sites_on_fills(&mut mesh, &rep.marker_sites, &rep.marker_outcomes, &cfg.markers);
+    assert_eq!(fair[0].status, "faired", "{fair:?}");
+    // Front-face vertices by distance from the site: inside the cut, across it, further out.
+    let front: Vec<(f32, Vec3)> = mesh
+        .vertices
+        .iter()
+        .map(|v| Vec3::from_array(v.position))
+        .filter(|p| p.z > -1.5)
+        .map(|p| (local(p).0.hypot(local(p).1), p))
+        .collect();
+    let worst_in = |r0: f32, r1: f32| front.iter().filter(|(r, _)| (r0..r1).contains(r)).map(|(_, p)| (p.z - surface(p.x, p.y)).abs()).fold(0f32, f32::max);
+    let (inside, around) = (worst_in(0.0, 6.0), worst_in(8.0, 12.0));
+    // Slope continuity: the normal error of the front faces across the cut against further out.
+    let normal_p99 = |r0: f32, r1: f32| {
+        let mut a: Vec<f32> = mesh
+            .triangles
+            .iter()
+            .filter_map(|t| {
+                let [a, b, c] = t.indices.map(|i| Vec3::from_array(mesh.vertices[i as usize].position));
+                let g = (a + b + c) / 3.0;
+                let r = local(g).0.hypot(local(g).1);
+                if !(r0..r1).contains(&r) || g.z < -1.5 {
+                    return None;
+                }
+                let e = 0.01;
+                let nt = Vec3::new(-(surface(g.x + e, g.y) - surface(g.x - e, g.y)) / (2.0 * e), -(surface(g.x, g.y + e) - surface(g.x, g.y - e)) / (2.0 * e), 1.0).normalize();
+                Some((b - a).cross(c - a).normalize().angle_between(nt) * 1000.0)
+            })
+            .collect();
+        a.sort_by(|x, y| x.total_cmp(y));
+        a[(a.len() - 1) * 99 / 100]
+    };
+    let kink = normal_p99(5.0, 8.0) - normal_p99(9.0, 12.0);
+    eprintln!("reconstruct (band slopes {slopes}): fill points worst {fill_worst:.4} mm; mesh inside the cut worst {inside:.4} (around it {around:.4}), normal error p99 at the cut {kink:.1} mrad over further out; {fair:?}");
+    let (fill_tol, site_tol): (f32, f32) = if slopes { (0.03, 0.025) } else { (0.05, 0.045) };
+    assert!(fill_worst < fill_tol, "fill points {fill_worst} mm off the surface");
+    assert!(inside < site_tol.max(around + 0.005), "site {inside} mm off the surface (around it {around})");
+    // (Against the true ridge: the ring fit alone does not follow it, and its faces round the cut
+    // are a few mrad off the ridge's even without a step there.)
+    let kink_max = if slopes { 4.0 } else { 10.0 };
+    assert!(kink < kink_max, "normals {kink} mrad off at the cut");
+}

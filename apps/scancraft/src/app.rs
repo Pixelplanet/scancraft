@@ -2519,10 +2519,11 @@ impl ScanCraftApp {
                     if let Some(sm) = smoother {
                         sm.smooth(&mut mesh);
                     }
-                    // The filled marker sites end flush with the surface around them.
+                    // The filled marker sites go onto their fill surfaces (the surface round each cut
+                    // continued into it), flush with the mesh around them.
                     let filled: Vec<_> = prep.marker_sites.iter().zip(&prep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(m, _)| m.clone()).collect();
                     if !filled.is_empty() {
-                        scancraft_mesh::solid::fair_marker_sites(&mut mesh, &filled, &prepare.markers);
+                        scancraft_mesh::solid::fair_marker_sites_on_fills(&mut mesh, &prep.marker_sites, &prep.marker_outcomes, &prepare.markers);
                     }
                     let analysis = Mesher::analyze(&mesh);
                     let holes = scancraft_mesh::HoleFiller::find_holes(&mesh).len();

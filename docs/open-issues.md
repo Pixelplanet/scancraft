@@ -374,6 +374,86 @@ narrow relief that stands 0.6–2.5 mm in front of or behind a thin wall when it
 disagrees with the wall map. Turn the setting off for parts with fine engraving.
 `implicit_surface_keeps_small_relief_without_pits` is unchanged.
 
+### 2.4 Marker-site fills that continue the curvature (2026-11-27)
+
+**What the user saw:** round depressions at the marker sites, in our solids and in Revo Scan's own
+mesh: the sticker hides the surface, the hole is filled with a flat spot, and on a dome a flat
+disc looks like a dent. The rounded-rectangle line on the outside is real (two paint colours under
+a white stripe) and is kept.
+
+**What was measured first** (`E:\Claude\eval\mesh-curv`, scripts in `scripts\`): Revo's mesh has
+flat fills (flatness ratio 0.54–0.76 at the clean sites). Ours did not at the clean sites (ratio
+0.9–1.2, centre within 0.02 mm of the surface's own continuation). The sites that showed were the
+rim sites (M1, M4, M36, M43, S2-M4), the curvature-band and flange sites (M6, M16, M20, M21, the
+rc-12 site S2-M12/S3-M22), and every fill was smoother than the scanned surface round it.
+
+**What changed** (`crates/scancraft-mesh/src/solid/sitefit.rs`, `markers.rs`):
+- **Ring selection:** samples must face like the fit (normal within 20°) and lie within 3 σ of it,
+  σ from the MAD. The old trim at 2× the RMS of the kept points shrank onto the plain part of the
+  ring.
+- **Curvature bands:** where the 4.5 mm band next to the cut is plain sheet all round (≥ 90 % on
+  the fit) and the ring quadric clearly misses it (≥ 0.01 mm RMS explained), the band's low angular
+  orders (m ≤ 3) are continued into the cut C1 by the disc's biharmonic solution
+  (A r^m + B r^(m+2)). The slope beyond the harmonic one is weighted by its significance against
+  the scan noise. Elsewhere the fill is the ring quadric, which already continues the curvature to
+  second order and was best on plain spots in the leave-out test.
+  - Tried and dropped on the real data: continuing the orders at every site, carrying the band's
+    value in at partial rings, a 6 mm band with t² terms, and a remainder of the scan points. The
+    band next to a cut holds the ragged rim of the gap round the sticker. Carried in, it gave dents
+    and bumps of 0.1–0.25 mm (S2-M61 +0.18, M1 dent, M3 blob).
+- **Fairing:** the mesh inside the cut goes onto the site's fill surface from the scan points
+  (`MarkerOutcome::surface`), met by the mesh round the cut (`SiteSurface::met_by`). The low orders
+  of the mesh's remainder are continued C1 where the fill is the quadric; the rest is carried in
+  harmonically. Re-fitting the solve's mesh ring was the weak link before: its smoothing, carried in
+  C1, put a synthetic ridge 0.04 mm off, against 0.013 mm now. All 22 cut sites are faired now; M4
+  and M36 used to be refused.
+- **Partial sites:** a patch stays within 0.4 mm of the convex hull of the sheet round the site,
+  and never behind surface going down in the cut (a rim's side face under a sticker hanging over
+  the rim).
+- **Reconstruct:** `PrepareConfig` turns the band slopes off (`continue_band_slopes: false`). The
+  merged model has no pass ids, so S2/S3 seams 0.15 mm apart cannot be equalised. With the band
+  slopes on, every site where they switched on (M16, M20, M21, M43, S2-M20, S2-M44, S2-M12)
+  scored worse. The app calls `fair_marker_sites_on_fills`.
+
+**Results** (final e2e `E:\Claude\eval\mesh-curv\e2e`; self = patch minus the C1 continuation of
+the output's own band, centre mm / flatness ratio; tables `after_self.txt`, `after.txt`,
+`fill_sites_after.txt`; images `sites_after*.png`, `compare_sites.png`):
+- **Make Solid vs v7.**
+  - Clean sites unchanged: |self| ≤ 0.024 mm, ratio 0.88–1.34.
+  - Better: M43 (−0.135 → −0.087, the disc outline gone in the renders), M6 (+0.115 → +0.067),
+    M36 (−0.455 → −0.372), M20 (+0.027 → +0.013), S2-M4 (−0.088 → −0.047) and S2-M61
+    (−0.059 → +0.009).
+  - Worse: M1 (−0.029 → −0.240 against its own band. In the renders it has a smoother edge than
+    v7's bump and a faint darker disc).
+  - Steps across the cut ≤ 0.01 mm everywhere a sheet surrounds the site.
+- **Reconstruct vs v7:** clean sites the same. M43 (+0.10) and S2-M44 (+0.12) are faint domes,
+  M36 has its rim notch as before.
+- **Real features, Make Solid:** relief windows, screw hole (1.44 mm free radius), the four bosses
+  and the bottom crease are identical to v7.
+- **Synthetic tests** (`solid/tests.rs`, `tests.rs`, `solid/sitefit.rs`): spheres R 60–150 and
+  cylinders R 40/80 within 0.002 mm, flatness ratio 1.00 ± 0.01. A ridge and a bump through the
+  site within 0.009/0.016 mm in the infill, 0.013/0.017 mm through Make Solid and 0.019 mm through
+  Reconstruct's path. A flat disc faired back without a kink (≤ 3 mrad). A rim roll-off in the
+  annulus: 0.016 mm, was 0.057. A sticker over a rim: no patch past it, was 422 points. All six new
+  tests fail on the old code.
+
+**Still not right:**
+- **Reconstruct's auto support radius is on a knife edge.** With the final marker code the
+  prepared cloud has 60 fewer points than v7's (310 196 against 310 260). That tips the point
+  spacing estimate from 0.65 to 0.64 mm and the support radius from 2.0 to 1.9 mm. At 1.9 mm the
+  S3 laser-line lattice on the inside, 30 mm from the nearest marker, comes back as pits: relief
+  p99 0.418 against 0.038 mm, 144 against 119 openings, and the bracket hole and boss C numbers
+  move. Runs with other marker variants that landed at 2.0 mm (`e2e_A`, `e2e_E`) match v7
+  exactly. Choosing the spacing sample by position instead of by index did not move it. This
+  needs its own fix in the mesher (a stable spacing estimate or a stronger stray test), not in
+  the marker code.
+- **Rim sites:**
+  - M36 keeps its rim bulge. The real scan has no side face under the overhanging sticker for the
+    shadow rule to use.
+  - M4 has small bright specks along the rim inside the cut.
+- **Fills are smoother than the scanned texture round them.** This was not addressed, as decided:
+  no noise added.
+
 ## 3. Found by the user in the app
 
 ### 3.1 New Project throws away the open project without asking
