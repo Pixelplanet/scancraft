@@ -142,6 +142,19 @@ pub fn walk_files(root: &Path) -> io::Result<Vec<WalkedFile>> {
     Ok(out)
 }
 
+/// Size and modification time of a file: when either differs from an earlier stamp, someone
+/// changed (or replaced) the file meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct FileStamp {
+    pub size: u64,
+    pub mtime_ns: u64,
+}
+
+/// The stamp of the file at `path`, `None` when it does not exist (or is not a file).
+pub fn stamp(path: &Path) -> Option<FileStamp> {
+    fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| FileStamp { size: m.len(), mtime_ns: mtime_ns(&m) })
+}
+
 /// Modification time in nanoseconds since 1970 (0 when the platform has none).
 pub fn mtime_ns(meta: &Metadata) -> u64 {
     meta.modified().ok().map(system_ns).unwrap_or(0)

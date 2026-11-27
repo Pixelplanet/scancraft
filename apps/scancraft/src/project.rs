@@ -717,8 +717,15 @@ const MERGED_FILE: &str = "outputs/merged.ply";
 const CLEANED_FILE: &str = "outputs/cleaned.ply";
 const MESH_FILE: &str = "outputs/mesh.ply";
 
-/// Writes the project into `dir`.
+/// Writes the project into `dir`. Fields of the project file this version does not know are
+/// kept from the file it replaces (`scancraft_io::project::save_project`).
 pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
+    save_carrying(dir, project, None)
+}
+
+/// [`save`]; when `dir` holds no project yet (the project moves there), the fields this version
+/// does not know come from the project at `previous` (where it was until now).
+pub fn save_carrying(dir: &Path, project: &StoredProject, previous: Option<&Path>) -> Result<(), String> {
     let e = |e: scancraft_io::IoError| e.to_string();
     let passes = project
         .passes
@@ -740,6 +747,7 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
             },
             keyframes: files::keyframes_path(p.id),
             raw_recording: p.meta.raw_recording.clone(),
+            other: Default::default(),
         })
         .collect();
     for p in &project.passes {
@@ -799,9 +807,10 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
         passes,
         outputs,
         settings: project.settings.clone(),
+        other: Default::default(),
     };
     let keyframes: Vec<(u32, Vec<KeyframeRecord>)> = project.passes.iter().map(|p| (p.id, p.keyframes.iter().map(to_record).collect())).collect();
-    files::save_project(dir, &file, &keyframes).map(|_| ()).map_err(e)
+    files::save_project_carrying(dir, &file, &keyframes, previous).map(|_| ()).map_err(e)
 }
 
 /// Reads a project: its folder, its `.scancraft` file, or an older folder with `project.json`.

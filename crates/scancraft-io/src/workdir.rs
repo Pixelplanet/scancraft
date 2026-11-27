@@ -183,6 +183,25 @@ impl WorkFolder {
     pub fn open(bundle_path: &Path, root: &Path) -> Result<WorkFolder, IoError> {
         let bundle_path = std::path::absolute(bundle_path)?;
         let lock = LockFile::lock_project(&bundle_path)?;
+        WorkFolder::open_with_lock(&bundle_path, root, lock)
+    }
+
+    /// [`WorkFolder::open`] of a bundle whose lock `holder` has (on another computer), after the
+    /// user confirmed taking it over ([`LockFile::take_over_from`]: refused when someone else
+    /// holds it by now, or a running ScanCraft on this computer).
+    pub fn open_taking_over(bundle_path: &Path, root: &Path, holder: &Owner) -> Result<WorkFolder, IoError> {
+        let bundle_path = std::path::absolute(bundle_path)?;
+        let lock = LockFile::take_over_from(&LockFile::path_for(&bundle_path), holder)?;
+        WorkFolder::open_with_lock(&bundle_path, root, lock)
+    }
+
+    /// [`WorkFolder::open`] with the bundle's lock already taken (by the caller, who may have had
+    /// to ask the user first). `lock` must be the bundle's ([`LockFile::path_for`]).
+    pub fn open_with_lock(bundle_path: &Path, root: &Path, lock: LockFile) -> Result<WorkFolder, IoError> {
+        let bundle_path = std::path::absolute(bundle_path)?;
+        if std::path::absolute(lock.path())? != LockFile::path_for(&bundle_path) {
+            return Err(IoError::Unsupported(format!("{} is not the lock of {}", lock.path().display(), bundle_path.display())));
+        }
         let mut bundle = Bundle::open(&bundle_path)?;
         bundle.read_project()?;
         fs::create_dir_all(root)?;
@@ -282,6 +301,11 @@ impl WorkFolder {
     /// The working folder (a project folder: open it with [`project::load_project`]).
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The bundle's lock (it says whose lock it replaced, if any: [`LockFile::replaced`]).
+    pub fn lock(&self) -> &LockFile {
+        &self.lock
     }
 
     pub fn bundle(&self) -> &Path {
@@ -396,6 +420,69 @@ impl WorkFolder {
     /// Closes the working folder: removes it (unsaved changes are lost) and unlocks the bundle.
     pub fn close(self) -> Result<(), IoError> {
         remove_working_folder(&self.dir)
+    }
+}
+
+/// A bundle unpacked only to be read (Add Project of a bundle, Open Read-Only): no lock is taken,
+/// so it also works while the bundle is open elsewhere, and nothing is ever written back. The
+/// folder is removed when this is dropped. Its state file marks it as being removed from the
+/// start, so a crash while it exists leaves a folder the next start removes without asking
+/// ([`LeftoverStatus::Closing`]); while this app runs it is in use and left alone.
+#[derive(Debug)]
+pub struct UnpackedCopy {
+    dir: PathBuf,
+    bundle: PathBuf,
+}
+
+impl UnpackedCopy {
+    /// Unpacks `bundle_path` into a new folder under `root` (checks as [`WorkFolder::open`]:
+    /// a newer or broken project file is refused before anything is unpacked, and the drive
+    /// must have room). On failure nothing is left behind.
+    pub fn unpack(bundle_path: &Path, root: &Path) -> Result<UnpackedCopy, IoError> {
+        let bundle_path = std::path::absolute(bundle_path)?;
+        let mut bundle = Bundle::open(&bundle_path)?;
+        bundle.read_project()?;
+        fs::create_dir_all(root)?;
+        fsutil::check_free_space(root, bundle.total_size())?;
+        let stem = bundle_path.file_stem().and_then(|s| project::file_stem_for(&s.to_string_lossy())).unwrap_or_else(|| "Project".into());
+        let dir = create_unique(root, &format!("{stem}-copy"))?;
+        let (bundle_size, bundle_mtime_ns) = stamp(&bundle_path).unwrap_or_default();
+        let state = WorkState {
+            format: STATE_FORMAT,
+            bundle: bundle_path.clone(),
+            bundle_size,
+            bundle_mtime_ns,
+            owner: Owner::this_process(),
+            opened: fsutil::unix_now(),
+            saved: None,
+            complete: false,
+            entries: Vec::new(),
+            contents: None,
+            closing: true,
+        };
+        let unpacked = write_state(&dir, &state).and_then(|()| bundle.extract_to(&dir).map(drop));
+        if let Err(e) = unpacked {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        Ok(UnpackedCopy { dir, bundle: bundle_path })
+    }
+
+    /// The unpacked project folder.
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn bundle(&self) -> &Path {
+        &self.bundle
+    }
+}
+
+impl Drop for UnpackedCopy {
+    fn drop(&mut self) {
+        if let Err(e) = remove_working_folder(&self.dir) {
+            log::warn!("could not remove the unpacked copy {}: {e}", self.dir.display());
+        }
     }
 }
 
@@ -816,6 +903,69 @@ mod tests {
         drop(handle);
         discard(&wd).unwrap();
         assert!(!wd.exists() && leftovers(&root).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unpacked_copy_needs_no_lock_and_leaves_nothing_behind() {
+        let dir = temp("copy");
+        let bundle_path = sample_bundle(&dir);
+        let root = dir.join("root");
+        // The bundle is open (locked) elsewhere: a copy to read from still works.
+        let open = WorkFolder::open(&bundle_path, &root).unwrap();
+        let copy = UnpackedCopy::unpack(&bundle_path, &root).unwrap();
+        assert!(copy.dir().starts_with(&root) && copy.dir() != open.dir());
+        assert_eq!(project::load_project(copy.dir()).unwrap().0.name, "Bracket");
+        assert!(copy.bundle().ends_with("Bracket.scancraftz"));
+        // While this app runs, it is in use (never recovered or removed by another start).
+        let listed = leftovers(&root);
+        assert!(listed.iter().all(|l| matches!(l.status, LeftoverStatus::InUse(_))), "{listed:?}");
+        let copy_dir = copy.dir().to_path_buf();
+        drop(copy);
+        assert!(!copy_dir.exists(), "removed when dropped");
+        assert!(LockFile::path_for(&bundle_path).is_file(), "the other holder's lock is untouched");
+        open.close().unwrap();
+
+        // After a crash it is removed without a question: it never held work.
+        let copy = UnpackedCopy::unpack(&bundle_path, &root).unwrap();
+        let copy_dir = copy.dir().to_path_buf();
+        std::mem::forget(copy);
+        let mut state = read_state(&copy_dir).unwrap();
+        state.owner.pid = dead_pid();
+        state.owner.process_started_ms = None;
+        write_state(&copy_dir, &state).unwrap();
+        assert_eq!(leftovers(&root).iter().map(|l| l.status.clone()).collect::<Vec<_>>(), vec![LeftoverStatus::Closing]);
+        assert!(WorkFolder::recover(&copy_dir).is_err());
+        discard(&copy_dir).unwrap();
+        assert!(leftovers(&root).is_empty());
+        // A damaged bundle leaves nothing either.
+        let junk = dir.join("junk.scancraftz");
+        fs::write(&junk, b"not a zip").unwrap();
+        assert!(UnpackedCopy::unpack(&junk, &root).is_err());
+        assert!(leftovers(&root).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bundle_locked_on_another_computer_is_opened_only_when_taken_over() {
+        let dir = temp("take-over");
+        let bundle_path = sample_bundle(&dir);
+        let root = dir.join("root");
+        let mut remote = Owner::this_process();
+        remote.host = "OTHER-PC".into();
+        fs::write(LockFile::path_for(&bundle_path), serde_json::to_vec(&remote).unwrap()).unwrap();
+        match WorkFolder::open(&bundle_path, &root) {
+            Err(IoError::Locked { owner: Some(o), .. }) => assert!(o.may_be_taken_over()),
+            other => panic!("{other:?}"),
+        }
+        let work = WorkFolder::open_taking_over(&bundle_path, &root, &remote).unwrap();
+        assert_eq!(work.lock().replaced().map(|o| o.host.as_str()), Some("OTHER-PC"));
+        assert!(work.lock().is_held());
+        // Never from a running app on this computer (this one, here).
+        let mine = work.lock().owner().clone();
+        assert!(matches!(WorkFolder::open_taking_over(&bundle_path, &root, &mine), Err(IoError::Locked { .. })));
+        work.close().unwrap();
+        assert!(leftovers(&root).is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

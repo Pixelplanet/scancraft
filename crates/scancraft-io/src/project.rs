@@ -15,7 +15,10 @@
 //! ```
 //!
 //! The project file stores scan settings and device information as free-form JSON so the format
-//! does not break when those structures grow; unknown fields are ignored on load. Every path in
+//! does not break when those structures grow. Fields this version does not know (at the top level
+//! and in a pass) are kept: they are read into `other` and a save writes them back, also those of
+//! the file a save replaces when the caller did not read them (forward compatibility: a project
+//! saved by a later version and saved again here keeps that version's additions). Every path in
 //! it is relative to the project folder. One project per folder: a folder with two `.scancraft`
 //! files is refused rather than guessed at, since both would share the pass data. A project file
 //! keeps its file name when the project is renamed; a new folder's file is named after the
@@ -75,6 +78,10 @@ pub struct ProjectFile {
     /// Application settings worth restoring (free-form).
     #[serde(default)]
     pub settings: serde_json::Value,
+    /// Fields this version does not know (written by a later one), kept as they are: a save
+    /// writes them back ([`save_project`]).
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -104,6 +111,10 @@ pub struct PassRecord {
     /// Raw sensor recording, if one was kept (relative or absolute).
     #[serde(default)]
     pub raw_recording: Option<String>,
+    /// Fields of the pass this version does not know, kept as they are (see
+    /// [`ProjectFile::other`]).
+    #[serde(flatten)]
+    pub other: serde_json::Map<String, serde_json::Value>,
 }
 
 fn yes() -> bool {
@@ -516,9 +527,27 @@ pub fn project_file_for_save(dir: &Path, name: &str) -> Result<PathBuf, IoError>
 /// renamed over the old one, and the project file comes last, so an interrupted or failed save
 /// leaves the previous project description in place. An older `project.json` in the folder is
 /// then replaced by the *moved* stub (module documentation).
+///
+/// Fields this version does not know are kept: those of `project` itself, and those of the
+/// project file being replaced in `dir` that `project` does not set (matched by pass id for the
+/// passes' fields), so a caller that builds the project from scratch does not drop what a later
+/// version wrote ([`save_project_carrying`] names another project to take them from when `dir`
+/// has none yet).
 pub fn save_project(dir: &Path, project: &ProjectFile, keyframes: &[(u32, Vec<KeyframeRecord>)]) -> Result<PathBuf, IoError> {
+    save_project_carrying(dir, project, keyframes, None)
+}
+
+/// [`save_project`]; when `dir` holds no project file yet (Save As into a new place), the unknown
+/// fields come from `previous` (a project folder or project file) instead.
+pub fn save_project_carrying(dir: &Path, project: &ProjectFile, keyframes: &[(u32, Vec<KeyframeRecord>)], previous: Option<&Path>) -> Result<PathBuf, IoError> {
     fs::create_dir_all(dir)?;
     let target = project_file_for_save(dir, &project.name)?;
+    let mut project = std::borrow::Cow::Borrowed(project);
+    let replaced = locate(dir).ok().map(|l| l.file).or_else(|| previous.and_then(|p| locate(p).ok()).map(|l| l.file));
+    if let Some(old) = replaced.and_then(|f| read_project_file(&f).ok()) {
+        carry_unknown_fields(project.to_mut(), &old);
+    }
+    let project = project.as_ref();
     for (id, kfs) in keyframes {
         let record = project.passes.iter().find(|p| p.id == *id).ok_or_else(|| IoError::Parse(format!("pass {id} is not in the project")))?;
         if !fsutil::is_safe_relative(&record.keyframes) {
@@ -534,6 +563,41 @@ pub fn save_project(dir: &Path, project: &ProjectFile, keyframes: &[(u32, Vec<Ke
     fsutil::atomic_write(&target, json.as_bytes())?;
     retire_legacy_file(dir, &target, project);
     Ok(target)
+}
+
+/// Copies the fields this version does not know from `old` into `project` where `project` does
+/// not have them: the top-level ones, and each pass's by pass id (a pass deleted since is gone
+/// with its fields).
+pub fn carry_unknown_fields(project: &mut ProjectFile, old: &ProjectFile) {
+    for (k, v) in &old.other {
+        project.other.entry(k.clone()).or_insert_with(|| v.clone());
+    }
+    for pass in &mut project.passes {
+        if let Some(o) = old.passes.iter().find(|o| o.id == pass.id) {
+            for (k, v) in &o.other {
+                pass.other.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+        }
+    }
+}
+
+/// The stamp ([`fsutil::FileStamp`]) of the project file of the project at `path` (a folder or
+/// its project file), `None` when there is none.
+pub fn project_file_stamp(path: &Path) -> Option<fsutil::FileStamp> {
+    locate(path).ok().and_then(|l| fsutil::stamp(&l.file))
+}
+
+/// `Err(IoError::Conflict)` when the project file of the project at `dir` is no longer the one
+/// with stamp `seen` (taken when the project was opened or last saved here): someone else saved
+/// it meanwhile, and saving now would replace their version. `seen: None` (not known) and a
+/// project file that is gone (saving puts it back) are not conflicts.
+pub fn check_unchanged(dir: &Path, seen: Option<fsutil::FileStamp>) -> Result<(), IoError> {
+    let Some(seen) = seen else { return Ok(()) };
+    let Ok(location) = locate(dir) else { return Ok(()) };
+    match fsutil::stamp(&location.file) {
+        Some(now) if now != seen => Err(IoError::Conflict(format!("{} was changed by someone else since it was opened here; saving would replace that version", location.file.display()))),
+        _ => Ok(()),
+    }
 }
 
 /// Replaces a real `project.json` in `dir` by the stub pointing at `target`. A failure only means
@@ -641,6 +705,7 @@ mod tests {
             start: "moved".into(),
             keyframes: keyframes_path(id),
             raw_recording: None,
+            other: Default::default(),
         };
         let project = ProjectFile {
             format: FORMAT_VERSION,
@@ -650,6 +715,7 @@ mod tests {
             passes: vec![pass(1, "reference"), pass(2, "aligned"), pass(3, "unaligned")],
             outputs: vec![OutputRecord { kind: "merged".into(), file: "outputs/merged.ply".into(), points: 42, passes: vec![1, 2] }],
             settings: serde_json::json!({ "min_mm": 150.0 }),
+            other: Default::default(),
         };
         let kfs = vec![(1, vec![keyframe(0, 10), keyframe(1, 0)]), (2, vec![keyframe(5, 100)]), (3, Vec::new())];
         save_project(&dir, &project, &kfs).unwrap();
@@ -683,9 +749,11 @@ mod tests {
                 start: "moved".into(),
                 keyframes: keyframes_path(1),
                 raw_recording: None,
+                other: Default::default(),
             }],
             outputs: Vec::new(),
             settings: serde_json::json!({}),
+            other: Default::default(),
         }
     }
 
@@ -839,5 +907,73 @@ mod tests {
         fs::write(&path, b"PLY\n....").unwrap();
         assert!(read_keyframes(&path).is_err());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn fields_of_a_later_version_are_kept_on_save() {
+        let dir = temp("forward");
+        let kfs = vec![(1, vec![keyframe(0, 3)])];
+        let file = save_project(&dir, &small_project("Bracket"), &kfs).unwrap();
+        // A later version adds fields at the top level and in a pass (and a pass it knows).
+        let mut json: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        json["thumbnail"] = serde_json::json!({ "file": "thumb.png", "size": [256, 256] });
+        json["passes"][0]["lighting"] = serde_json::json!("dome");
+        fs::write(&file, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        // Read here: the unknown fields are held, and written back as they were.
+        let (loaded, loaded_kfs) = load_project(&dir).unwrap();
+        assert_eq!(loaded.other.get("thumbnail"), Some(&json["thumbnail"]));
+        assert_eq!(loaded.passes[0].other.get("lighting"), Some(&serde_json::json!("dome")));
+        save_project(&dir, &loaded, &loaded_kfs).unwrap();
+        let again: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        assert_eq!(again["thumbnail"], json["thumbnail"]);
+        assert_eq!(again["passes"][0]["lighting"], "dome");
+
+        // A caller that builds the project from scratch (the app does) keeps them too: they come
+        // from the file being replaced. A field the caller sets wins; a deleted pass's are gone.
+        let mut fresh = small_project("Bracket");
+        fresh.other.insert("thumbnail".into(), serde_json::json!("mine"));
+        fresh.passes.push(PassRecord { id: 2, keyframes: keyframes_path(2), ..fresh.passes[0].clone() });
+        save_project(&dir, &fresh, &[(1, vec![keyframe(0, 3)]), (2, Vec::new())]).unwrap();
+        let (loaded, _) = load_project(&dir).unwrap();
+        assert_eq!(loaded.other.get("thumbnail"), Some(&serde_json::json!("mine")));
+        assert_eq!(loaded.passes[0].other.get("lighting"), Some(&serde_json::json!("dome")));
+        assert!(loaded.passes[1].other.is_empty(), "pass 2 is new: nothing to carry");
+
+        // Save As into a new folder takes them from the previous project.
+        let moved = temp("forward-moved");
+        save_project_carrying(&moved, &small_project("Bracket"), &kfs, Some(&dir)).unwrap();
+        let (copied, _) = load_project(&moved).unwrap();
+        assert_eq!(copied.other.get("thumbnail"), Some(&serde_json::json!("mine")));
+        assert_eq!(copied.passes[0].other.get("lighting"), Some(&serde_json::json!("dome")));
+        // A newer *format* is still refused, unknown fields or not.
+        json["format"] = serde_json::json!(FORMAT_VERSION + 1);
+        fs::write(&file, serde_json::to_vec(&json).unwrap()).unwrap();
+        assert!(matches!(load_project(&dir), Err(IoError::Unsupported(_))));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&moved);
+    }
+
+    #[test]
+    fn a_project_file_changed_by_someone_else_is_a_conflict() {
+        let dir = temp("conflict");
+        let kfs = vec![(1, vec![keyframe(0, 3)])];
+        save_project(&dir, &small_project("Bracket"), &kfs).unwrap();
+        let seen = project_file_stamp(&dir);
+        assert!(seen.is_some());
+        assert!(check_unchanged(&dir, seen).is_ok());
+        assert!(check_unchanged(&dir, None).is_ok(), "not known: no conflict");
+        // Someone else saves (another size, a later time).
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        save_project(&dir, &small_project("Bracket, edited elsewhere"), &kfs).unwrap();
+        match check_unchanged(&dir, seen) {
+            Err(IoError::Conflict(why)) => assert!(why.contains("changed by someone else"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        // Gone: saving puts it back, no conflict.
+        let file = locate(&dir).unwrap().file;
+        fs::remove_file(&file).unwrap();
+        assert!(check_unchanged(&dir, seen).is_ok());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

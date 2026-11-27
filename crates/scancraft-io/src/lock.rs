@@ -11,7 +11,9 @@
 //! only one wins. A lock whose owner is gone (same host, process no longer running, or the
 //! process id now belongs to a later process) is stale and taken over; a live one is refused with
 //! who holds it ([`IoError::Locked`]). A lock from another host cannot be checked and counts as
-//! live; [`LockFile::take_over`] breaks it once the user confirmed. The lock is removed when its
+//! live; [`LockFile::take_over_from`] breaks it once the user confirmed (only from the holder the
+//! user was shown, never from a process running on this computer). A taken-over lock remembers
+//! whose it was ([`LockFile::replaced`]) so the app can say so. The lock is removed when its
 //! [`LockFile`] is dropped (only if it is still ours).
 
 use std::fs::{self, OpenOptions};
@@ -57,6 +59,14 @@ pub enum Liveness {
 }
 
 impl Owner {
+    /// Whether the user may be offered to take a lock of this owner over: it is on another
+    /// computer (which cannot be checked from here). An owner on this computer is either running
+    /// (never taken over) or ended (its lock is taken over without asking, see
+    /// [`LockFile::acquire`]).
+    pub fn may_be_taken_over(&self) -> bool {
+        self.liveness() == Liveness::Unknown
+    }
+
     /// This process, now.
     pub fn this_process() -> Owner {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -109,6 +119,9 @@ fn same_start(recorded: Option<u64>, now: Option<u64>) -> bool {
 pub struct LockFile {
     path: PathBuf,
     owner: Owner,
+    /// The holder whose lock this one replaced: a stale lock of an ended process taken over by
+    /// [`LockFile::acquire`], or another holder broken by [`LockFile::take_over_from`].
+    replaced: Option<Box<Owner>>,
 }
 
 impl LockFile {
@@ -136,9 +149,13 @@ impl LockFile {
     /// Takes the lock at `path`: creates it, or takes over a stale one. A live lock (also one of
     /// this process: the project is already open here) is refused with [`IoError::Locked`].
     pub fn acquire(path: &Path) -> Result<LockFile, IoError> {
+        let mut replaced = None;
         for _ in 0..4 {
             match LockFile::create(path) {
-                Ok(lock) => return Ok(lock),
+                Ok(mut lock) => {
+                    lock.replaced = replaced;
+                    return Ok(lock);
+                }
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(e) => return Err(e.into()),
             }
@@ -147,6 +164,7 @@ impl LockFile {
                 Holder::Owner(owner) if owner.liveness() == Liveness::Dead => {
                     log::info!("taking over the stale lock {} of {}", path.display(), owner.describe());
                     break_lock(path)?;
+                    replaced = Some(Box::new(owner));
                 }
                 Holder::Unreadable { age_secs } if age_secs > UNREADABLE_GRACE_SECS => {
                     log::warn!("taking over the unreadable lock {}", path.display());
@@ -168,6 +186,28 @@ impl LockFile {
         LockFile::acquire(path)
     }
 
+    /// Takes the lock from `expected`, the holder the user was shown and agreed to take it from.
+    /// Refused ([`IoError::Locked`] naming the holder now) when another one holds it by now, and
+    /// always for a live process on this computer (a ScanCraft that is running: never broken).
+    /// A lock that is free by now is simply taken.
+    pub fn take_over_from(path: &Path, expected: &Owner) -> Result<LockFile, IoError> {
+        match read_holder(path) {
+            Holder::Gone => {}
+            Holder::Owner(now) if now.token == expected.token && now.pid == expected.pid && now.host == expected.host => {
+                if now.is_this_process() || now.liveness() == Liveness::Alive {
+                    return Err(IoError::Locked { path: path.to_path_buf(), owner: Some(Box::new(now)) });
+                }
+                log::warn!("taking over the lock {} of {} (confirmed by the user)", path.display(), now.describe());
+                break_lock(path)?;
+            }
+            Holder::Owner(now) => return Err(IoError::Locked { path: path.to_path_buf(), owner: Some(Box::new(now)) }),
+            Holder::Unreadable { .. } => return Err(IoError::Locked { path: path.to_path_buf(), owner: None }),
+        }
+        let mut lock = LockFile::acquire(path)?;
+        lock.replaced.get_or_insert_with(|| Box::new(expected.clone()));
+        Ok(lock)
+    }
+
     fn create(path: &Path) -> io::Result<LockFile> {
         let owner = Owner::this_process();
         let mut f = OpenOptions::new().write(true).create_new(true).open(path)?;
@@ -178,7 +218,7 @@ impl LockFile {
             let _ = fs::remove_file(path);
             return Err(e);
         }
-        Ok(LockFile { path: path.to_path_buf(), owner })
+        Ok(LockFile { path: path.to_path_buf(), owner, replaced: None })
     }
 
     pub fn path(&self) -> &Path {
@@ -187,6 +227,12 @@ impl LockFile {
 
     pub fn owner(&self) -> &Owner {
         &self.owner
+    }
+
+    /// Whose lock this one replaced, if it replaced one (see the field): the app says so, a
+    /// lock is never taken from someone silently.
+    pub fn replaced(&self) -> Option<&Owner> {
+        self.replaced.as_deref()
     }
 
     /// Whether the file on disk still names this lock (someone may have broken it).
@@ -415,6 +461,47 @@ mod tests {
         fs::File::options().write(true).open(&path).unwrap().set_modified(old).unwrap();
         drop(LockFile::acquire(&path).unwrap());
         assert!(!path.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_is_taken_over_only_from_the_holder_shown() {
+        let dir = temp("take-over");
+        let path = dir.join(FOLDER_LOCK_FILE);
+        let mut remote = Owner::this_process();
+        remote.host = "SOME-OTHER-PC".into();
+        remote.pid = 4242;
+        assert!(remote.may_be_taken_over());
+        fs::write(&path, serde_json::to_vec(&remote).unwrap()).unwrap();
+        // Another holder by now (the other PC closed and a third opened it): refused, naming it.
+        let mut shown = remote.clone();
+        shown.token = "another".into();
+        shown.host = "THIRD-PC".into();
+        match LockFile::take_over_from(&path, &shown) {
+            Err(IoError::Locked { owner: Some(o), .. }) => assert_eq!(o.host, "SOME-OTHER-PC"),
+            other => panic!("{other:?}"),
+        }
+        // From the holder shown: taken, and the lock says whose it was.
+        let lock = LockFile::take_over_from(&path, &remote).unwrap();
+        assert!(lock.is_held() && lock.replaced() == Some(&remote));
+        drop(lock);
+        // Free by now: simply taken.
+        drop(LockFile::take_over_from(&path, &remote).unwrap());
+        // A live process on this computer is never broken, even when it is the one shown.
+        let live = LockFile::acquire(&path).unwrap();
+        let mut running = live.owner().clone();
+        assert!(!running.may_be_taken_over());
+        assert!(matches!(LockFile::take_over_from(&path, &running), Err(IoError::Locked { .. })));
+        assert!(live.is_held());
+        drop(live);
+        // A stale lock of an ended process is taken without asking, but not silently.
+        running.pid = dead_pid();
+        running.process_started_ms = None;
+        assert!(!running.may_be_taken_over(), "an ended process's lock needs no question");
+        fs::write(&path, serde_json::to_vec(&running).unwrap()).unwrap();
+        let lock = LockFile::acquire(&path).unwrap();
+        assert_eq!(lock.replaced().map(|o| o.pid), Some(running.pid));
+        drop(lock);
         let _ = fs::remove_dir_all(&dir);
     }
 

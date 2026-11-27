@@ -638,8 +638,25 @@ fn leave_out(item: Item, rel: &str, present: &HashSet<&str>) -> Leave {
     }
 }
 
+/// Entries at least this large get ZIP64 size fields ([`LARGE_ENTRY`]; tests lower it to reach
+/// the ZIP64 paths with small files).
+#[cfg(not(test))]
+fn large_entry() -> u64 {
+    LARGE_ENTRY
+}
+
+#[cfg(test)]
+thread_local! {
+    static LARGE_ENTRY_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(LARGE_ENTRY) };
+}
+
+#[cfg(test)]
+fn large_entry() -> u64 {
+    LARGE_ENTRY_FOR_TEST.with(|c| c.get())
+}
+
 fn zip_options(size: u64, mtime_ns: u64) -> FileOptions {
-    let mut options = FileOptions::default().compression_method(CompressionMethod::Stored).large_file(size >= LARGE_ENTRY).unix_permissions(0o644);
+    let mut options = FileOptions::default().compression_method(CompressionMethod::Stored).large_file(size >= large_entry()).unix_permissions(0o644);
     let (y, mo, d, h, mi, s) = fsutil::civil_utc(mtime_ns / 1_000_000_000);
     if let Ok(t) = u16::try_from(y).map_err(drop).and_then(|y| zip::DateTime::from_date_and_time(y, mo as u8, d as u8, h as u8, mi as u8, s as u8)) {
         options = options.last_modified_time(t);
@@ -841,6 +858,7 @@ pub(crate) mod tests {
             start: "moved".into(),
             keyframes: keyframes_path(id),
             raw_recording: raw.map(str::to_string),
+            other: Default::default(),
         }
     }
 
@@ -856,6 +874,7 @@ pub(crate) mod tests {
             passes: vec![pass(1, None), pass(2, Some("pass-2/raw.bin"))],
             outputs: Vec::new(),
             settings: serde_json::json!({}),
+            other: Default::default(),
         };
         let file = project::save_project(dir, &project, &[(1, vec![keyframe(0, 50)]), (2, vec![keyframe(1, 80), keyframe(2, 10)])]).unwrap();
         let put = |rel: &str, bytes: &[u8]| {
@@ -1047,6 +1066,177 @@ pub(crate) mod tests {
         bundle.extract_to(&fresh).unwrap();
         assert_eq!(fs::read(fresh.join("outputs/mesh.ply")).unwrap(), vec![3u8; 900], "the working folder's file, not the replaced bundle's");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The local header of entry `index`: (compressed size field, extra field id) as written.
+    fn local_header(path: &Path, index: usize) -> (u32, Option<u16>) {
+        let mut archive = ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let start = archive.by_index_raw(index).unwrap().header_start() as usize;
+        let bytes = fs::read(path).unwrap();
+        let h = &bytes[start..];
+        assert_eq!(&h[..4], b"PK\x03\x04");
+        let compressed = u32::from_le_bytes(h[18..22].try_into().unwrap());
+        let (name_len, extra_len) = (u16::from_le_bytes([h[26], h[27]]) as usize, u16::from_le_bytes([h[28], h[29]]));
+        let extra = (extra_len >= 4).then(|| u16::from_le_bytes([h[30 + name_len], h[31 + name_len]]));
+        (compressed, extra)
+    }
+
+    /// Bundles get ZIP64 size fields for entries that may pass 4 GiB. With the threshold lowered
+    /// every entry takes that path: written, listed, checked, extracted and copied raw on Save
+    /// like any other (the > 4 GiB offsets themselves: the next test).
+    #[test]
+    fn zip64_entries_round_trip() {
+        let dir = temp("zip64");
+        let project = dir.join("Bracket");
+        sample_project(&project);
+        let bundle_path = dir.join("Bracket.scancraftz");
+        LARGE_ENTRY_FOR_TEST.with(|c| c.set(0));
+        let written = write_bundle(&project, &bundle_path, &BundleContents::everything());
+        LARGE_ENTRY_FOR_TEST.with(|c| c.set(LARGE_ENTRY));
+        written.unwrap();
+        let mut bundle = Bundle::open(&bundle_path).unwrap();
+        for e in bundle.entries() {
+            assert_eq!(local_header(&bundle_path, e.index), (u32::MAX, Some(0x0001)), "{} has ZIP64 sizes", e.name);
+        }
+        assert!(bundle.verify().unwrap().is_ok());
+        assert_eq!(bundle.read_project().unwrap().name, "Bracket");
+        let work = dir.join("work");
+        let recorded = bundle.extract_to(&work).unwrap();
+        assert_eq!(fs::read(work.join("pass-2/raw.bin")).unwrap(), vec![1u8; 4000]);
+        drop(bundle);
+        // Save copies them raw (small now, so with plain headers) and the result reads the same.
+        let (report, _) = save_back(&work, &bundle_path, &recorded, &bundle_path, &BundleContents::everything()).unwrap();
+        assert_eq!(report.written, 0, "{report:?}");
+        let mut again = Bundle::open(&bundle_path).unwrap();
+        assert!(again.verify().unwrap().is_ok());
+        assert_eq!(again.read("outputs/mesh.ply").unwrap(), vec![3u8; 900]);
+        // Normal sizes stay plain ZIP.
+        assert!(local_header(&bundle_path, again.project_entry().index).1.is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A seekable byte store that keeps only pages that are not all zero: a ZIP with a 4 GiB
+    /// entry costs a few MB of memory and no disk.
+    #[derive(Default)]
+    struct Sparse {
+        pages: HashMap<u64, Box<[u8]>>,
+        len: u64,
+        pos: u64,
+    }
+
+    const PAGE: u64 = 1 << 16;
+
+    impl Write for Sparse {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut done = 0;
+            while done < buf.len() {
+                let at = self.pos + done as u64;
+                let (page, off) = (at / PAGE, (at % PAGE) as usize);
+                let n = (PAGE as usize - off).min(buf.len() - done);
+                let part = &buf[done..done + n];
+                if self.pages.contains_key(&page) || part.iter().any(|&b| b != 0) {
+                    let p = self.pages.entry(page).or_insert_with(|| vec![0u8; PAGE as usize].into_boxed_slice());
+                    p[off..off + n].copy_from_slice(part);
+                }
+                done += n;
+            }
+            self.pos += buf.len() as u64;
+            self.len = self.len.max(self.pos);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Read for Sparse {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = (self.len.saturating_sub(self.pos)).min(buf.len() as u64) as usize;
+            let mut done = 0;
+            while done < n {
+                let at = self.pos + done as u64;
+                let (page, off) = (at / PAGE, (at % PAGE) as usize);
+                let k = (PAGE as usize - off).min(n - done);
+                match self.pages.get(&page) {
+                    Some(p) => buf[done..done + k].copy_from_slice(&p[off..off + k]),
+                    None => buf[done..done + k].fill(0),
+                }
+                done += k;
+            }
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl io::Seek for Sparse {
+        fn seek(&mut self, to: io::SeekFrom) -> io::Result<u64> {
+            self.pos = match to {
+                io::SeekFrom::Start(p) => p,
+                io::SeekFrom::End(d) => self.len.checked_add_signed(d).ok_or(io::ErrorKind::InvalidInput)?,
+                io::SeekFrom::Current(d) => self.pos.checked_add_signed(d).ok_or(io::ErrorKind::InvalidInput)?,
+            };
+            Ok(self.pos)
+        }
+    }
+
+    /// Past 4 GiB for real, in memory: an entry larger than 4 GiB written with the bundle's own
+    /// entry options, an entry behind it (its offset past 4 GiB), read back with the CRC checked,
+    /// and copied raw into a second archive as Save does with unchanged entries.
+    #[test]
+    fn entries_and_offsets_past_4_gib_round_trip() {
+        const BIG: u64 = (4 << 30) + 3 * PAGE + 123;
+        let tail = b"the end of a long recording";
+        let mut zw = ZipWriter::new(Sparse::default());
+        zw.start_file("pass-1/raw.bin", zip_options(BIG, 0)).unwrap();
+        let zeros = vec![0u8; 1 << 20];
+        let mut left = BIG - tail.len() as u64;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            zw.write_all(&zeros[..n]).unwrap();
+            left -= n as u64;
+        }
+        zw.write_all(tail).unwrap();
+        zw.start_file("Part.scancraft", zip_options(2, 0)).unwrap();
+        zw.write_all(b"{}").unwrap();
+        let store = zw.finish().unwrap();
+        assert!(store.len > BIG && store.pages.len() < 64, "{} pages", store.pages.len());
+
+        let read_all = |store: Sparse| -> Sparse {
+            let mut archive = ZipArchive::new(store).unwrap();
+            assert_eq!(archive.len(), 2);
+            {
+                let big = archive.by_index_raw(0).unwrap();
+                assert_eq!((big.name(), big.size(), big.compressed_size()), ("pass-1/raw.bin", BIG, BIG));
+            }
+            assert!(archive.by_index_raw(1).unwrap().header_start() > u32::MAX as u64, "the second entry starts past 4 GiB");
+            let mut small = String::new();
+            archive.by_name("Part.scancraft").unwrap().read_to_string(&mut small).unwrap();
+            assert_eq!(small, "{}");
+            // Read through to the end: the CRC is checked there.
+            let mut big = archive.by_index(0).unwrap();
+            let mut buf = vec![0u8; 1 << 20];
+            let (mut total, mut last) = (0u64, Vec::new());
+            loop {
+                let n = big.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                total += n as u64;
+                last = buf[..n].to_vec();
+            }
+            assert_eq!(total, BIG);
+            assert!(last.ends_with(tail));
+            drop(big);
+            archive.into_inner()
+        };
+        let store = read_all(store);
+        // Save copies an unchanged entry raw.
+        let mut archive = ZipArchive::new(store).unwrap();
+        let mut copy = ZipWriter::new(Sparse::default());
+        copy.raw_copy_file(archive.by_index_raw(0).unwrap()).unwrap();
+        copy.raw_copy_file(archive.by_index_raw(1).unwrap()).unwrap();
+        read_all(copy.finish().unwrap());
     }
 
     #[test]
