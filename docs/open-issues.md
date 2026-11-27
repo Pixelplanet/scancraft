@@ -604,9 +604,10 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
 - **Project in use on another computer** (`open_project`, `ui_shell::lock_prompt`): opening a
   folder or bundle whose lock names another computer (cannot be checked from here) asks:
   **Open Read-Only** (a copy in a tab with no place on disk, name "… (read-only)": a folder is
-  read in place, a bundle through a temporary unpacked copy that is removed again,
-  `workdir::UnpackedCopy`; nothing is locked or written there; Save asks for a new place and
-  brings a folder's raw recordings along), **Take Over** (destructive;
+  read in place, a bundle through an unpacked copy, `workdir::UnpackedCopy`, kept until the tab
+  closes or moves; nothing is locked or written there; Save asks for a new place and brings the
+  raw recordings and the fields of later versions along, from a folder and a bundle alike),
+  **Take Over** (destructive;
   `LockFile::take_over_from` takes it only from the holder shown, refused when someone else holds
   it by now and always for a running process on this PC), **Cancel**. A lock of a running
   ScanCraft on this PC is still refused without a question. A lock of a process that has ended
@@ -637,6 +638,35 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
   one behind it (offset past 4 GiB) into an in-memory sparse store with the bundle's own entry
   options, reads it back with the CRC checked, and raw-copies both into a second archive. Not
   tested: more than 65 535 entries, and a > 4 GiB bundle on a real disk.
+
+**Review fixes 2026-11-27** (each with a test that failed before; no GUI run):
+- A proposed free name (Save As… after the conflict question, a read-only copy) was worked out
+  once; if another tab, app or computer saved there before Save, that project was silently
+  replaced. The tab remembers the proposal (`ProjectInfo::proposed`); a save to it that finds it
+  taken is refused, and the next free name is proposed (`a_proposed_name_taken_meanwhile_is_never_
+  saved_over`). A name the user types still saves into an existing folder as before.
+- A read-only copy of a bundle dropped its raw recordings and the fields of later versions on
+  Save (its unpacked copy was gone). The copy now stays with the tab (`Store::ReadOnly { copy }`)
+  and Save takes both from it (`a_bundle_open_on_another_pc_opens_read_only_or_taken_over`).
+- A bundle tab whose lock was taken over elsewhere could never be saved again, with a wrong
+  "being opened by another ScanCraft" message. `WorkFolder::relock` takes back a lock that has
+  been let go (as a folder tab does); one held by someone else refuses the save naming them and
+  points to saving under another name (`a_bundle_taken_over_elsewhere_saves_once_it_is_let_go`,
+  io `a_lock_taken_over_and_let_go_is_taken_back_on_save`).
+- The second start's ignored options were replaced at once by the open's own messages, and the
+  text spoke of a project when none was given. They now go with the result of the open
+  (`ScanCraftApp::carried_note`, `take_handover`), and the text has a form without a project.
+- Add Project through the file dialog showed "Shell.scancraft" or "project.json" in the status
+  and history; it now shows the project's name (`project_label`).
+- Quit over an open lock or conflict question: Save All did nothing and said nothing. It is now
+  disabled with the reason, and says it when triggered (`save_all_blocked`). The lock question's
+  Cancel says "Not opened".
+- Paths stored in a project (keyframes, surfaces, cleaned clouds, colour keyframes, outputs) were
+  resolved as given: a crafted project or bundle could make the app read any local file or a UNC
+  share (sending Windows credentials). `project::resolve` now refuses anything but a plain
+  relative path inside the project folder, for folders and bundles alike (raw recordings, never
+  read on open, are the exception): `files_named_outside_the_project_folder_are_never_read`,
+  `projects_naming_files_outside_their_folder_are_refused`.
 
 Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
 is unpacked at disk speed); a real Settings window (the bundle options live in the Save card); a

@@ -421,3 +421,11 @@ laser model are not built.
   `packaging/windows/install.ps1` / `uninstall.ps1` (not run). Not tested with a real window or
   double-click. Status in `docs/open-issues.md` 4.1. The user's report about marker depressions
   and cross-line laser artifacts on the top surface of the part was not addressed in this track.
+- 2026-11-27 (branch `agent/project-file`) — Shared-folder project files: save-conflict question
+  (Save Anyway / Save As…), lock question for another PC (Take Over / Open Read-Only), Add Project
+  with bundles, folder entries in the dialogs, second-start options named, unknown project-file
+  fields kept, ZIP64 tests. Review fixes: a proposed free name taken meanwhile is never saved
+  over, read-only bundle copies keep raw recordings and later fields, a bundle lock let go is
+  taken back on save, project paths outside the project folder (absolute, `..`, UNC) are refused
+  on open. Unit tests only, nothing tried in a window or Explorer. Status in
+  `docs/open-issues.md` 4.1.
