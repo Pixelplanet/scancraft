@@ -310,7 +310,19 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
         }
     };
     // An empty primary label means "not possible here" (Save All with a never-saved project).
-    let actions = kit::Actions { primary: primary.filter(|l| !l.is_empty()).map(|label| (label, true)), cancel: Some("Cancel"), destructive: Some((destructive, true)), ..Default::default() };
+    // Save All waits while a question is open or a job runs (the window's close button can open
+    // this dialog over the lock or conflict question): disabled, with the reason.
+    let blocked = match prompt {
+        ClosePrompt::Quit => app.save_all_blocked(),
+        ClosePrompt::Tab => None,
+    };
+    let actions = kit::Actions {
+        primary: primary.filter(|l| !l.is_empty()).map(|label| (label, blocked.is_none())),
+        primary_tip: blocked,
+        cancel: Some("Cancel"),
+        destructive: Some((destructive, true)),
+        ..Default::default()
+    };
     let choice = kit::confirm_modal(ctx, egui::Id::new("close_prompt"), icon, title, &message, &actions);
     match (prompt, choice) {
         (_, Some(kit::Choice::Cancel)) => app.close_prompt = None,
@@ -338,7 +350,7 @@ pub fn lock_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
     match kit::confirm_modal(ctx, egui::Id::new("lock_prompt"), warning_icon(), "Project in Use", &message, &actions) {
         Some(kit::Choice::Primary) => app.open_read_only(),
         Some(kit::Choice::Destructive) => app.take_over_and_open(),
-        Some(kit::Choice::Cancel) => app.lock_prompt = None,
+        Some(kit::Choice::Cancel) => app.cancel_lock_prompt(),
         None => {}
     }
 }

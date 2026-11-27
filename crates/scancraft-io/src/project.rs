@@ -631,7 +631,7 @@ pub fn load_project(path: &Path) -> Result<(ProjectFile, PassKeyframes), IoError
     let project = read_project_file(&location.file)?;
     let mut keyframes = Vec::with_capacity(project.passes.len());
     for p in &project.passes {
-        let file = resolve(&location.root, &p.keyframes);
+        let file = resolve(&location.root, &p.keyframes)?;
         let kfs = read_keyframes(&file).map_err(|e| match e {
             IoError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => IoError::Parse(format!("{}: the keyframes of {} ({}) are missing", location.root.display(), p.name, p.keyframes)),
             other => other,
@@ -661,10 +661,17 @@ pub fn is_project(path: &Path) -> bool {
     locate(path).is_ok()
 }
 
-/// Resolves a path stored in the project relative to its folder.
-pub fn resolve(dir: &Path, stored: &str) -> PathBuf {
-    let p = Path::new(stored);
-    if p.is_absolute() { p.to_path_buf() } else { dir.join(p) }
+/// Resolves a file the project names (keyframes, surfaces, outputs, colour keyframes) inside its
+/// folder `dir`. Refused when the stored path is not a plain relative path inside the folder
+/// ([`fsutil::is_safe_relative`]: absolute, a drive or share such as `\\host\share`, `..`, or
+/// backslashes): ScanCraft writes only such paths, and a project or bundle from someone else must
+/// never make it read files elsewhere on this computer or on the network. (Raw recordings, which
+/// may be stored elsewhere, are never read on open.)
+pub fn resolve(dir: &Path, stored: &str) -> Result<PathBuf, IoError> {
+    if !fsutil::is_safe_relative(stored) {
+        return Err(IoError::Parse(format!("{}: the project names the file {stored:?}, which is not inside its folder", dir.display())));
+    }
+    Ok(dir.join(stored))
 }
 
 #[cfg(test)]
@@ -974,6 +981,29 @@ mod tests {
         let file = locate(&dir).unwrap().file;
         fs::remove_file(&file).unwrap();
         assert!(check_unchanged(&dir, seen).is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn files_named_outside_the_project_folder_are_never_read() {
+        let dir = temp("outside");
+        // A keyframe file elsewhere on this computer that a crafted project names.
+        let private = dir.join("private");
+        fs::create_dir_all(&private).unwrap();
+        let secret = private.join("secret.bin");
+        write_keyframes(&secret, &[keyframe(7, 2)]).unwrap();
+        let project_dir = dir.join("Evil");
+        save_project(&project_dir, &small_project("Evil"), &[(1, vec![keyframe(1, 1)])]).unwrap();
+        let file = locate(&project_dir).unwrap().file;
+        for stored in [secret.display().to_string(), "../private/secret.bin".into(), r"\\attacker.example\s\k.bin".into(), r"pass-1\keyframes.bin".into(), "C:secret.bin".into()] {
+            let mut p = read_project_file(&file).unwrap();
+            p.passes[0].keyframes = stored.clone();
+            fs::write(&file, serde_json::to_vec_pretty(&p).unwrap()).unwrap();
+            match load_project(&project_dir) {
+                Err(IoError::Parse(why)) => assert!(why.contains("not inside its folder"), "{stored}: {why}"),
+                other => panic!("{stored}: {other:?}"),
+            }
+        }
+        assert!(resolve(&project_dir, "pass-1/keyframes.bin").is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 }

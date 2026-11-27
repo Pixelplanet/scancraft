@@ -338,19 +338,30 @@ impl WorkFolder {
         self.state.held_contents()
     }
 
-    fn check_lock(&self) -> Result<(), IoError> {
+    /// Makes sure this folder holds its bundle's lock again before writing the bundle. A lock
+    /// that another app took over (Take Over on another computer) and has since let go is taken
+    /// again, as a project folder's is; one that someone else holds now is refused with
+    /// [`IoError::Locked`] naming them.
+    pub fn relock(&mut self) -> Result<(), IoError> {
         if self.lock.is_held() {
             return Ok(());
         }
-        Err(IoError::Locked { path: self.lock.path().to_path_buf(), owner: lock::holder(self.lock.path()).map(Box::new) })
+        let again = LockFile::lock_project(&self.state.bundle).map_err(|e| match e {
+            // (A lock file being written right now has no holder to name yet.)
+            IoError::Locked { owner: None, .. } => IoError::Locked { path: self.lock.path().to_path_buf(), owner: lock::holder(self.lock.path()).map(Box::new) },
+            other => other,
+        })?;
+        self.lock = again;
+        Ok(())
     }
 
     /// *Save*: writes the working folder back into its bundle. Refused with
     /// [`IoError::Conflict`] when the bundle was changed by someone else since it was opened or
     /// last saved ([`WorkFolder::save_overwriting`] replaces it anyway), and with
-    /// [`IoError::Locked`] when another app broke this app's lock.
+    /// [`IoError::Locked`] when someone else holds its lock now (a lock taken over and let go
+    /// again is taken back: [`WorkFolder::relock`]).
     pub fn save(&mut self, contents: &BundleContents) -> Result<BundleReport, IoError> {
-        self.check_lock()?;
+        self.relock()?;
         if self.state.bundle.exists() && self.bundle_changed() {
             return Err(IoError::Conflict(format!("{} was changed by someone else since it was opened; saving would replace that version", self.state.bundle.display())));
         }
@@ -360,7 +371,7 @@ impl WorkFolder {
 
     /// *Save* over a bundle that was changed by someone else (after the user confirmed).
     pub fn save_overwriting(&mut self, contents: &BundleContents) -> Result<BundleReport, IoError> {
-        self.check_lock()?;
+        self.relock()?;
         let dest = self.state.bundle.clone();
         self.write_to(&dest, contents)
     }
@@ -966,6 +977,40 @@ mod tests {
         assert!(matches!(WorkFolder::open_taking_over(&bundle_path, &root, &mine), Err(IoError::Locked { .. })));
         work.close().unwrap();
         assert!(leftovers(&root).is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_taken_over_and_let_go_is_taken_back_on_save() {
+        let dir = temp("relock");
+        let bundle_path = sample_bundle(&dir);
+        let root = dir.join("root");
+        let mut work = WorkFolder::open(&bundle_path, &root).unwrap();
+        // Another computer takes the bundle over: saving here names it (not "being opened").
+        let mut remote = Owner::this_process();
+        remote.host = "OTHER-PC".into();
+        fs::write(LockFile::path_for(&bundle_path), serde_json::to_vec(&remote).unwrap()).unwrap();
+        for result in [work.save(&BundleContents::default()), work.save_overwriting(&BundleContents::default())] {
+            match result {
+                Err(IoError::Locked { owner: Some(o), .. }) => assert_eq!(o.host, "OTHER-PC"),
+                other => panic!("{other:?}"),
+            }
+        }
+        // It saves the bundle and lets go: the save here is a conflict, then works when confirmed.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let bytes = fs::read(&bundle_path).unwrap();
+        fs::write(&bundle_path, bytes).unwrap();
+        fs::remove_file(LockFile::path_for(&bundle_path)).unwrap();
+        assert!(matches!(work.save(&BundleContents::default()), Err(IoError::Conflict(_))));
+        assert!(work.lock().is_held(), "the lock is taken back before anything is written");
+        work.save_overwriting(&BundleContents::default()).unwrap();
+        assert!(!work.bundle_changed());
+        // Let go again with the bundle unchanged: a plain save takes it back and works.
+        fs::remove_file(LockFile::path_for(&bundle_path)).unwrap();
+        work.save(&BundleContents::default()).unwrap();
+        assert!(lock::holder(&LockFile::path_for(&bundle_path)).unwrap().is_this_process());
+        work.close().unwrap();
+        assert!(!LockFile::path_for(&bundle_path).exists());
         let _ = fs::remove_dir_all(&dir);
     }
 

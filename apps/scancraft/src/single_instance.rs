@@ -25,7 +25,8 @@
 //! Only the project is handed over. The second start's options that set up a new app
 //! (`--mock`, `--connect`, …: `Cli::new_app_options`) are not applied to the running app, which
 //! may be connected or capturing already; they travel as `ignored` and the running app names them
-//! in its status bar ([`Handover::Ignored`]), since the second start has no window to say so.
+//! in its status bar, with the result of opening the project when one was given
+//! ([`Handover::Ignored`]), since the second start has no window to say so.
 //! An older running app that does not know the field simply does not show them.
 
 use std::io::{BufRead, BufReader, Read, Write};
@@ -60,8 +61,10 @@ pub enum Handover {
     /// front and say why (`path` as given).
     Refused { path: String, why: String },
     /// The second start's options that were not applied (see the module documentation), at
-    /// most [`MAX_IGNORED`], each shortened to [`MAX_IGNORED_LEN`] characters.
-    Ignored(Vec<String>),
+    /// most [`MAX_IGNORED`], each shortened to [`MAX_IGNORED_LEN`] characters. `project`: an
+    /// [`Handover::Open`] of its project follows (the app names the options with the result of
+    /// that open, which would otherwise replace them at once).
+    Ignored { options: Vec<String>, project: bool },
 }
 
 /// Ignored options passed on to the running app (more are dropped).
@@ -247,7 +250,7 @@ fn answer(mut stream: TcpStream, server: &Server) {
             // The options not applied are named first, then the project opens.
             let ignored: Vec<String> = r.ignored.iter().take(MAX_IGNORED).map(|o| o.chars().filter(|c| !c.is_control()).take(MAX_IGNORED_LEN).collect()).collect();
             if !ignored.is_empty() && answer == "ok" {
-                let _ = server.tx.send(Handover::Ignored(ignored));
+                let _ = server.tx.send(Handover::Ignored { options: ignored, project: matches!(handover, Handover::Open(_)) });
             }
             if server.tx.send(handover).is_ok() {
                 if let Some(ctx) = server.wake.lock().ok().and_then(|w| w.clone()) {
@@ -298,9 +301,15 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     serde_json::from_str(line.trim()).map_err(|_| "not a request".to_string())
 }
 
-/// What the running app says about a second start's options it did not apply.
-pub fn ignored_message(options: &[String]) -> String {
-    format!("ScanCraft was already running: the project of the second start opens here, its options {} were not used. Connect a scanner from the Connect stage.", options.join(" "))
+/// What the running app says about a second start's options it did not apply; `project`:
+/// whether that start handed over a project (it opens here).
+pub fn ignored_message(options: &[String], project: bool) -> String {
+    let options = options.join(" ");
+    if project {
+        format!("ScanCraft was already running: the project of the second start opens here, its options {options} were not used. Connect a scanner from the Connect stage.")
+    } else {
+        format!("ScanCraft was already running: the options {options} of the second start were not used. Connect a scanner from the Connect stage.")
+    }
 }
 
 /// The path check (after the token check).
@@ -439,12 +448,17 @@ mod tests {
         // before its project opens.
         let options = vec!["--mock".to_string(), "--connect 10.0.0.7".to_string()];
         assert!(matches!(start(&dir, Some(&project), &options), Start::HandedOver));
-        assert_eq!(recv(&primary.requests), Handover::Ignored(options));
+        assert_eq!(recv(&primary.requests), Handover::Ignored { options: options.clone(), project: true });
         assert_eq!(recv(&primary.requests), Handover::Open(project.clone()));
+        assert!(matches!(start(&dir, None, &options), Start::HandedOver));
+        assert_eq!(recv(&primary.requests), Handover::Ignored { options: options.clone(), project: false });
+        assert_eq!(recv(&primary.requests), Handover::Focus);
+        assert!(ignored_message(&options, true).contains("the project of the second start opens here"));
+        assert!(!ignored_message(&options, false).contains("project"), "{}", ignored_message(&options, false));
         let junk = vec!["x\u{1b}[2J".repeat(100); 20];
         assert!(matches!(start(&dir, None, &junk), Start::HandedOver));
         match recv(&primary.requests) {
-            Handover::Ignored(o) => assert!(o.len() == MAX_IGNORED && o.iter().all(|s| s.chars().count() <= MAX_IGNORED_LEN && !s.contains('\u{1b}'))),
+            Handover::Ignored { options: o, project: false } => assert!(o.len() == MAX_IGNORED && o.iter().all(|s| s.chars().count() <= MAX_IGNORED_LEN && !s.contains('\u{1b}'))),
             other => panic!("{other:?}"),
         }
         assert_eq!(recv(&primary.requests), Handover::Focus);

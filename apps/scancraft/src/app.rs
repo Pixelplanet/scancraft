@@ -459,6 +459,10 @@ pub struct ScanCraftApp {
     /// Radius of the geometry when the view was last framed automatically (0: not yet).
     framed_radius: f32,
     pub status: String,
+    /// A note shown with the next status message (appended to it, as a warning): which options
+    /// of a later start were not used. It is kept while a job runs, whose result would replace
+    /// it at once, and dropped once shown with a message after which nothing runs.
+    pub carried_note: Option<String>,
     pub tone: Tone,
     pub busy: Option<String>,
     /// Exposure and gain are still the chosen preset's (the user has not changed them).
@@ -602,6 +606,7 @@ impl ScanCraftApp {
             display_menu: false,
             framed_radius: 0.0,
             status: "Ready".to_string(),
+            carried_note: None,
             tone: Tone::Normal,
             busy: None,
             camera_from_preset: false,
@@ -646,8 +651,19 @@ impl ScanCraftApp {
     }
 
     pub fn say(&mut self, tone: Tone, message: impl Into<String>) {
+        let mut message = message.into();
+        let mut tone = tone;
+        if let Some(note) = &self.carried_note {
+            message = format!("{message} · {note}");
+            if tone != Tone::Error {
+                tone = Tone::Warning;
+            }
+            if self.busy.is_none() {
+                self.carried_note = None;
+            }
+        }
         self.tone = tone;
-        self.status = message.into();
+        self.status = message;
     }
 
     /// Keeps the project-file preferences for the next start.
@@ -2835,6 +2851,7 @@ impl ScanCraftApp {
                     self.project.path = Some(path);
                     self.project.name = name;
                     self.project.saved_generation = self.next_generation;
+                    self.project.proposed = None;
                     self.tool = None;
                     self.say(Tone::Success, message);
                     if std::mem::take(&mut self.pending_close) {
@@ -4825,25 +4842,69 @@ mod tests {
         let root = dir.join("work");
         let mut app = app();
         app.prefs.work_root = Some(root.clone());
+        app.prefs.bundle_contents.raw_recordings = true;
         add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
         add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
         let bundle = dir.join("Bracket.scancraftz");
         app.save_project(bundle.clone());
         finish_job(&mut app);
+        // The bundle holds a raw recording and fields of a later version.
+        let work = app.project.store.work_dir().unwrap();
+        std::fs::write(work.join("pass-1").join("raw.bin"), [7u8; 100]).unwrap();
+        let file = scancraft_io::project::locate(&work).unwrap().file;
+        let mut p = scancraft_io::project::read_project_file(&file).unwrap();
+        p.other.insert("future".into(), serde_json::json!({"x": 1}));
+        p.passes[0].other.insert("future_pass".into(), serde_json::json!(2));
+        std::fs::write(&file, serde_json::to_vec_pretty(&p).unwrap()).unwrap();
+        app.save_project(bundle.clone());
+        finish_job(&mut app);
         app.shutdown();
+        assert!(scancraft_io::bundle::Bundle::open(&bundle).unwrap().read("pass-1/raw.bin").is_ok(), "{}", app.status);
         foreign_lock(&bundle, other_pc());
+        let kept = |p: &scancraft_io::project::ProjectFile| p.other.get("future") == Some(&serde_json::json!({"x": 1})) && p.passes.iter().find(|q| q.id == 1).is_some_and(|q| q.other.get("future_pass") == Some(&serde_json::json!(2)));
 
         let mut other = self::app();
         other.prefs.work_root = Some(root.clone());
+        other.prefs.bundle_contents.raw_recordings = true;
         other.open_project(bundle.clone());
         assert!(other.lock_prompt.is_some() && other.busy.is_none());
         other.open_read_only();
         finish_job(&mut other);
         assert_eq!(other.passes.len(), 2, "{}", other.status);
         assert!(other.project.path.is_none() && !other.project.store.is_bundle());
-        assert!(scancraft_io::workdir::leftovers(&root).is_empty(), "the copy it was read from is gone");
+        // Read through an unpacked copy, kept while the tab is open (never recovered).
+        let copy = other.project.store.data_dir().expect("the unpacked copy");
+        assert!(copy.starts_with(&root) && copy.join("pass-1").join("raw.bin").is_file());
+        assert!(scancraft_io::workdir::leftovers(&root).iter().all(|l| matches!(l.status, scancraft_io::workdir::LeftoverStatus::InUse(_))));
         assert!(other.settings.project_path.ends_with("Bracket (2).scancraftz"), "{}", other.settings.project_path);
         assert_eq!(holder(&LockFile::path_for(&bundle)).unwrap().host, "OTHER-PC");
+        // Saved to the proposed bundle: the raw recording and the later fields come along, and
+        // the copy goes once the tab has moved there.
+        let proposed = std::path::PathBuf::from(&other.settings.project_path);
+        other.save_project(proposed.clone());
+        finish_job(&mut other);
+        assert!(other.project.store.is_bundle(), "{}", other.status);
+        assert!(!copy.exists(), "the unpacked copy is removed");
+        let mut b = scancraft_io::bundle::Bundle::open(&proposed).unwrap();
+        assert!(b.read("pass-1/raw.bin").is_ok(), "the raw recording comes along");
+        assert!(kept(&b.read_project().unwrap()), "the fields of a later version are kept");
+        drop(b);
+        other.shutdown();
+
+        // The same into a folder.
+        let mut copier = self::app();
+        copier.prefs.work_root = Some(root.clone());
+        copier.open_project(bundle.clone());
+        copier.open_read_only();
+        finish_job(&mut copier);
+        let copy = copier.project.store.data_dir().unwrap();
+        let folder = dir.join("Bracket copy");
+        copier.save_project(folder.clone());
+        finish_job(&mut copier);
+        assert_eq!(copier.project.path.as_deref(), Some(folder.as_path()), "{}", copier.status);
+        assert!(folder.join("pass-1").join("raw.bin").is_file() && !copy.exists());
+        assert!(kept(&scancraft_io::project::read_project_file(&scancraft_io::project::locate(&folder).unwrap().file).unwrap()));
+        release(&mut copier);
 
         other.new_tab();
         other.open_project(bundle.clone());
@@ -4853,6 +4914,198 @@ mod tests {
         assert!(other.status.contains("OTHER-PC"), "{}", other.status);
         other.shutdown();
         assert!(!LockFile::path_for(&bundle).exists() && scancraft_io::workdir::leftovers(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_proposed_name_taken_meanwhile_is_never_saved_over() {
+        let dir = temp_dir("proposed");
+        let folder = dir.join("Bracket");
+        let mut maker = app();
+        add_fixed_pass(&mut maker, 1, table_and_block(), Transform::default());
+        maker.save_project(folder.clone());
+        finish_job(&mut maker);
+        release(&mut maker);
+        foreign_lock(&folder, other_pc());
+        let on_disk = |path: &std::path::Path| scancraft_io::project::read_project_file(&scancraft_io::project::locate(path).unwrap().file).unwrap();
+
+        // Two read-only copies of it: both are proposed "Bracket (2)".
+        let open_copy = || {
+            let mut a = self::app();
+            a.open_project(folder.clone());
+            a.open_read_only();
+            finish_job(&mut a);
+            a
+        };
+        let (mut first, mut second) = (open_copy(), open_copy());
+        let proposal = dir.join("Bracket (2)");
+        assert_eq!(std::path::PathBuf::from(&first.settings.project_path), proposal);
+        assert_eq!(std::path::PathBuf::from(&second.settings.project_path), proposal);
+        // The second saves there (with a pass more) and lets go.
+        add_fixed_pass(&mut second, 9, table_and_block(), Transform::default());
+        second.save_project(proposal.clone());
+        finish_job(&mut second);
+        assert_eq!(second.project.path.as_deref(), Some(proposal.as_path()), "{}", second.status);
+        assert!(second.project.proposed.is_none(), "saved: nothing proposed any more");
+        release(&mut second);
+        // The first's proposal is taken by now: refused, and the next free name proposed.
+        first.pending_close = true;
+        first.save_project(proposal.clone());
+        assert!(first.busy.is_none() && first.status.contains("created meanwhile"), "{}", first.status);
+        assert!(!first.pending_close, "a close waiting for the save stays open");
+        assert_eq!(on_disk(&proposal).passes.len(), 2, "the other save is untouched");
+        let next = dir.join("Bracket (3)");
+        assert_eq!(std::path::PathBuf::from(&first.settings.project_path), next);
+        assert!(first.status.contains("Bracket (3)"), "{}", first.status);
+        first.save_project(next.clone());
+        finish_job(&mut first);
+        assert_eq!(first.project.path.as_deref(), Some(next.as_path()), "{}", first.status);
+        assert_eq!(on_disk(&next).passes.len(), 1);
+        // Saving there again (its own place now) is a plain save.
+        first.save_project(next.clone());
+        finish_job(&mut first);
+        assert!(first.status.starts_with("Saved"), "{}", first.status);
+        release(&mut first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bundle_taken_over_elsewhere_saves_once_it_is_let_go() {
+        use scancraft_io::lock::{holder, LockFile};
+        let dir = temp_dir("relock-bundle");
+        let root = dir.join("work");
+        let mut app = app();
+        app.prefs.work_root = Some(root.clone());
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        let bundle = dir.join("Part.scancraftz");
+        app.save_project(bundle.clone());
+        finish_job(&mut app);
+        // Another computer takes it over: saving is refused, naming it, with a way out.
+        foreign_lock(&bundle, other_pc());
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        app.save_project(bundle.clone());
+        assert!(app.busy.is_none() && app.save_conflict.is_none(), "{}", app.status);
+        assert!(app.status.contains("OTHER-PC") && app.status.contains("another name"), "{}", app.status);
+        assert!(!app.status.contains("being opened"), "{}", app.status);
+        // It saves and lets go: the save here asks about their version, then Save Anyway works.
+        std::thread::sleep(Duration::from_millis(30));
+        let bytes = std::fs::read(&bundle).unwrap();
+        std::fs::write(&bundle, bytes).unwrap();
+        std::fs::remove_file(LockFile::path_for(&bundle)).unwrap();
+        app.save_project(bundle.clone());
+        assert!(app.busy.is_none() && app.save_conflict.is_some(), "{}", app.status);
+        app.save_anyway();
+        finish_job(&mut app);
+        assert_eq!(bundle_passes(&bundle), 2, "{}", app.status);
+        assert!(holder(&LockFile::path_for(&bundle)).unwrap().is_this_process(), "the lock is this tab's again");
+        app.shutdown();
+        assert!(!LockFile::path_for(&bundle).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_second_start_s_ignored_options_are_shown_with_its_open() {
+        use crate::single_instance::Handover;
+        let dir = temp_dir("handover-note");
+        let folder = dir.join("Part");
+        let mut maker = app();
+        add_fixed_pass(&mut maker, 1, table_and_block(), Transform::default());
+        maker.save_project(folder.clone());
+        finish_job(&mut maker);
+        release(&mut maker);
+
+        let mut app = app();
+        let options = vec!["--mock".to_string()];
+        app.take_handover(Handover::Ignored { options: options.clone(), project: true });
+        app.take_handover(Handover::Open(folder.clone()));
+        finish_job(&mut app);
+        assert!(app.status.starts_with("Opened Part") && app.status.contains("--mock were not used"), "{}", app.status);
+        assert_eq!(app.tone, Tone::Warning);
+        app.say(Tone::Normal, "Next");
+        assert_eq!(app.status, "Next", "shown once");
+        // Already open: said with that.
+        app.take_handover(Handover::Ignored { options: options.clone(), project: true });
+        app.take_handover(Handover::Open(folder.clone()));
+        assert!(app.status.contains("already open") && app.status.contains("--mock"), "{}", app.status);
+        // Without a project: no word of one.
+        app.take_handover(Handover::Ignored { options, project: false });
+        assert!(app.status.contains("--mock") && !app.status.contains("project"), "{}", app.status);
+        release(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn quitting_over_an_open_question_says_why_save_all_waits() {
+        let dir = temp_dir("quit-question");
+        let folder = dir.join("Bracket");
+        let mut app = app();
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        app.save_project(folder.clone());
+        finish_job(&mut app);
+        // Someone else saves the project file meanwhile.
+        std::thread::sleep(Duration::from_millis(30));
+        let file = scancraft_io::project::locate(&folder).unwrap().file;
+        let text = std::fs::read(&file).unwrap();
+        std::fs::write(&file, text).unwrap();
+        add_fixed_pass(&mut app, 2, table_and_block(), Transform::default());
+        app.save_project(folder.clone());
+        assert!(app.save_conflict.is_some());
+        // The window's close button opens the quit dialog over the question.
+        app.close_prompt = Some(ClosePrompt::Quit);
+        assert_eq!(app.save_all_blocked(), Some("Answer the question first"));
+        app.save_all_then_quit();
+        assert!(app.busy.is_none() && app.save_all_queue.is_none() && app.close_prompt.is_some());
+        assert!(app.status.contains("answer the question first"), "{}", app.status);
+        app.close_prompt = None;
+        app.cancel_save_conflict();
+        assert_eq!(app.save_all_blocked(), None);
+        release(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn projects_naming_files_outside_their_folder_are_refused() {
+        let dir = temp_dir("outside-files");
+        let root = dir.join("work");
+        let folder = dir.join("Evil");
+        let mut maker = app();
+        add_fixed_pass(&mut maker, 1, table_and_block(), Transform::default());
+        maker.save_project(folder.clone());
+        finish_job(&mut maker);
+        release(&mut maker);
+        // Its imported pass's surface is moved elsewhere and named by an absolute path.
+        let private = dir.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let elsewhere = private.join("surface.ply");
+        std::fs::rename(folder.join(scancraft_io::project::surface_path(1)), &elsewhere).unwrap();
+        let file = scancraft_io::project::locate(&folder).unwrap().file;
+        let mut p = scancraft_io::project::read_project_file(&file).unwrap();
+        p.passes[0].scan_config["origin"]["surface"] = serde_json::json!(elsewhere.display().to_string());
+        std::fs::write(&file, serde_json::to_vec_pretty(&p).unwrap()).unwrap();
+        let evil = dir.join("Evil.scancraftz");
+        scancraft_io::bundle::write_bundle(&folder, &evil, &Default::default()).unwrap();
+
+        let mut app = app();
+        app.prefs.work_root = Some(root.clone());
+        add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
+        for path in [evil.clone(), folder.clone()] {
+            app.add_project(path.clone());
+            finish_job(&mut app);
+            assert!(app.passes.len() == 1 && app.status.contains("not inside its folder"), "{}: {}", path.display(), app.status);
+        }
+        assert!(scancraft_io::workdir::leftovers(&root).is_empty());
+        // Opened read-only (another computer has it) or as it is: refused the same.
+        foreign_lock(&evil, other_pc());
+        let mut viewer = self::app();
+        viewer.prefs.work_root = Some(root.clone());
+        viewer.open_project(evil.clone());
+        viewer.open_read_only();
+        finish_job(&mut viewer);
+        assert!(viewer.passes.is_empty() && viewer.status.contains("not inside its folder"), "{}", viewer.status);
+        viewer.open_project(folder.clone());
+        finish_job(&mut viewer);
+        assert!(viewer.passes.is_empty() && viewer.status.contains("not inside its folder"), "{}", viewer.status);
+        assert!(scancraft_io::workdir::leftovers(&root).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4970,9 +5223,11 @@ mod tests {
         app.prefs.work_root = Some(root.clone());
         add_fixed_pass(&mut app, 1, table_and_block(), Transform::default());
         app.add_project(bundle.clone());
+        assert_eq!(app.status, "Adding Shell…");
         finish_job(&mut app);
         assert_eq!(app.passes.len(), 3, "{}", app.status);
         assert!(app.status.contains("from Shell"), "{}", app.status);
+        assert_eq!(app.history.undo_label(), Some("Add Project Shell"));
         assert!(app.passes[1..].iter().all(|p| p.meta.alignment == AlignState::Unaligned));
         let left = scancraft_io::workdir::leftovers(&root);
         assert_eq!(left.len(), 1, "only the maker's own working folder: the copy was removed: {left:?}");
@@ -5003,7 +5258,16 @@ mod tests {
         finish_job(&mut older);
         release(&mut older);
         let file = scancraft_io::project::locate(&old).unwrap().file;
+        // Added by its project file: named after the project, not the file.
+        let mut adder = self::app();
+        adder.add_project(file.clone());
+        assert_eq!(adder.status, "Adding Old project…");
+        finish_job(&mut adder);
+        assert_eq!(adder.history.undo_label(), Some("Add Project Old project"));
         std::fs::rename(&file, old.join("project.json")).unwrap();
+        adder.add_project(old.join("project.json"));
+        assert_eq!(adder.status, "Adding Old project…", "an older project.json: by its folder");
+        finish_job(&mut adder);
         let mut opener = self::app();
         opener.picker = FilePicker::answered(PickPurpose::OpenProjectFolder, vec![old.clone()]);
         opener.poll_picker();

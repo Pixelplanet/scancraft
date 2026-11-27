@@ -36,10 +36,13 @@ pub enum Store {
     /// A bundle opened into a working folder (shared with a running save job). `dir` is the
     /// working folder, which never changes (read without locking `work`).
     Bundle { work: Arc<Mutex<WorkFolder>>, dir: PathBuf },
-    /// A read-only copy of the project folder or bundle at this path (opened while another
-    /// computer has it): nothing is locked or written there; Save asks for a new place. Files of
-    /// a project folder the app does not hold (raw recordings) are copied from it on that save.
-    ReadOnly(PathBuf),
+    /// A read-only copy of the project folder or bundle at `source` (opened while another
+    /// computer has it): nothing is locked or written there; Save asks for a new place. A bundle
+    /// is read through `copy`, its unpacked copy, which stays while the tab is open (removed when
+    /// the tab closes or moves to the new place): the files the app does not hold (raw
+    /// recordings) and the project-file fields of later versions are taken from there on that
+    /// save, as from a project folder itself.
+    ReadOnly { source: PathBuf, copy: Option<workdir::UnpackedCopy> },
 }
 
 impl std::fmt::Debug for Store {
@@ -48,7 +51,7 @@ impl std::fmt::Debug for Store {
             Store::None => write!(f, "Store::None"),
             Store::Folder { lock, .. } => write!(f, "Store::Folder({})", lock.path().display()),
             Store::Bundle { dir, .. } => write!(f, "Store::Bundle({})", dir.display()),
-            Store::ReadOnly(source) => write!(f, "Store::ReadOnly({})", source.display()),
+            Store::ReadOnly { source, .. } => write!(f, "Store::ReadOnly({})", source.display()),
         }
     }
 }
@@ -63,6 +66,16 @@ impl Store {
     pub fn bundle(work: WorkFolder) -> Store {
         let dir = work.dir().to_path_buf();
         Store::Bundle { work: Arc::new(Mutex::new(work)), dir }
+    }
+
+    /// A read-only copy of the project folder `dir`.
+    pub fn read_only_folder(dir: PathBuf) -> Store {
+        Store::ReadOnly { source: dir, copy: None }
+    }
+
+    /// A read-only copy of the bundle `bundle`, read through its unpacked copy `copy`.
+    pub fn read_only_bundle(bundle: PathBuf, copy: workdir::UnpackedCopy) -> Store {
+        Store::ReadOnly { source: bundle, copy: Some(copy) }
     }
 
     pub fn is_bundle(&self) -> bool {
@@ -84,16 +97,16 @@ impl Store {
             Store::None => None,
             Store::Folder { lock, .. } => Some(scancraft_io::lock::locked_target(lock.path())),
             Store::Bundle { .. } => self.work_dir(),
-            // A read-only copy of a folder: still read from (never written); of a bundle: its
-            // unpacked copy is gone once the project is read.
-            Store::ReadOnly(source) => source.is_dir().then(|| source.clone()),
+            // A read-only copy: the folder itself or the bundle's unpacked copy (only read from).
+            Store::ReadOnly { copy: Some(copy), .. } => Some(copy.dir().to_path_buf()),
+            Store::ReadOnly { source, copy: None } => source.is_dir().then(|| source.clone()),
         }
     }
 
     /// The project folder or bundle a read-only tab was copied from.
     pub fn read_only_source(&self) -> Option<&Path> {
         match self {
-            Store::ReadOnly(source) => Some(source),
+            Store::ReadOnly { source, .. } => Some(source),
             _ => None,
         }
     }

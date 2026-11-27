@@ -267,11 +267,16 @@ pub struct ProjectInfo {
     pub saved_generation: u64,
     /// Its lock, and a bundle's working folder (`crate::storage`).
     pub store: crate::storage::Store,
+    /// A free name the Save card proposed beside a project (`(beside, proposal)`: Save As… after
+    /// the conflict question, a read-only copy). It was free only when proposed: a save there
+    /// that finds it taken meanwhile proposes the next free name instead of replacing what is
+    /// there now. Cleared when the project is saved.
+    pub proposed: Option<(PathBuf, PathBuf)>,
 }
 
 impl Default for ProjectInfo {
     fn default() -> Self {
-        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0, store: crate::storage::Store::None }
+        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0, store: crate::storage::Store::None, proposed: None }
     }
 }
 
@@ -621,13 +626,14 @@ fn write_rgb_keyframes(dir: &Path, id: u32, kfs: &[scancraft_color::RgbKeyframe]
 }
 
 fn read_rgb_keyframes(dir: &Path, manifest_rel: &str) -> Result<Vec<scancraft_color::RgbKeyframe>, String> {
-    let manifest_path = files::resolve(dir, manifest_rel);
+    let manifest_path = files::resolve(dir, manifest_rel).map_err(|e| e.to_string())?;
     let rgb_dir = manifest_path.parent().ok_or_else(|| "invalid RGB manifest path".to_string())?;
     let json = std::fs::read_to_string(&manifest_path).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     let entries: Vec<RgbKeyframeManifestEntry> = serde_json::from_str(&json).map_err(|e| format!("{}: {e}", manifest_path.display()))?;
     let mut out = Vec::with_capacity(entries.len());
     for e in entries {
-        let jpeg_path = rgb_dir.join(&e.jpeg_file);
+        // (Inside the pass's colour folder, as the manifest itself.)
+        let jpeg_path = files::resolve(rgb_dir, &e.jpeg_file).map_err(|e| e.to_string())?;
         let jpeg = std::fs::read(&jpeg_path).map_err(|err| format!("{}: {err}", jpeg_path.display()))?;
         out.push(scancraft_color::RgbKeyframe {
             id: e.id,
@@ -678,7 +684,7 @@ fn write_cleaned(dir: &Path, id: u32, edit: &PointCloud) -> Result<(), String> {
 
 /// Reads a cleaned surface; without a matching counts file every point counts as a fused one.
 fn read_cleaned(dir: &Path, id: u32, file: &str) -> Result<PointCloud, String> {
-    let mut cloud = read_surface(&files::resolve(dir, file))?;
+    let mut cloud = read_surface(&files::resolve(dir, file).map_err(|e| e.to_string())?)?;
     let counts = std::fs::read(dir.join(cleaned_counts_path(id))).ok().filter(|b| b.len() == cloud.len() * 4);
     for (i, p) in cloud.points.iter_mut().enumerate() {
         p.confidence = match &counts {
@@ -825,7 +831,7 @@ pub fn load(path: &Path) -> Result<StoredProject, String> {
         let device: Option<DeviceInfo> = serde_json::from_value(record.device.clone()).ok();
         let (origin, surface_file) = origin_of(&record.scan_config);
         let surface = match (&origin, surface_file) {
-            (PassOrigin::File { .. }, Some(file)) => Some(Arc::new(read_surface(&files::resolve(dir, &file)).map_err(|e| format!("the surface of {} cannot be read ({e})", record.name))?)),
+            (PassOrigin::File { .. }, Some(file)) => Some(Arc::new(files::resolve(dir, &file).map_err(|e| e.to_string()).and_then(|f| read_surface(&f)).map_err(|e| format!("the surface of {} cannot be read ({e})", record.name))?)),
             (PassOrigin::File { .. }, None) => return Err(format!("{} is an imported pass without a surface file", record.name)),
             _ => None,
         };
@@ -863,10 +869,11 @@ pub fn load(path: &Path) -> Result<StoredProject, String> {
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
-    let cloud = |o: &OutputRecord| scancraft_io::load_ply(files::resolve(dir, &o.file)).ok().map(|(c, _)| c);
+    // (An output that cannot be read, also one named outside the folder, is left out.)
+    let cloud = |o: &OutputRecord| files::resolve(dir, &o.file).ok().and_then(|f| scancraft_io::load_ply(f).ok()).map(|(c, _)| c);
     let merged = output("merged").and_then(|o| cloud(o).map(|c| (c, o.passes.clone())));
     let cleaned = output("cleaned").and_then(cloud);
-    let mesh = output("mesh").and_then(|o| scancraft_io::load_ply(files::resolve(dir, &o.file)).ok()).and_then(|(_, m)| m);
+    let mesh = output("mesh").and_then(|o| files::resolve(dir, &o.file).ok()).and_then(|f| scancraft_io::load_ply(f).ok()).and_then(|(_, m)| m);
     Ok(StoredProject { name: file.name, reference: file.reference_pass, next_pass_id: file.next_pass_id, passes, merged, cleaned, mesh, settings: file.settings })
 }
 

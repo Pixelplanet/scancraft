@@ -353,10 +353,21 @@ impl ScanCraftApp {
         self.tab_labels().into_iter().filter(|t| t.dirty && t.path.is_none()).map(|t| t.name).collect()
     }
 
+    /// Why the quit dialog's Save All cannot start now (it switches between tabs).
+    pub fn save_all_blocked(&self) -> Option<&'static str> {
+        self.tabs_blocked()
+    }
+
     /// The quit dialog's Save All: saves every project with unsaved changes into its folder, one
     /// after another (each in its own tab), then closes the window. Stops at the first failure.
     pub fn save_all_then_quit(&mut self) {
-        if !self.dirty_without_folder().is_empty() || self.tabs_blocked().is_some() {
+        if !self.dirty_without_folder().is_empty() {
+            return;
+        }
+        // (The quit dialog shows Save All disabled with this reason; the window's close button
+        // can open it over the lock or conflict question.)
+        if let Some(why) = self.save_all_blocked() {
+            self.say(Tone::Warning, format!("Save All cannot start: {}", why.to_lowercase()));
             return;
         }
         self.close_prompt = None;

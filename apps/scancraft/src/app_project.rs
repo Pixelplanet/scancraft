@@ -30,6 +30,25 @@ use scancraft_io::workdir::{self, WorkFolder};
 /// isolation cache).
 type JobPass = (u32, Transform, bool, bool, PassSource, MaskCache);
 
+/// Said when a save into the project's own place is refused because someone else holds it.
+const SAVE_ELSEWHERE: &str = "To keep your changes, save under another name in Save Project";
+
+/// The name a project is shown by in the status and the history, from the path it was picked as:
+/// a bundle or project file without its extension, an older `project.json` or a project folder
+/// by the folder's name.
+pub(crate) fn project_label(path: &std::path::Path) -> String {
+    use scancraft_io::project::{has_extension, BUNDLE_EXTENSION, PROJECT_EXTENSION};
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let label = if has_extension(path, BUNDLE_EXTENSION) || (has_extension(path, PROJECT_EXTENSION) && !path.is_dir()) {
+        path.file_stem().map(|n| n.to_string_lossy().into_owned())
+    } else if path.is_file() {
+        path.parent().and_then(name)
+    } else {
+        name(path)
+    };
+    label.filter(|l| !l.is_empty()).unwrap_or_else(|| "project".into())
+}
+
 /// Passes with fewer points take no part in Align All.
 const ALIGN_ALL_MIN_POINTS: usize = 200;
 
@@ -1046,8 +1065,16 @@ impl ScanCraftApp {
     pub fn save_conflict_as(&mut self) {
         let Some(conflict) = self.save_conflict.take() else { return };
         self.open_tool(Tool::SaveProject);
-        self.settings.project_path = crate::storage::free_sibling(&conflict.target).display().to_string();
+        self.propose_beside(&conflict.target);
         self.say(Tone::Normal, "Choose where to save this version, then Save");
+    }
+
+    /// Fills the Save card with a free name beside `path` (`X (2)`, `X (2).scancraftz`, …) and
+    /// remembers it as proposed ([`ProjectInfo::proposed`]).
+    fn propose_beside(&mut self, path: &std::path::Path) {
+        let free = crate::storage::free_sibling(path);
+        self.settings.project_path = free.display().to_string();
+        self.project.proposed = Some((path.to_path_buf(), free));
     }
 
     /// The conflict question's Cancel: nothing is saved (a close or quit waiting for the save
@@ -1086,6 +1113,15 @@ impl ScanCraftApp {
             return;
         }
         let target = std::path::absolute(&target).unwrap_or(target);
+        // A free name proposed earlier that is taken by now (another tab, app or computer saved
+        // there meanwhile): what is there now is never replaced; the next free name is proposed.
+        if let Some((beside, proposal)) = self.project.proposed.clone() {
+            if same_path(&proposal, &target) && target.exists() {
+                self.propose_beside(&beside);
+                self.save_refused(format!("Not saved: {} was created meanwhile by another save. The Save card now proposes {}", target.display(), self.settings.project_path));
+                return;
+            }
+        }
         let as_bundle = scancraft_io::project::has_extension(&target, scancraft_io::project::BUNDLE_EXTENSION);
         if !as_bundle && target.is_file() {
             self.save_refused(format!("{} is a file: enter a folder, or a .scancraftz file to save a bundle", target.display()));
@@ -1101,6 +1137,18 @@ impl ScanCraftApp {
             if let Store::Bundle { work, dir } = &self.project.store {
                 // A bundle tab: into its working folder, then back into this or another bundle.
                 let (work, dir) = (work.clone(), dir.clone());
+                // Still this tab's to write: a lock another computer took over and has let go
+                // since is taken again (as a project folder's); one someone else holds now
+                // refuses the save, naming them.
+                let relocked = match work.lock() {
+                    Ok(mut w) if same_path(w.bundle(), &target) => w.relock().map_err(|e| e.to_string()),
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("the working folder is unavailable".to_string()),
+                };
+                if let Err(e) = relocked {
+                    self.save_refused(format!("Could not save the bundle: {e}. {SAVE_ELSEWHERE}"));
+                    return;
+                }
                 if !overwrite {
                     let changed = work.lock().ok().filter(|w| same_path(w.bundle(), &target) && w.bundle().exists() && w.bundle_changed()).map(|w| w.bundle().to_path_buf());
                     if let Some(bundle) = changed {
@@ -1178,7 +1226,7 @@ impl ScanCraftApp {
                 match LockFile::lock_project(&target) {
                     Ok(again) => *lock = again,
                     Err(e) => {
-                        self.save_refused(format!("Could not save the project: {e}"));
+                        self.save_refused(format!("Could not save the project: {e}. {SAVE_ELSEWHERE}"));
                         return;
                     }
                 }
@@ -1329,8 +1377,9 @@ impl ScanCraftApp {
     }
 
     /// The lock question's Open Read-Only: reads the project without its lock into a tab with
-    /// no place on disk (a bundle through a temporary copy that is removed again). Nothing is
-    /// written where it is; Save asks for a new place.
+    /// no place on disk (a bundle through an unpacked copy under the working-folder root, kept
+    /// until the tab closes or is saved elsewhere). Nothing is written where it is; Save asks for
+    /// a new place and brings the raw recordings and the fields of later versions along.
     pub fn open_read_only(&mut self) {
         let Some(p) = self.lock_prompt.take() else { return };
         if !self.can_edit() {
@@ -1344,12 +1393,12 @@ impl ScanCraftApp {
                         Ok(c) => c,
                         Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
                     };
-                    let read = read_opened(copy.dir());
-                    drop(copy);
-                    match read {
+                    // The copy stays while the tab is open: a save to a new place takes the raw
+                    // recordings and the fields of later versions from it.
+                    match read_opened(copy.dir()) {
                         Ok(mut opened) => {
                             opened.path = bundle.clone();
-                            opened.store = Store::ReadOnly(bundle);
+                            opened.store = Store::read_only_bundle(bundle, copy);
                             opened.read_only = true;
                             JobResult::Opened(Box::new(opened))
                         }
@@ -1360,7 +1409,7 @@ impl ScanCraftApp {
             OpenTarget::Folder(dir) => {
                 self.spawn_job("Opening a read-only copy", move || match read_opened(&dir) {
                     Ok(mut opened) => {
-                        opened.store = Store::ReadOnly(dir);
+                        opened.store = Store::read_only_folder(dir);
                         opened.read_only = true;
                         JobResult::Opened(Box::new(opened))
                     }
@@ -1392,6 +1441,28 @@ impl ScanCraftApp {
                 Err(e) => JobResult::Failed(format!("Could not recover {}: {e}", dir.display())),
             }
         });
+    }
+
+    /// A request of a later start ([`crate::single_instance`]): open its project, or say why it
+    /// was refused or which of its options were not used. With a project those options are
+    /// named with the messages of its open ([`ScanCraftApp::carried_note`]), which would
+    /// otherwise replace them at once.
+    pub fn take_handover(&mut self, handover: crate::single_instance::Handover) {
+        use crate::single_instance::{ignored_message, Handover};
+        match handover {
+            Handover::Open(p) => self.request_open(OpenRequest::Path(p)),
+            Handover::Refused { path, why } => self.say(Tone::Error, format!("Could not open {path}: {why}")),
+            Handover::Ignored { options, project: true } => self.carried_note = Some(ignored_message(&options, true)),
+            Handover::Ignored { options, project: false } => self.say(Tone::Warning, ignored_message(&options, false)),
+            Handover::Focus => {}
+        }
+    }
+
+    /// The lock question's Cancel: nothing is opened.
+    pub fn cancel_lock_prompt(&mut self) {
+        if self.lock_prompt.take().is_some() {
+            self.say(Tone::Normal, "Not opened");
+        }
     }
 
     /// Opens (or recovers) a project now, or once the running operation has finished.
@@ -1583,11 +1654,11 @@ impl ScanCraftApp {
         let saved_generation = if opened.recovered { 0 } else { self.next_generation };
         if opened.read_only {
             // A copy with no place on disk: Save proposes a new one beside the original.
-            self.settings.project_path = crate::storage::free_sibling(&opened.path).display().to_string();
-            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store };
+            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store, proposed: None };
+            self.propose_beside(&opened.path);
         } else {
             self.settings.project_path = opened.path.display().to_string();
-            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store };
+            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store, proposed: None };
         }
         self.selection = None;
         self.tool = None;
@@ -1642,8 +1713,8 @@ impl ScanCraftApp {
         if self.import_blocked().is_some() {
             return;
         }
+        let label = project_label(&dir);
         if scancraft_io::project::is_bundle(&dir) {
-            let label = dir.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "bundle".into());
             let root = self.prefs.work_root();
             self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || {
                 let copy = match workdir::UnpackedCopy::unpack(&dir, &root) {
@@ -1664,7 +1735,6 @@ impl ScanCraftApp {
             self.say(Tone::Error, e.to_string());
             return;
         }
-        let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
         self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || match crate::imports::read_project(&dir) {
             Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
             Ok((name, passes)) => JobResult::AddedProject { name, passes },

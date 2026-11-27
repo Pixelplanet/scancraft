@@ -115,12 +115,7 @@ impl eframe::App for ScanCraft {
         while let Some(h) = self.handovers.as_ref().and_then(|rx| rx.try_recv().ok()) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            match h {
-                single_instance::Handover::Open(p) => self.app.request_open(storage::OpenRequest::Path(p)),
-                single_instance::Handover::Refused { path, why } => self.app.say(app::Tone::Error, format!("Could not open {path}: {why}")),
-                single_instance::Handover::Ignored(options) => self.app.say(app::Tone::Warning, single_instance::ignored_message(&options)),
-                single_instance::Handover::Focus => {}
-            }
+            self.app.take_handover(h);
         }
         self.app.poll_picker();
         self.app.poll_jobs();
