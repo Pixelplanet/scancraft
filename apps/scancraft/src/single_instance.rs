@@ -10,7 +10,8 @@
 //! ```
 //!
 //! The running app listens on a loopback TCP port (127.0.0.1 only) chosen by the system. A
-//! request is one JSON line `{"token": …, "open": "<path>" | null}`, sent within 3 s, and gets
+//! request is one JSON line `{"token": …, "open": "<path>" | null, "ignored": [options]}`, sent
+//! within 3 s, and gets
 //! one line back: `ok`, `refused: <why>`, or `closing` (the app is ending: the second start
 //! waits for its lock and then runs as the new one). A refused start never runs a second app; the
 //! running one shows why the project could not be opened. Each request is answered on its own
@@ -20,6 +21,12 @@
 //! read it; on Unix the file is made 0600): a request without it is refused. The path must be
 //! absolute and name an existing project file (`.scancraft`), bundle (`.scancraftz`) or project
 //! folder; nothing else is accepted. `open: null` only brings the window to the front.
+//!
+//! Only the project is handed over. The second start's options that set up a new app
+//! (`--mock`, `--connect`, …: `Cli::new_app_options`) are not applied to the running app, which
+//! may be connected or capturing already; they travel as `ignored` and the running app names them
+//! in its status bar ([`Handover::Ignored`]), since the second start has no window to say so.
+//! An older running app that does not know the field simply does not show them.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
@@ -52,7 +59,14 @@ pub enum Handover {
     /// A start with the right token asked to open something that is not a project: come to the
     /// front and say why (`path` as given).
     Refused { path: String, why: String },
+    /// The second start's options that were not applied (see the module documentation), at
+    /// most [`MAX_IGNORED`], each shortened to [`MAX_IGNORED_LEN`] characters.
+    Ignored(Vec<String>),
 }
+
+/// Ignored options passed on to the running app (more are dropped).
+const MAX_IGNORED: usize = 8;
+const MAX_IGNORED_LEN: usize = 200;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Info {
@@ -66,12 +80,15 @@ struct Request {
     token: String,
     #[serde(default)]
     open: Option<String>,
+    /// Options of the second start that the running app does not apply (it names them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ignored: Vec<String>,
 }
 
 /// How this start goes on.
 pub enum Start {
     /// The only ScanCraft: it listens for later starts.
-    Primary(Primary),
+    Primary(Box<Primary>),
     /// A running ScanCraft took the request: this start ends.
     HandedOver,
     /// The running ScanCraft refused the request (it shows why): this start ends too, never a
@@ -96,8 +113,8 @@ pub struct Primary {
 impl Primary {
     /// The receiver and the slot for the window's context (set once it exists, so a request
     /// wakes the otherwise idle window); the guard stays with `main`.
-    pub fn split(self) -> (Guard, mpsc::Receiver<Handover>, Arc<Mutex<Option<eframe::egui::Context>>>) {
-        let Primary { _lock, info_path, token, requests, wake, closing } = self;
+    pub fn split(self: Box<Self>) -> (Guard, mpsc::Receiver<Handover>, Arc<Mutex<Option<eframe::egui::Context>>>) {
+        let Primary { _lock, info_path, token, requests, wake, closing } = *self;
         (Guard { _lock, info_path, token, closing }, requests, wake)
     }
 }
@@ -132,22 +149,24 @@ pub fn default_dir() -> PathBuf {
     scancraft_io::fsutil::local_data_dir().join("ScanCraft")
 }
 
-/// Becomes the running ScanCraft, or hands `open` (or a focus request) to the one that runs.
-pub fn start(dir: &Path, open: Option<&Path>) -> Start {
+/// Becomes the running ScanCraft, or hands `open` (or a focus request) to the one that runs,
+/// with the options this start sets up a new app with (`ignored`: the running app does not apply
+/// them, it names them).
+pub fn start(dir: &Path, open: Option<&Path>, ignored: &[String]) -> Start {
     if let Err(e) = std::fs::create_dir_all(dir) {
         return Start::Alone(format!("cannot create {}: {e}", dir.display()));
     }
-    start_waiting(dir, open, HANDOVER_WAIT)
+    start_waiting(dir, open, ignored, HANDOVER_WAIT)
 }
 
 /// [`start`], waiting up to `wait` for a running app that cannot be reached or is ending.
-fn start_waiting(dir: &Path, open: Option<&Path>, wait: Duration) -> Start {
+fn start_waiting(dir: &Path, open: Option<&Path>, ignored: &[String], wait: Duration) -> Start {
     let deadline = Instant::now() + wait;
     loop {
         match LockFile::acquire(&dir.join(LOCK_FILE)) {
             Ok(lock) => {
                 return match listen(dir, lock) {
-                    Ok(primary) => Start::Primary(primary),
+                    Ok(primary) => Start::Primary(Box::new(primary)),
                     Err(e) => Start::Alone(e),
                 }
             }
@@ -156,7 +175,7 @@ fn start_waiting(dir: &Path, open: Option<&Path>, wait: Duration) -> Start {
         }
         // Another ScanCraft runs; it may still be writing where it listens, or be ending (its
         // lock is free then, and this start becomes the running one).
-        let last = match hand_over(dir, open) {
+        let last = match hand_over(dir, open, ignored) {
             Ok(()) => return Start::HandedOver,
             Err(Refusal::Refused(why)) => return Start::Refused(why),
             Err(Refusal::Retry(e)) => e,
@@ -225,6 +244,11 @@ fn answer(mut stream: TcpStream, server: &Server) {
                 Ok(h) => (h, "ok".to_string()),
                 Err(why) => (Handover::Refused { path: r.open.clone().unwrap_or_default(), why: why.clone() }, format!("refused: {why}")),
             };
+            // The options not applied are named first, then the project opens.
+            let ignored: Vec<String> = r.ignored.iter().take(MAX_IGNORED).map(|o| o.chars().filter(|c| !c.is_control()).take(MAX_IGNORED_LEN).collect()).collect();
+            if !ignored.is_empty() && answer == "ok" {
+                let _ = server.tx.send(Handover::Ignored(ignored));
+            }
             if server.tx.send(handover).is_ok() {
                 if let Some(ctx) = server.wake.lock().ok().and_then(|w| w.clone()) {
                     ctx.request_repaint();
@@ -274,6 +298,11 @@ fn read_request(stream: &TcpStream) -> Result<Request, String> {
     serde_json::from_str(line.trim()).map_err(|_| "not a request".to_string())
 }
 
+/// What the running app says about a second start's options it did not apply.
+pub fn ignored_message(options: &[String]) -> String {
+    format!("ScanCraft was already running: the project of the second start opens here, its options {} were not used. Connect a scanner from the Connect stage.", options.join(" "))
+}
+
 /// The path check (after the token check).
 fn check_path(request: &Request) -> Result<Handover, String> {
     match &request.open {
@@ -319,10 +348,10 @@ enum Refusal {
 }
 
 /// Sends `open` (or a focus request) to the running app.
-fn hand_over(dir: &Path, open: Option<&Path>) -> Result<(), Refusal> {
+fn hand_over(dir: &Path, open: Option<&Path>, ignored: &[String]) -> Result<(), Refusal> {
     let retry = |e: String| Refusal::Retry(e);
     let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).map_err(|e| retry(e.to_string()))?).map_err(|e| retry(e.to_string()))?;
-    let request = Request { token: info.token, open: open.map(|p| p.display().to_string()) };
+    let request = Request { token: info.token, open: open.map(|p| p.display().to_string()), ignored: ignored.to_vec() };
     send(info.port, &serde_json::to_string(&request).map_err(|e| retry(e.to_string()))?)
 }
 
@@ -400,22 +429,39 @@ mod tests {
         let project = dir.join("Part");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("Part.scancraft"), b"{}").unwrap();
-        let Start::Primary(primary) = start(&dir, None) else { panic!("the first start runs") };
+        let Start::Primary(primary) = start(&dir, None, &[]) else { panic!("the first start runs") };
         // A second start with a project, and one without.
-        assert!(matches!(start(&dir, Some(&project.join("Part.scancraft"))), Start::HandedOver));
+        assert!(matches!(start(&dir, Some(&project.join("Part.scancraft")), &[]), Start::HandedOver));
         assert_eq!(recv(&primary.requests), Handover::Open(project.join("Part.scancraft")));
-        assert!(matches!(start(&dir, None), Start::HandedOver));
+        assert!(matches!(start(&dir, None, &[]), Start::HandedOver));
+        assert_eq!(recv(&primary.requests), Handover::Focus);
+        // A second start's connection options are not applied, but named to the running app
+        // before its project opens.
+        let options = vec!["--mock".to_string(), "--connect 10.0.0.7".to_string()];
+        assert!(matches!(start(&dir, Some(&project), &options), Start::HandedOver));
+        assert_eq!(recv(&primary.requests), Handover::Ignored(options));
+        assert_eq!(recv(&primary.requests), Handover::Open(project.clone()));
+        let junk = vec!["x\u{1b}[2J".repeat(100); 20];
+        assert!(matches!(start(&dir, None, &junk), Start::HandedOver));
+        match recv(&primary.requests) {
+            Handover::Ignored(o) => assert!(o.len() == MAX_IGNORED && o.iter().all(|s| s.chars().count() <= MAX_IGNORED_LEN && !s.contains('\u{1b}'))),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(recv(&primary.requests), Handover::Focus);
+        // A request from an older start (no "ignored" field) still works.
+        let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
+        assert_eq!(send(info.port, &format!("{{\"token\": \"{}\", \"open\": null}}", info.token)), Ok(()));
         assert_eq!(recv(&primary.requests), Handover::Focus);
         // A project that does not exist is refused by the running app, which says why; the
         // start ends at once and never runs a second app.
         let gone = dir.join("gone.scancraft");
         let t0 = Instant::now();
-        assert!(matches!(start(&dir, Some(&gone)), Start::Refused(why) if why.contains("no such file")));
+        assert!(matches!(start(&dir, Some(&gone), &["--mock".to_string()]), Start::Refused(why) if why.contains("no such file")));
         assert!(t0.elapsed() < Duration::from_secs(2), "no retrying a definite refusal");
         assert!(matches!(recv(&primary.requests), Handover::Refused { path, .. } if path == gone.display().to_string()));
         // Without the token nothing is accepted, and nothing reaches the app.
         let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
-        let forged = Request { token: "0".repeat(64), open: Some(project.display().to_string()) };
+        let forged = Request { token: "0".repeat(64), open: Some(project.display().to_string()), ignored: Vec::new() };
         assert!(matches!(send(info.port, &serde_json::to_string(&forged).unwrap()), Err(Refusal::Refused(w)) if w.contains("wrong token")));
         assert!(matches!(send(info.port, "not json"), Err(Refusal::Refused(w)) if w.contains("not a request")));
         assert!(primary.requests.try_recv().is_err(), "refused requests never reach the app");
@@ -423,17 +469,17 @@ mod tests {
         let (guard, _rx, _wake) = primary.split();
         drop(guard);
         assert!(!dir.join(INFO_FILE).exists() && !dir.join(LOCK_FILE).exists());
-        assert!(matches!(start(&dir, None), Start::Primary(_)));
+        assert!(matches!(start(&dir, None, &[]), Start::Primary(_)));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn an_ending_app_is_waited_for_instead_of_handed_to() {
         let dir = temp("closing");
-        let Start::Primary(primary) = start(&dir, None) else { panic!("the first start runs") };
+        let Start::Primary(primary) = start(&dir, None, &[]) else { panic!("the first start runs") };
         let (guard, rx, _wake) = primary.split();
         let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
-        let focus = serde_json::to_string(&Request { token: info.token.clone(), open: None }).unwrap();
+        let focus = serde_json::to_string(&Request { token: info.token.clone(), open: None, ignored: Vec::new() }).unwrap();
         // The app no longer reads its requests: never "ok".
         guard.closing_flag().store(true, Ordering::SeqCst);
         assert_eq!(send(info.port, &focus), Err(Refusal::Retry("closing".into())));
@@ -447,7 +493,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(500));
             drop(guard);
         });
-        assert!(matches!(start_waiting(&dir, None, Duration::from_secs(10)), Start::Primary(_)));
+        assert!(matches!(start_waiting(&dir, None, &[], Duration::from_secs(10)), Start::Primary(_)));
         ending.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -455,7 +501,7 @@ mod tests {
     #[test]
     fn a_slow_client_neither_blocks_others_nor_stays_connected() {
         let dir = temp("slow");
-        let Start::Primary(primary) = start(&dir, None) else { panic!("the first start runs") };
+        let Start::Primary(primary) = start(&dir, None, &[]) else { panic!("the first start runs") };
         let info: Info = serde_json::from_slice(&std::fs::read(dir.join(INFO_FILE)).unwrap()).unwrap();
         // A client that sends a byte every 200 ms and never a whole line.
         let slow = TcpStream::connect((Ipv4Addr::LOCALHOST, info.port)).unwrap();
@@ -470,7 +516,7 @@ mod tests {
         });
         // Another start is answered meanwhile.
         let t0 = Instant::now();
-        assert!(matches!(start(&dir, None), Start::HandedOver));
+        assert!(matches!(start(&dir, None, &[]), Start::HandedOver));
         assert!(t0.elapsed() < Duration::from_secs(2));
         assert_eq!(recv(&primary.requests), Handover::Focus);
         // The slow one is cut off after the request time, not after 64 KiB of bytes.

@@ -243,6 +243,8 @@ fn read_opened(dir: &std::path::Path) -> Result<OpenedProject, String> {
         path: dir.to_path_buf(),
         store: Store::None,
         recovered: false,
+        read_only: false,
+        notice: None,
         name: stored.name,
         next_pass_id: stored.next_pass_id,
         passes,
@@ -1021,15 +1023,72 @@ impl ScanCraftApp {
     /// working folder, then back into the bundle). Saving anywhere else moves the tab there
     /// (Save As Project Folder, Save as Bundle…): the new place is locked, the old one unlocked,
     /// and a bundle's old working folder removed. The project is named after the folder or file.
+    ///
+    /// When the project file or bundle was changed by someone else since it was opened or last
+    /// saved here, nothing is saved: the conflict question (`save_conflict`) asks first.
     pub fn save_project(&mut self, target: PathBuf) {
+        self.save_project_with(target, false);
+    }
+
+    /// The conflict question's Save Anyway: saves over the version someone else saved.
+    pub fn save_anyway(&mut self) {
+        let Some(conflict) = self.save_conflict.take() else { return };
+        if !self.project.path.as_deref().is_some_and(|p| same_path(p, &conflict.target)) {
+            self.pending_close = false;
+            self.say(Tone::Error, "Not saved: the project shown is no longer the one asked about");
+            return;
+        }
+        self.save_project_with(conflict.target, true);
+    }
+
+    /// The conflict question's Save As…: the Save Project card, proposing a free name beside the
+    /// changed project (both versions are kept).
+    pub fn save_conflict_as(&mut self) {
+        let Some(conflict) = self.save_conflict.take() else { return };
+        self.open_tool(Tool::SaveProject);
+        self.settings.project_path = crate::storage::free_sibling(&conflict.target).display().to_string();
+        self.say(Tone::Normal, "Choose where to save this version, then Save");
+    }
+
+    /// The conflict question's Cancel: nothing is saved (a close or quit waiting for the save
+    /// stops too).
+    pub fn cancel_save_conflict(&mut self) {
+        if self.save_conflict.take().is_some() {
+            self.pending_close = false;
+            self.say(Tone::Normal, "Not saved");
+        }
+    }
+
+    /// A save that did not start: as a failed one, it neither closes the tab it was for nor
+    /// quits.
+    fn save_refused(&mut self, message: String) {
+        self.pending_close = false;
+        if self.save_all_queue.take().is_some() {
+            self.quit_confirmed = false;
+        }
+        self.say(Tone::Error, message);
+    }
+
+    /// Asks about a save that would replace someone else's version (stops a Save All on quit:
+    /// the question is about one tab).
+    fn ask_save_conflict(&mut self, target: PathBuf, why: String) {
+        if self.save_all_queue.take().is_some() {
+            self.quit_confirmed = false;
+        }
+        self.save_conflict = Some(crate::storage::SaveConflict { target, message: why });
+    }
+
+    /// [`Self::save_project`]; `overwrite`: save even over a version someone else saved (the
+    /// conflict question's Save Anyway).
+    fn save_project_with(&mut self, target: PathBuf, overwrite: bool) {
         if self.tool_blocked(Tool::SaveProject).is_some() || target.as_os_str().is_empty() {
-            self.say(Tone::Error, "Enter a folder or bundle file for the project");
+            self.save_refused("Enter a folder or bundle file for the project".into());
             return;
         }
         let target = std::path::absolute(&target).unwrap_or(target);
         let as_bundle = scancraft_io::project::has_extension(&target, scancraft_io::project::BUNDLE_EXTENSION);
         if !as_bundle && target.is_file() {
-            self.say(Tone::Error, format!("{} is a file: enter a folder, or a .scancraftz file to save a bundle", target.display()));
+            self.save_refused(format!("{} is a file: enter a folder, or a .scancraftz file to save a bundle", target.display()));
             return;
         }
         let name = if as_bundle { target.file_stem() } else { target.file_name() }.map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
@@ -1042,6 +1101,13 @@ impl ScanCraftApp {
             if let Store::Bundle { work, dir } = &self.project.store {
                 // A bundle tab: into its working folder, then back into this or another bundle.
                 let (work, dir) = (work.clone(), dir.clone());
+                if !overwrite {
+                    let changed = work.lock().ok().filter(|w| same_path(w.bundle(), &target) && w.bundle().exists() && w.bundle_changed()).map(|w| w.bundle().to_path_buf());
+                    if let Some(bundle) = changed {
+                        self.ask_save_conflict(target, format!("{} was changed by someone else since it was opened here.", bundle.display()));
+                        return;
+                    }
+                }
                 self.spawn_job("Saving the bundle", move || {
                     let saved = (|| {
                         project::save(&dir, &input.into_project(name.clone())?)?;
@@ -1051,7 +1117,11 @@ impl ScanCraftApp {
                         // for; Save as Bundle… writes what the settings ask for.
                         let report = if same_path(work.bundle(), &target) {
                             let keep = work.held_contents().union(&contents);
-                            work.save(&keep)
+                            if overwrite {
+                                work.save_overwriting(&keep)
+                            } else {
+                                work.save(&keep)
+                            }
                         } else {
                             work.save_as(&target, &contents)
                         };
@@ -1071,7 +1141,7 @@ impl ScanCraftApp {
                         Err(e) => return JobResult::Failed(format!("Could not save the bundle: {e}")),
                     };
                     let saved = (|| {
-                        project::save(work.dir(), &input.into_project(name.clone())?)?;
+                        project::save_carrying(work.dir(), &input.into_project(name.clone())?, old_dir.as_deref())?;
                         // From now on the folder holds the project (for a new one, its only copy
                         // on disk): a crash while the bundle is written leaves it recoverable.
                         work.project_written().map_err(|e| e.to_string())?;
@@ -1095,25 +1165,46 @@ impl ScanCraftApp {
         // Never into the working folders (closing a bundle tab removes its working folder), also
         // those under an earlier root.
         if let Some(root) = self.prefs.work_roots().into_iter().find(|root| target.starts_with(root) || std::path::absolute(root).is_ok_and(|r| target.starts_with(r))) {
-            self.say(Tone::Error, format!("{} is where opened bundles are unpacked: choose another folder", root.display()));
+            self.save_refused(format!("{} is where opened bundles are unpacked: choose another folder", root.display()));
             return;
         }
         // A project folder: locked first unless it is this tab's folder already.
-        let lock = if self.project.store.is_folder(&target) {
-            None
+        let (lock, seen) = if self.project.store.is_folder(&target) {
+            // This tab's folder: still locked by this tab (a lock broken by another computer that
+            // has since let go is taken again; one held by someone else refuses the save), and
+            // not saved by someone else meanwhile.
+            let Store::Folder { lock, seen } = &mut self.project.store else { unreachable!("is_folder") };
+            if !lock.is_held() {
+                match LockFile::lock_project(&target) {
+                    Ok(again) => *lock = again,
+                    Err(e) => {
+                        self.save_refused(format!("Could not save the project: {e}"));
+                        return;
+                    }
+                }
+            }
+            let seen = seen.clone();
+            let recorded = seen.lock().ok().and_then(|s| *s);
+            if !overwrite {
+                if let Err(scancraft_io::IoError::Conflict(why)) = scancraft_io::project::check_unchanged(&target, recorded) {
+                    self.ask_save_conflict(target, why);
+                    return;
+                }
+            }
+            (None, Some(seen))
         } else {
             let locked = std::fs::create_dir_all(&target).map_err(scancraft_io::IoError::from).and_then(|_| LockFile::lock_project(&target));
             match locked {
-                Ok(lock) => Some(lock),
+                Ok(lock) => (Some(lock), None),
                 Err(e) => {
-                    self.say(Tone::Error, format!("Could not save the project: {e}"));
+                    self.save_refused(format!("Could not save the project: {e}"));
                     return;
                 }
             }
         };
         self.spawn_job("Saving the project", move || {
             let saved = (|| {
-                project::save(&target, &input.into_project(name.clone())?)?;
+                project::save_carrying(&target, &input.into_project(name.clone())?, old_dir.as_deref())?;
                 // From a bundle (or another folder): bring the files the app does not hold.
                 if let (Some(_), Some(old)) = (&lock, &old_dir) {
                     workdir::copy_item_files(old, &target, Item::RawRecordings).map_err(|e| e.to_string())?;
@@ -1121,7 +1212,14 @@ impl ScanCraftApp {
                 Ok::<_, String>(())
             })();
             match saved {
-                Ok(()) => JobResult::Saved { message: format!("Saved {passes} to {}", target.display()), path: target, name, store: lock.map(Store::Folder) },
+                Ok(()) => {
+                    // What the project file is now: the next save checks nobody else saved since.
+                    let stamp = scancraft_io::project::project_file_stamp(&target);
+                    if let Some(Ok(mut s)) = seen.as_ref().map(|s| s.lock()) {
+                        *s = stamp;
+                    }
+                    JobResult::Saved { message: format!("Saved {passes} to {}", target.display()), path: target, name, store: lock.map(|l| Store::folder(l, stamp)) }
+                }
                 Err(e) => JobResult::Failed(format!("Could not save the project: {e}")),
             }
         });
@@ -1134,8 +1232,10 @@ impl ScanCraftApp {
 
     /// Opens a project folder, project file or bundle in a new tab (or in the current one when it
     /// is empty). A project that is open in a tab already is switched to. The project is locked
-    /// while open; one open elsewhere (another app or PC) is refused. A bundle is unpacked into a
-    /// working folder (under the working-folder root) and the tab works there.
+    /// while open. One open in another app on this computer is refused; one open on another
+    /// computer is asked about (`lock_prompt`: Take Over, Open Read-Only or Cancel). A lock left
+    /// by a ScanCraft that has ended is taken over, and the status says so. A bundle is unpacked
+    /// into a working folder (under the working-folder root) and the tab works there.
     pub fn open_project(&mut self, path: PathBuf) {
         if !self.can_edit() {
             return;
@@ -1152,11 +1252,25 @@ impl ScanCraftApp {
             }
             return;
         }
+        match LockFile::lock_project(target.path()) {
+            Ok(lock) => self.open_locked(target, lock),
+            Err(scancraft_io::IoError::Locked { owner: Some(owner), .. }) if owner.may_be_taken_over() => {
+                self.lock_prompt = Some(crate::storage::LockPrompt { target, owner: *owner });
+            }
+            Err(e) => self.say(Tone::Error, format!("Could not open the project: {e}")),
+        }
+    }
+
+    /// Opens `target` with its lock taken.
+    fn open_locked(&mut self, target: OpenTarget, lock: LockFile) {
+        // Never silently: a lock taken from an ended ScanCraft (or, after the question, from
+        // another computer) is named in the status.
+        let notice = lock.replaced().map(|o| format!("its lock was taken over from {}", o.describe()));
         match target {
             OpenTarget::Bundle(bundle) => {
                 let root = self.prefs.work_root();
                 self.spawn_job("Opening the bundle", move || {
-                    let work = match WorkFolder::open(&bundle, &root) {
+                    let work = match WorkFolder::open_with_lock(&bundle, &root, lock) {
                         Ok(w) => w,
                         Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
                     };
@@ -1164,6 +1278,7 @@ impl ScanCraftApp {
                         Ok(mut opened) => {
                             opened.path = bundle;
                             opened.store = Store::bundle(work);
+                            opened.notice = notice;
                             JobResult::Opened(Box::new(opened))
                         }
                         Err(e) => {
@@ -1174,16 +1289,79 @@ impl ScanCraftApp {
                 });
             }
             OpenTarget::Folder(dir) => {
-                let lock = match LockFile::lock_project(&dir) {
-                    Ok(lock) => lock,
-                    Err(e) => {
-                        self.say(Tone::Error, format!("Could not open the project: {e}"));
-                        return;
+                self.spawn_job("Opening the project", move || {
+                    // Taken before reading: a save by someone else after this is a conflict.
+                    let seen = scancraft_io::project::project_file_stamp(&dir);
+                    match read_opened(&dir) {
+                        Ok(mut opened) => {
+                            opened.store = Store::folder(lock, seen);
+                            opened.notice = notice;
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => JobResult::Failed(format!("Could not open the project: {e}")),
                     }
-                };
-                self.spawn_job("Opening the project", move || match read_opened(&dir) {
+                });
+            }
+        }
+    }
+
+    /// The lock question's message: who has the project, and what each answer does.
+    pub fn lock_prompt_message(&self) -> String {
+        let Some(p) = &self.lock_prompt else { return String::new() };
+        format!(
+            "{} is in use by {}.\nTake Over only if that ScanCraft is no longer running or has the project open by mistake: if both save, one loses its changes. Open Read-Only opens a copy here; Save then asks for a new place.",
+            p.target.path().display(),
+            p.owner.describe()
+        )
+    }
+
+    /// The lock question's Take Over: takes the lock from the holder shown (refused when someone
+    /// else holds it by now) and opens the project.
+    pub fn take_over_and_open(&mut self) {
+        let Some(p) = self.lock_prompt.take() else { return };
+        if !self.can_edit() {
+            return;
+        }
+        match LockFile::take_over_from(&LockFile::path_for(p.target.path()), &p.owner) {
+            Ok(lock) => self.open_locked(p.target, lock),
+            Err(e) => self.say(Tone::Error, format!("Could not take over the project: {e}")),
+        }
+    }
+
+    /// The lock question's Open Read-Only: reads the project without its lock into a tab with
+    /// no place on disk (a bundle through a temporary copy that is removed again). Nothing is
+    /// written where it is; Save asks for a new place.
+    pub fn open_read_only(&mut self) {
+        let Some(p) = self.lock_prompt.take() else { return };
+        if !self.can_edit() {
+            return;
+        }
+        match p.target {
+            OpenTarget::Bundle(bundle) => {
+                let root = self.prefs.work_root();
+                self.spawn_job("Opening a read-only copy", move || {
+                    let copy = match workdir::UnpackedCopy::unpack(&bundle, &root) {
+                        Ok(c) => c,
+                        Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    };
+                    let read = read_opened(copy.dir());
+                    drop(copy);
+                    match read {
+                        Ok(mut opened) => {
+                            opened.path = bundle.clone();
+                            opened.store = Store::ReadOnly(bundle);
+                            opened.read_only = true;
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    }
+                });
+            }
+            OpenTarget::Folder(dir) => {
+                self.spawn_job("Opening a read-only copy", move || match read_opened(&dir) {
                     Ok(mut opened) => {
-                        opened.store = Store::Folder(lock);
+                        opened.store = Store::ReadOnly(dir);
+                        opened.read_only = true;
                         JobResult::Opened(Box::new(opened))
                     }
                     Err(e) => JobResult::Failed(format!("Could not open the project: {e}")),
@@ -1401,10 +1579,16 @@ impl ScanCraftApp {
             self.settings.merge_outliers = v;
         }
         self.settings.whole_scene = opened.settings.get("whole_scene").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.settings.project_path = opened.path.display().to_string();
         // A recovered project holds changes its bundle does not have yet.
         let saved_generation = if opened.recovered { 0 } else { self.next_generation };
-        self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store };
+        if opened.read_only {
+            // A copy with no place on disk: Save proposes a new one beside the original.
+            self.settings.project_path = crate::storage::free_sibling(&opened.path).display().to_string();
+            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store };
+        } else {
+            self.settings.project_path = opened.path.display().to_string();
+            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store };
+        }
         self.selection = None;
         self.tool = None;
         self.framed_radius = 0.0;
@@ -1412,6 +1596,10 @@ impl ScanCraftApp {
         let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
         if opened.recovered {
             self.say(Tone::Success, format!("Recovered {} · {passes} · Save writes the changes into the bundle", self.project.name));
+        } else if opened.read_only {
+            self.say(Tone::Warning, format!("Opened {} · {passes} · nothing is written where it is: Save asks for a new place", self.project.name));
+        } else if let Some(notice) = opened.notice {
+            self.say(Tone::Warning, format!("Opened {} · {passes} · {notice}", self.project.name));
         } else {
             self.say(Tone::Success, format!("Opened {} · {passes}", self.project.name));
         }
@@ -1446,9 +1634,30 @@ impl ScanCraftApp {
         });
     }
 
-    /// Appends the passes of the project in `dir`, unaligned and with fresh ids (undoable).
+    /// Appends the passes of the project in `dir` (a project folder, its project file or a
+    /// bundle), unaligned and with fresh ids (undoable). A bundle is unpacked into a temporary
+    /// folder under the working-folder root, read, and the folder removed again; it is not
+    /// locked, so a bundle open in another tab or app can be added too.
     pub fn add_project(&mut self, dir: PathBuf) {
         if self.import_blocked().is_some() {
+            return;
+        }
+        if scancraft_io::project::is_bundle(&dir) {
+            let label = dir.file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "bundle".into());
+            let root = self.prefs.work_root();
+            self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || {
+                let copy = match workdir::UnpackedCopy::unpack(&dir, &root) {
+                    Ok(c) => c,
+                    Err(e) => return JobResult::Failed(format!("Could not add the bundle: {e}")),
+                };
+                let read = crate::imports::read_project(copy.dir());
+                drop(copy);
+                match read {
+                    Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
+                    Ok((name, passes)) => JobResult::AddedProject { name, passes },
+                    Err(e) => JobResult::Failed(e),
+                }
+            });
             return;
         }
         if let Err(e) = scancraft_io::project::locate(&dir) {

@@ -99,6 +99,8 @@ pub struct TabLabel {
     pub path: Option<std::path::PathBuf>,
     /// A bundle's working folder (`None`: not a bundle).
     pub work_dir: Option<std::path::PathBuf>,
+    /// What a read-only copy was opened from.
+    pub copy_of: Option<std::path::PathBuf>,
     pub active: bool,
 }
 
@@ -170,6 +172,8 @@ impl ScanCraftApp {
             Some("Stop the capture first")
         } else if self.picker.is_open() {
             Some("Close the file dialog first")
+        } else if self.lock_prompt.is_some() || self.save_conflict.is_some() {
+            Some("Answer the question first")
         } else {
             None
         }
@@ -182,9 +186,11 @@ impl ScanCraftApp {
             .enumerate()
             .map(|(i, t)| {
                 if i == self.active_tab {
-                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), work_dir: self.project.store.work_dir(), active: true }
+                    let copy_of = self.project.store.read_only_source().map(std::path::Path::to_path_buf);
+                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), work_dir: self.project.store.work_dir(), copy_of, active: true }
                 } else {
-                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), work_dir: t.project.store.work_dir(), active: false }
+                    let copy_of = t.project.store.read_only_source().map(std::path::Path::to_path_buf);
+                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), work_dir: t.project.store.work_dir(), copy_of, active: false }
                 }
             })
             .collect()

@@ -6,7 +6,9 @@
 //! unpacked into a working folder while the tab is open. Either is locked while open
 //! (`scancraft_io::lock`), so a second app or PC cannot save over it. Closing the tab releases
 //! the lock and removes a bundle's working folder; after a crash the working folder stays and the
-//! next start offers to recover it ([`crate::app::ScanCraftApp::check_leftovers`]).
+//! next start offers to recover it ([`crate::app::ScanCraftApp::check_leftovers`]). A project
+//! another computer has open can also be opened read-only: the tab is then a copy with no place
+//! on disk ([`Store::ReadOnly`]).
 //!
 //! The preferences (working-folder root, what a bundle holds) are kept in
 //! `<local app data>/ScanCraft/settings.json`. The app has no Settings window yet: they are edited
@@ -16,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use scancraft_io::bundle::BundleContents;
+use scancraft_io::fsutil::FileStamp;
 use scancraft_io::lock::LockFile;
 use scancraft_io::workdir::{self, WorkFolder};
 use serde::{Deserialize, Serialize};
@@ -26,24 +29,37 @@ pub enum Store {
     /// Not saved yet.
     #[default]
     None,
-    /// A project folder, locked while the tab is open.
-    Folder(LockFile),
+    /// A project folder, locked while the tab is open. `seen`: the stamp of its project file
+    /// when it was opened or last saved here (shared with a running save job): a different
+    /// project file there now was saved by someone else, and Save asks before replacing it.
+    Folder { lock: LockFile, seen: Arc<Mutex<Option<FileStamp>>> },
     /// A bundle opened into a working folder (shared with a running save job). `dir` is the
     /// working folder, which never changes (read without locking `work`).
     Bundle { work: Arc<Mutex<WorkFolder>>, dir: PathBuf },
+    /// A read-only copy of the project folder or bundle at this path (opened while another
+    /// computer has it): nothing is locked or written there; Save asks for a new place. Files of
+    /// a project folder the app does not hold (raw recordings) are copied from it on that save.
+    ReadOnly(PathBuf),
 }
 
 impl std::fmt::Debug for Store {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Store::None => write!(f, "Store::None"),
-            Store::Folder(lock) => write!(f, "Store::Folder({})", lock.path().display()),
+            Store::Folder { lock, .. } => write!(f, "Store::Folder({})", lock.path().display()),
             Store::Bundle { dir, .. } => write!(f, "Store::Bundle({})", dir.display()),
+            Store::ReadOnly(source) => write!(f, "Store::ReadOnly({})", source.display()),
         }
     }
 }
 
 impl Store {
+    /// A locked project folder whose project file had the stamp `seen` when it was read or
+    /// written.
+    pub fn folder(lock: LockFile, seen: Option<FileStamp>) -> Store {
+        Store::Folder { lock, seen: Arc::new(Mutex::new(seen)) }
+    }
+
     pub fn bundle(work: WorkFolder) -> Store {
         let dir = work.dir().to_path_buf();
         Store::Bundle { work: Arc::new(Mutex::new(work)), dir }
@@ -66,15 +82,26 @@ impl Store {
     pub fn data_dir(&self) -> Option<PathBuf> {
         match self {
             Store::None => None,
-            Store::Folder(lock) => Some(scancraft_io::lock::locked_target(lock.path())),
+            Store::Folder { lock, .. } => Some(scancraft_io::lock::locked_target(lock.path())),
             Store::Bundle { .. } => self.work_dir(),
+            // A read-only copy of a folder: still read from (never written); of a bundle: its
+            // unpacked copy is gone once the project is read.
+            Store::ReadOnly(source) => source.is_dir().then(|| source.clone()),
+        }
+    }
+
+    /// The project folder or bundle a read-only tab was copied from.
+    pub fn read_only_source(&self) -> Option<&Path> {
+        match self {
+            Store::ReadOnly(source) => Some(source),
+            _ => None,
         }
     }
 
     /// Whether this store is the project folder `dir` (already locked by this tab).
     pub fn is_folder(&self, dir: &Path) -> bool {
         match self {
-            Store::Folder(lock) => same_path(&scancraft_io::lock::locked_target(lock.path()), dir),
+            Store::Folder { lock, .. } => same_path(&scancraft_io::lock::locked_target(lock.path()), dir),
             _ => false,
         }
     }
@@ -136,6 +163,39 @@ impl OpenTarget {
             OpenTarget::Folder(p) | OpenTarget::Bundle(p) => p,
         }
     }
+}
+
+/// A project another computer has open (its lock cannot be checked from here), waiting for
+/// the lock question: Take Over, Open Read-Only or Cancel.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LockPrompt {
+    pub target: OpenTarget,
+    /// Who holds the lock, as shown: Take Over takes it from this holder only.
+    pub owner: scancraft_io::lock::Owner,
+}
+
+/// A save that would replace a version someone else saved, waiting for the conflict question:
+/// Save Anyway, Save As… or Cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveConflict {
+    /// The project folder or bundle the save was for.
+    pub target: PathBuf,
+    /// What changed.
+    pub message: String,
+}
+
+/// A free name beside `path` for Save As…: `<name> (2)`, `<name> (3)`, … (a bundle keeps its
+/// extension).
+pub fn free_sibling(path: &Path) -> PathBuf {
+    let bundle = scancraft_io::project::has_extension(path, scancraft_io::project::BUNDLE_EXTENSION);
+    let stem = if bundle { path.file_stem() } else { path.file_name() }.map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "Project".into());
+    (2..)
+        .map(|k| {
+            let name = if bundle { format!("{stem} ({k}).{}", scancraft_io::project::BUNDLE_EXTENSION) } else { format!("{stem} ({k})") };
+            path.with_file_name(name)
+        })
+        .find(|p| !p.exists())
+        .expect("an unused name")
 }
 
 /// A project waiting to be opened once the app is free.

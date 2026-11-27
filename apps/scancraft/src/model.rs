@@ -572,6 +572,11 @@ pub struct OpenedProject {
     pub store: crate::storage::Store,
     /// Recovered from a working folder left by a crash: it holds unsaved changes.
     pub recovered: bool,
+    /// A read-only copy (the project is open on another computer): the tab gets no place on
+    /// disk, and Save asks for one.
+    pub read_only: bool,
+    /// Said with the "Opened" message (a lock that was taken over).
+    pub notice: Option<String>,
     pub name: String,
     pub next_pass_id: u32,
     pub passes: Vec<crate::project::LoadedPass>,

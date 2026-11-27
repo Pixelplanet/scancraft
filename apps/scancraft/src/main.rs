@@ -33,7 +33,7 @@ use std::sync::Arc;
 use eframe::egui;
 use tokio::runtime::Runtime;
 
-use crate::app::{Capture, ScanCraftApp, StartConnection};
+use crate::app::{Capture, ScanCraftApp};
 use crate::model::Stage;
 
 struct ScanCraft {
@@ -118,6 +118,7 @@ impl eframe::App for ScanCraft {
             match h {
                 single_instance::Handover::Open(p) => self.app.request_open(storage::OpenRequest::Path(p)),
                 single_instance::Handover::Refused { path, why } => self.app.say(app::Tone::Error, format!("Could not open {path}: {why}")),
+                single_instance::Handover::Ignored(options) => self.app.say(app::Tone::Warning, single_instance::ignored_message(&options)),
                 single_instance::Handover::Focus => {}
             }
         }
@@ -135,6 +136,8 @@ impl eframe::App for ScanCraft {
         }
         crate::ui_ai::ai_pack_modal(&mut self.app, &ctx);
         ui_shell::recovery_prompt(&mut self.app, &ctx);
+        ui_shell::lock_prompt(&mut self.app, &ctx);
+        ui_shell::conflict_prompt(&mut self.app, &ctx);
         ui_shell::close_prompt(&mut self.app, &ctx);
         // Save All on quit has saved everything.
         if std::mem::take(&mut self.app.close_window) {
@@ -181,10 +184,11 @@ fn main() -> eframe::Result<()> {
     let mut wake = None;
     let mut closing = None;
     let _instance_guard = if cli.single_instance() {
-        match single_instance::start(&single_instance::default_dir(), cli.project.as_deref()) {
+        match single_instance::start(&single_instance::default_dir(), cli.project.as_deref(), &cli.new_app_options) {
             single_instance::Start::HandedOver => {
-                if cli.start != StartConnection::None {
-                    eprintln!("scancraft: ScanCraft is already running; the project (if any) opens there, the connection options are ignored");
+                // The running app names them too (this start has no window).
+                if !cli.new_app_options.is_empty() {
+                    eprintln!("scancraft: ScanCraft is already running; the project (if any) opens there, and {} were not used", cli.new_app_options.join(" "));
                 }
                 return Ok(());
             }
