@@ -17,7 +17,10 @@ open and writes back on Save. Open Project… takes either; the Save Project car
 or a bundle (and moves the tab there); projects are locked while open; working folders left by a
 crash are offered for recovery at start; `scancraft.exe <path>` opens a project and a second start
 hands it to the running app (one app per user, so two apps never use the scanner). The installer
-registers both file types. Details, decisions and what is left: [open-issues.md](open-issues.md)
+registers both file types. 2026-11-27: a project another PC has open asks Take Over / Open
+Read-Only, a save over someone else's version asks Save Anyway / Save As…, Add Project takes
+bundles, Open / Add Project Folder… are on the app bar buttons' right-click, unknown project-file
+fields are kept. Details, decisions and what is left: [open-issues.md](open-issues.md)
 4.1; layout: [architecture/scan-sessions.md](architecture/scan-sessions.md) section 8.
 
 **Update 2026-11-24 late (original PC): start with [open-issues.md](open-issues.md).** The branch

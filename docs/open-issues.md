@@ -522,14 +522,14 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
   folder project or a new one gets a new working folder, `WorkFolder::create`). Files the app does
   not hold in memory (raw recordings) are copied over (`workdir::copy_item_files`). A save into
   the working-folder root is refused (closing a tab removes its working folder). A bundle replaced
-  behind the app's back refuses Save (`Conflict`) with a message; Save as Bundle… under a new name
-  keeps both (there is no "save anyway" button yet).
+  behind the app's back asks first (Save Anyway / Save As… / Cancel, see the 2026-11-27 status).
 - **Closing a tab** (after the Save / Discard / Cancel question when it has changes) releases the
   lock and removes a bundle's working folder; quitting does the same for every tab. Quit's
   **Save All** saves bundle tabs into their bundles.
 - **Locks:** opening or saving a folder project takes `.scancraft.lock`; opening a bundle takes
-  `<bundle>.lock` (through `WorkFolder`). A project open in another app or on another PC is
-  refused with who holds it; one open in another window of this process says "already open".
+  `<bundle>.lock` (through `WorkFolder`). A project open in another app on this PC is refused with
+  who holds it, one on another PC is asked about (Take Over / Open Read-Only / Cancel, see the
+  2026-11-27 status); one open in another window of this process says "already open".
 - **Settings:** there is no Settings window yet, so the bundle contents (each item with its
   "Needed for" text as the tooltip; the core item shown ticked and disabled) and the
   working-folder root (*Unpack into*, with a Browse button and the free space in the tooltip) are
@@ -590,10 +590,56 @@ Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data
 - `uninstall.ps1 -Quiet -RemoveData` keeps working folders unless `-RemoveWorkFolders` is given,
   and they are always kept while any ScanCraft runs (not run, parsed only).
 
+**Status 2026-11-27: the open items of steps 1 and 2 done** (each with a test; no GUI run):
+- **Changed by someone else** (`app_project.rs::save_project_with`, `ui_shell::conflict_prompt`):
+  Save of a bundle whose file changed since it was opened or last saved here (`WorkState::
+  bundle_changed`), or of a project folder whose project file changed (new: the folder tab keeps
+  the project file's size and time stamp, `Store::Folder::seen`, `project::check_unchanged`), no
+  longer just fails. It asks first (*Changed by Someone Else*): **Save Anyway** (destructive,
+  `WorkFolder::save_overwriting` / skip the check), **Save As…** (the Save card with a free name
+  beside it, `storage::free_sibling`: both versions are kept), **Cancel**. Nothing is written
+  before the answer; a close waiting for the save stays open, a Save All on quit stops. A folder
+  tab whose lock was broken by someone who has let go takes it again (the stamp check still
+  catches their save); one held by someone else refuses the save naming them.
+- **Project in use on another computer** (`open_project`, `ui_shell::lock_prompt`): opening a
+  folder or bundle whose lock names another computer (cannot be checked from here) asks:
+  **Open Read-Only** (a copy in a tab with no place on disk, name "… (read-only)": a folder is
+  read in place, a bundle through a temporary unpacked copy that is removed again,
+  `workdir::UnpackedCopy`; nothing is locked or written there; Save asks for a new place and
+  brings a folder's raw recordings along), **Take Over** (destructive;
+  `LockFile::take_over_from` takes it only from the holder shown, refused when someone else holds
+  it by now and always for a running process on this PC), **Cancel**. A lock of a running
+  ScanCraft on this PC is still refused without a question. A lock of a process that has ended
+  on this PC is still taken without asking, but no longer silently: the status after opening says
+  whose lock was taken over (`LockFile::replaced`).
+- **Add Project with a bundle** (`add_project`): a `.scancraftz` is unpacked into a temporary
+  folder under the working-folder root (`UnpackedCopy`, not locked, so a bundle open elsewhere
+  works too), its passes are read and the folder removed. A crash meanwhile leaves a folder that
+  the next start removes quietly (its state says "being removed" from the start). Add Project…
+  now picks files (project files, bundles, `project.json`); a dropped bundle still opens as a tab.
+- **Folders in the dialogs** (`file_picker.rs`): the Windows dialog picks files *or* folders, so
+  the app bar's Open and Add buttons have a right-click menu with **Open Project Folder…** /
+  **Add Project Folder…** (an older `project.json` folder opens by picking the folder itself).
+- **Second start's options** (`cli.rs`, `single_instance.rs`): a start that hands its project to
+  the running app passes only the project. `--mock`, `--connect`, `--replay`, `--mock-modes` are
+  not applied there (the running app may be connected or capturing); they travel in the request
+  (`ignored`) and the running app names them in its status bar ("… were not used. Connect a
+  scanner from the Connect stage."). `--new-instance` still starts a second app that uses them.
+- **Unknown project-file fields are kept** (`ProjectFile::other`, `PassRecord::other`, serde
+  flatten): read, held, and written back; a save also carries those of the file it replaces (the
+  app builds the project from memory) or, on Save As into a new place, of the previous project
+  (`save_project_carrying`). A newer *format* number is still refused. Not kept: unknown keys
+  inside a pass's `scan_config` (the app rewrites it from its own settings) and inside
+  `alignment`.
+- **ZIP64:** tested without writing 4 GiB to disk. `zip64_entries_round_trip` forces ZIP64 size
+  fields on every entry of a real bundle (lowered threshold) and checks open, verify, extract and
+  raw copy on Save; `entries_and_offsets_past_4_gib_round_trip` writes a 4 GiB + 196 kB entry and
+  one behind it (offset past 4 GiB) into an in-memory sparse store with the bundle's own entry
+  options, reads it back with the CRC checked, and raw-copies both into a second archive. Not
+  tested: more than 65 535 entries, and a > 4 GiB bundle on a real disk.
+
 Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
-is unpacked at disk speed); keeping unknown project-file fields on save; sizes above 4 GiB
-untested; a real Settings window (the bundle options live in the Save card); a "save anyway"
-answer to a bundle changed by someone else and a "take over" answer to a lock from another PC
-(`LockFile::take_over` exists); Add Project with a bundle (refused: not a project folder); the
-single-instance check and the file association are not tested by a real double-click (no GUI runs
-on this PC during the benchmarks); an Explorer thumbnail.
+is unpacked at disk speed); a real Settings window (the bundle options live in the Save card); a
+Take Over answer when *saving* into a folder or bundle another computer holds (refused with who
+holds it; Save As works); the single-instance check and the file association are not tested by a
+real double-click (no GUI runs on this PC during the benchmarks); an Explorer thumbnail.
