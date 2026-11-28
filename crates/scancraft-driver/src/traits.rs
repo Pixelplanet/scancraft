@@ -57,4 +57,18 @@ pub trait ScannerDevice: Send + Sync {
 
     /// Gracefully disconnect and release device handles
     async fn disconnect(&mut self) -> Result<(), DriverError>;
+
+    /// Records the raw stream(s) of the next `start_scan` into `target` (taken by that call;
+    /// `None` cancels). Returns `false` if this device has no stream to record. Recording must
+    /// never slow the stream down: see [`crate::recording`].
+    fn set_recording(&mut self, _target: Option<crate::recording::RecordingTarget>) -> bool {
+        false
+    }
+
+    /// For the capture record, after `start_scan` succeeded: the stream layout, the setup the
+    /// device was sent, the calibration files needed to decode a recording offline and the files
+    /// being recorded. `None` when the device has nothing to say.
+    fn recording_info(&self, _config: &ScanConfig) -> Option<crate::recording::RecordingInfo> {
+        None
+    }
 }

@@ -34,6 +34,16 @@ pub struct RevopointDevice {
     last_config: ScanConfig,
     /// Held while streaming so no other process reconfigures the scanner under us.
     lock: Option<crate::scanner_lock::ScannerLock>,
+    /// The calibration files as downloaded (name in a pass's calibration folder, bytes).
+    calibration_files: Vec<(String, Vec<u8>)>,
+    /// Algorithm version from the scanner's announcement.
+    algo_version: String,
+    /// Where the next scan is recorded (`set_recording`), and what the running one records to.
+    recording: Option<scancraft_driver::RecordingTarget>,
+    recording_files: Vec<std::path::PathBuf>,
+    /// The stream setup of the last scan (format, display type, ...) and the control queries
+    /// sent to start it.
+    last_stream: serde_json::Value,
 }
 
 impl RevopointDevice {
@@ -48,14 +58,37 @@ impl RevopointDevice {
             .map_err(|e| DriverError::ConnectionFailed(format!("calibration download: {e}")))?;
         let red = StereoCalibration::parse(&yaml).ok_or_else(|| DriverError::Protocol("camparam.yaml is missing pL/pR".into()))?;
         let mut calibration = DeviceCalibration::new(red);
-        match crate::color_stream::download_calibration(&ctl).await {
-            Ok(color) => calibration = calibration.with_color(color),
+        // The files are kept as received: a recorded scan is decoded offline with them.
+        let mut calibration_files = vec![("camparam.yaml".to_string(), yaml.clone().into_bytes())];
+        match crate::color_stream::download_calibration_files(&ctl).await {
+            Ok((color, files)) => {
+                calibration = calibration.with_color(color);
+                calibration_files.extend(files);
+            }
             Err(e) => log::warn!("POP 4 {sn}: no RGB calibration ({e}); colour scanning disabled"),
         }
-        match crate::calibration::download_blue(&ctl).await {
-            Ok(blue) => calibration = calibration.with_blue(blue),
+        match crate::calibration::download_blue_files(&ctl).await {
+            Ok((blue, files)) => {
+                calibration = calibration.with_blue(blue);
+                calibration_files.extend(files);
+            }
             Err(e) => log::warn!("POP 4 {sn}: blue (laser) calibration unavailable, laser modes disabled: {e}"),
         }
+        // Firmware and algorithm versions from the scanner's announcement (best effort).
+        let announcement = match ip.parse::<std::net::Ipv4Addr>() {
+            Ok(addr) => crate::discovery::query(addr, Duration::from_millis(1200)).await,
+            Err(_) => None,
+        };
+        let (firmware, algo_version) = announcement.map(|a| (a.firmware, a.algo)).unwrap_or_default();
+        if firmware.is_empty() {
+            log::warn!("POP 4: the scanner did not say its firmware version");
+        } else {
+            log::info!("POP 4 firmware {firmware}, algorithm {algo_version}");
+        }
+        // The copies kept for capture records must not carry the serial number (projects are
+        // shared as test data): `camparam.yaml` names it as `deviceID`, `metroExtra.bin` in its
+        // header.
+        let calibration_files = calibration_files.into_iter().map(|(name, bytes)| (name, crate::calibration::redact_serial(&bytes, &sn))).collect();
         let has_rgb = calibration.color.is_some();
         let calibration = Arc::new(calibration);
         let rig = calibration.red_rig(streams::full_field::WIDTH, streams::full_field::HEIGHT);
@@ -65,7 +98,7 @@ impl RevopointDevice {
             vendor: "Revopoint".to_string(),
             model: "POP 4".to_string(),
             serial_number: sn,
-            firmware_version: "—".to_string(),
+            firmware_version: if firmware.is_empty() { "—".to_string() } else { firmware },
             active_transport: DeviceTransport::WiFi { ip: ip.to_string(), control_port: 80, data_port: 8871, imu_port: 9999 },
             depth_resolution: (rig.width, rig.height),
             rgb_resolution: has_rgb.then_some((crate::color_stream::WIDTH, crate::color_stream::HEIGHT)),
@@ -113,6 +146,11 @@ impl RevopointDevice {
             paused: Arc::new(AtomicBool::new(false)),
             last_config: ScanConfig::default(),
             lock: None,
+            calibration_files,
+            algo_version,
+            recording: None,
+            recording_files: Vec::new(),
+            last_stream: serde_json::Value::Null,
         })
     }
 
@@ -126,10 +164,10 @@ impl RevopointDevice {
     }
 
     /// Sets the device up for `mode`, then streams it. `on_frame` runs on a dedicated decode
-    /// thread and returns `false` to stop. With `record` and `SCANCRAFT_RECORD_DIR` set, every
-    /// received packet is also written to `<dir>/pop4_<unix time>.bin` in the wire framing, so a
-    /// session can be replayed offline (`examples/replay_track.rs`).
-    async fn start_stream<F>(&mut self, mode: Box<dyn ModeStream>, record: bool, mut on_frame: F) -> Result<(), DriverError>
+    /// thread and returns `false` to stop. With a `recorder` every received packet is also
+    /// recorded in the wire framing ([`wire_record`]), through its writer thread, so a session
+    /// can be replayed offline (`offline.rs`, `examples/replay_track.rs`).
+    async fn start_stream<F>(&mut self, mode: Box<dyn ModeStream>, recorder: Option<scancraft_driver::RawRecorder>, mut on_frame: F) -> Result<(), DriverError>
     where
         F: FnMut(SensorFrame) -> bool + Send + 'static,
     {
@@ -142,6 +180,8 @@ impl RevopointDevice {
         // close streams, display geometry, output format (the DSP powers off and reloads here,
         // forgetting every register), open the media stream, trigger mode, wait for the first
         // frame, and only then the mode's register setup.
+        // Everything sent from here until the mode is configured goes into the capture record.
+        self.ctl.start_transcript();
         self.ctl.cgi("close_stream_all").await?;
         let spec = mode.spec();
         self.ctl.set_stream_format(spec.output_fmt, spec.display_type, spec.width, spec.layout.display_rows(spec.height)).await?;
@@ -165,7 +205,6 @@ impl RevopointDevice {
         let first_packet = Arc::new(tokio::sync::Notify::new());
         let first_packet_tx = first_packet.clone();
         let url = format!("http://{}/cgi-bin/zx_media.cgi?{}", self.ctl.ip, spec.media_query);
-        let mut recorder = record.then(open_recording).flatten();
         let paused = self.paused.clone();
         paused.store(false, Ordering::SeqCst);
 
@@ -222,16 +261,9 @@ impl RevopointDevice {
                         if paused.load(Ordering::Relaxed) {
                             continue;
                         }
-                        if let Some(file) = recorder.as_mut() {
-                            use std::io::Write;
-                            let written = file
-                                .write_all(&crate::media::PACKET_MAGIC)
-                                .and_then(|_| file.write_all(&(packet.len() as u32).to_le_bytes()))
-                                .and_then(|_| file.write_all(&packet));
-                            if let Err(e) = written {
-                                log::warn!("recording stopped: {e}");
-                                recorder = None;
-                            }
+                        // Through the writer thread: a slow disk drops records, never the stream.
+                        if let Some(rec) = recorder.as_ref() {
+                            rec.push(wire_record(&packet));
                         }
                         if !packet_tx.put(packet) {
                             return;
@@ -253,6 +285,16 @@ impl RevopointDevice {
             ));
         }
         let configured = mode.lock().await.configure(&self.ctl).await;
+        let commands = self.ctl.take_transcript();
+        self.last_stream = serde_json::json!({
+            "output_fmt": spec.output_fmt,
+            "display_type": spec.display_type,
+            "width": spec.width,
+            "height": spec.height,
+            "layout": format!("{:?}", spec.layout),
+            "media_query": spec.media_query,
+            "commands": commands,
+        });
         if let Err(e) = configured {
             self.shut_down_stream().await;
             return Err(e);
@@ -262,9 +304,14 @@ impl RevopointDevice {
 
     /// Starts the RGB stream next to the running depth stream; frames go to `sync`. Must follow
     /// `start_stream` (which closes all streams first).
-    async fn start_color_stream(&mut self, sync: Arc<crate::color_stream::ColorSync>, record: bool) -> Result<(), DriverError> {
-        crate::color_stream::configure(&self.ctl).await?;
-        let recorder = record.then(|| open_recording_named("_rgb")).flatten();
+    async fn start_color_stream(&mut self, sync: Arc<crate::color_stream::ColorSync>, recorder: Option<scancraft_driver::RawRecorder>) -> Result<(), DriverError> {
+        self.ctl.start_transcript();
+        let configured = crate::color_stream::configure(&self.ctl).await;
+        let commands = self.ctl.take_transcript();
+        if let Some(map) = self.last_stream.as_object_mut() {
+            map.insert("rgb".into(), serde_json::json!({ "media_query": crate::color_stream::MEDIA_QUERY, "width": crate::color_stream::WIDTH, "height": crate::color_stream::HEIGHT, "commands": commands }));
+        }
+        configured?;
         self.color_task = Some(crate::color_stream::spawn(self.ctl.ip.clone(), self.calibration.color.clone(), sync, self.paused.clone(), recorder));
         Ok(())
     }
@@ -349,25 +396,37 @@ impl<T> Drop for SlotReceiver<T> {
     }
 }
 
-fn open_recording() -> Option<std::io::BufWriter<std::fs::File>> {
-    open_recording_named("")
+/// One packet as recorded: the media-stream framing `[u32 LE 0x11223344][u32 LE len][packet]`
+/// (what `PacketParser` / `RgbPacketParser` read back).
+pub(crate) fn wire_record(packet: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(packet.len() + 8);
+    out.extend_from_slice(&crate::media::PACKET_MAGIC);
+    out.extend_from_slice(&(packet.len() as u32).to_le_bytes());
+    out.extend_from_slice(packet);
+    out
 }
 
-/// `<SCANCRAFT_RECORD_DIR>/pop4_<unix time><suffix>.bin`; the RGB stream uses suffix `_rgb`.
-fn open_recording_named(suffix: &str) -> Option<std::io::BufWriter<std::fs::File>> {
-    let dir = std::env::var_os("SCANCRAFT_RECORD_DIR")?;
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let path = std::path::Path::new(&dir).join(format!("pop4_{secs}{suffix}.bin"));
-    match std::fs::File::create(&path) {
-        Ok(f) => {
+/// A recorder for `path`, `None` (logged) when the file cannot be opened: scanning goes on.
+fn open_recorder(path: &std::path::Path, append: bool, stats: &Arc<scancraft_driver::RecordStats>, queue: usize) -> Option<scancraft_driver::RawRecorder> {
+    match scancraft_driver::RawRecorder::open(path, append, stats.clone(), queue) {
+        Ok(r) => {
             log::info!("recording raw stream to {}", path.display());
-            Some(std::io::BufWriter::with_capacity(1 << 20, f))
+            Some(r)
         }
         Err(e) => {
             log::warn!("cannot record to {}: {e}", path.display());
             None
         }
     }
+}
+
+/// `<SCANCRAFT_RECORD_DIR>/pop4_<unix time><suffix>.bin`; the RGB stream uses suffix `_rgb`.
+/// Used when the app asked for no recording of its own (`set_recording`).
+fn open_recording_named(suffix: &str) -> Option<scancraft_driver::RawRecorder> {
+    let dir = std::env::var_os("SCANCRAFT_RECORD_DIR")?;
+    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = std::path::Path::new(&dir).join(format!("pop4_{secs}{suffix}.bin"));
+    open_recorder(&path, false, &scancraft_driver::RecordStats::new(), scancraft_driver::recording::DEFAULT_QUEUE_BYTES)
 }
 
 async fn imu_listener(ip: String, tx: broadcast::Sender<ImuSample>) {
@@ -424,7 +483,7 @@ impl ScannerDevice for RevopointDevice {
         let mut imu_rx = self.imu_tx.subscribe();
         let object = if crate::modes::full_field_preset(self.last_config.object).is_some() { self.last_config.object } else { ObjectType::General };
         let mode = Box::new(streams::FullField::new(object, self.calibration.clone())?);
-        self.start_stream(mode, false, move |frame| {
+        self.start_stream(mode, None, move |frame| {
             let preview = PreviewFrame {
                 frame_index: frame.frame_index,
                 timestamp_ms: frame.timestamp_ms,
@@ -475,9 +534,19 @@ impl ScannerDevice for RevopointDevice {
         let color_sync = wants_color.then(|| Arc::new(crate::color_stream::ColorSync::default()));
         let frame_sync = color_sync.clone();
 
+        // The app's recording target (raw files in the pass folder), else SCANCRAFT_RECORD_DIR.
+        let target = self.recording.take();
+        let (main_rec, rgb_rec) = match &target {
+            Some(t) => (
+                open_recorder(&t.main, t.append, &t.main_stats, t.queue_bytes),
+                wants_color.then(|| open_recorder(&t.rgb, t.append, &t.rgb_stats, t.queue_bytes)).flatten(),
+            ),
+            None => (open_recording_named(""), wants_color.then(|| open_recording_named("_rgb")).flatten()),
+        };
+        self.recording_files = main_rec.iter().chain(rgb_rec.iter()).map(|r| r.path().to_path_buf()).collect();
         let (tx, rx) = mpsc::channel(4);
         let mut imu_rx = self.imu_tx.subscribe();
-        self.start_stream(mode, true, move |mut frame| {
+        self.start_stream(mode, main_rec, move |mut frame| {
             frame.imu = frame.imu.or_else(|| latest(&mut imu_rx));
             if let Some(sync) = &frame_sync {
                 frame.color = sync.take_match(frame.timestamp_ms, Duration::from_millis(120));
@@ -487,7 +556,7 @@ impl ScannerDevice for RevopointDevice {
         .await?;
         if let Some(sync) = color_sync {
             // Depth keeps streaming if the RGB setup fails; frames then simply carry no colour.
-            if let Err(e) = self.start_color_stream(sync, true).await {
+            if let Err(e) = self.start_color_stream(sync, rgb_rec).await {
                 log::warn!("RGB stream not started: {e}");
             }
         }
@@ -532,6 +601,22 @@ impl ScannerDevice for RevopointDevice {
         self.shut_down_stream().await;
         self.imu_task.abort();
         Ok(())
+    }
+
+    fn set_recording(&mut self, target: Option<scancraft_driver::RecordingTarget>) -> bool {
+        self.recording = target;
+        true
+    }
+
+    fn recording_info(&self, config: &ScanConfig) -> Option<scancraft_driver::RecordingInfo> {
+        let mut stream = self.last_stream.clone();
+        if let Some(map) = stream.as_object_mut() {
+            map.insert("format".into(), crate::offline::STREAM_FORMAT.into());
+            map.insert("record_framing".into(), "u32 LE 0x11223344, u32 LE length, packet as received (rgb: JPEG + u32 LE timestamp)".into());
+            map.insert("algorithm_version".into(), self.algo_version.clone().into());
+            map.insert("light".into(), config.light.label().into());
+        }
+        Some(scancraft_driver::RecordingInfo { stream, calibration: self.calibration_files.clone(), files: self.recording_files.clone() })
     }
 }
 

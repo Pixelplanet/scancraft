@@ -220,6 +220,10 @@ pub enum OpenRequest {
     Recover(PathBuf),
 }
 
+fn yes() -> bool {
+    true
+}
+
 /// The project-file preferences (kept across starts).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Prefs {
@@ -235,6 +239,11 @@ pub struct Prefs {
     /// What Save as Bundle… puts into a bundle.
     #[serde(default)]
     pub bundle_contents: BundleContents,
+    /// Record the raw streams of every scan with a real scanner into the project
+    /// (`pass-<id>/raw.bin`, `raw_rgb.bin`), so the scan can be replayed and processed again
+    /// offline. On by default; several MB per second.
+    #[serde(default = "yes")]
+    pub record_raw: bool,
     /// Settings of later versions, kept as they are.
     #[serde(flatten)]
     pub other: serde_json::Map<String, serde_json::Value>,
@@ -242,7 +251,7 @@ pub struct Prefs {
 
 impl Default for Prefs {
     fn default() -> Self {
-        Prefs { work_root: None, past_work_roots: Vec::new(), bundle_contents: BundleContents::default(), other: Default::default() }
+        Prefs { work_root: None, past_work_roots: Vec::new(), bundle_contents: BundleContents::default(), record_raw: true, other: Default::default() }
     }
 }
 

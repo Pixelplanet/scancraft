@@ -461,3 +461,17 @@ laser model are not built.
   Reconstruct's spacing is the mean of the middle fifth over all points (stable). 13 new tests, all
   fail on 41e7b72. Open: the lattice suppression still depends on the support radius; see
   open-issues 2.4.
+- 2026-11-28 (original PC, branch `agent/integration`) — Capture records for the scan day (metal
+  part under scanning spray): every pass of a real scanner records its raw streams into the
+  project (`pass-<id>/raw.bin`, `raw_rgb.bin`) through a non-blocking writer thread
+  (`scancraft_driver::recording`; the old recording wrote inside the HTTP stream task), plus
+  `capture.json` (build + git commit via `apps/scancraft/build.rs`, device with firmware from the
+  scanner's announcement and only a serial hash, settings, setup commands sent, counts, events,
+  turntable region), `tracking.csv` and `calibration/` (serial blanked); project notes; settings
+  JSON with processing parameters and history; app log file (`logfile.rs`). Headless replay
+  `scancraft --replay-pass <project> <id>` reproduces the live poses (< 0.0001 mm on the
+  simulator and a POP 4 recording). Simulator: turntable scene (static table and wall, markers on
+  the turntable, rectified IR pair, Marker tracking). Fixed: turntable plane fit took a plane
+  tilted through disc and table (inliers 2 → 1 mm). Found: a depth window cutting the object
+  biases tracking to "no motion". No scanner used. Notes: scan-sessions.md §7–8, HANDOFF §4,
+  open-issues §4.2.

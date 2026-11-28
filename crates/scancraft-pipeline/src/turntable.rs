@@ -116,6 +116,10 @@ impl DepthSource for TurntableFilter {
         true
     }
 
+    fn turntable_region(&self) -> Option<TurntableRegion> {
+        self.region
+    }
+
     fn process(&mut self, frame: &SensorFrame) -> Option<FrameGeometry> {
         let geometry = self.inner.process(frame)?;
         if self.region.is_none() {
@@ -166,7 +170,10 @@ pub fn estimate_region(points: &[Vec3], config: &TurntableConfig) -> Option<Turn
     }
     // 1. Plane: RANSAC, preferring planes whose normal points up in the sensor frame, oriented
     //    towards the sensor (origin): the object side. Then refined on all inliers.
-    const INLIER_MM: f32 = 2.0;
+    // 1 mm, not 2: a turntable disc a few mm above the table, seen at a grazing angle, let a
+    // plane tilted by ~2 degrees through both collect more points within 2 mm than either plane
+    // (simulator turntable scene, 2026-11-28); the depth noise of a plane is ~0.25 mm RMS.
+    const INLIER_MM: f32 = 1.0;
     let sample: Vec<Vec3> = points.iter().step_by((points.len() / 4000).max(1)).copied().collect();
     let search = PlaneSearch {
         iterations: 400,

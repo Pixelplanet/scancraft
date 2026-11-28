@@ -919,3 +919,29 @@ is unpacked at disk speed); a real Settings window (the bundle options live in t
 Take Over answer when *saving* into a folder or bundle another computer holds (refused with who
 holds it; Save As works); the single-instance check and the file association are not tested by a
 real double-click (no GUI runs on this PC during the benchmarks); an Explorer thumbnail.
+### 4.2 Capture records: what a scanned pass keeps for later tests (2026-11-28) — done, gaps listed
+
+Built on `agent/integration` (layout in [scan-sessions.md](architecture/scan-sessions.md) §8, replay
+in [HANDOFF.md](HANDOFF.md) §4 "Replaying a pass"): raw streams into the pass folder by default,
+`capture.json`, `tracking.csv`, `calibration/`, project notes, processing parameters and history in
+the project file, an app log file named by the record, headless replay to the live poses. Proven
+on the simulator (handheld and turntable, Feature and Marker) and on a POP 4 Full-field recording;
+**not yet with the real scanner in the app** (no scanner was used).
+
+Still not recorded, and why:
+- **IMU samples between frames**: only the sample delivered with each frame (`tracking.csv`);
+  firmware v5.3.99 reports the IMU off, so there is nothing to record today.
+- **The laser plane file** (`%LOCALAPPDATA%/ScanCraft/laser_planes_*.json`) is not copied into
+  laser passes; laser passes replay only on a PC with the same file.
+- **Same Position seeds**: a seeded pass replays in its own frame (the record says `seeded`).
+- **Live AI masks** applied to frames before tracking are not stored (the record says `live_ai`).
+- **Colour pairing by arrival time**: live, a depth frame gets the RGB frame that arrived within
+  120 ms; the replay pairs by time stamp only (same result unless the RGB stream lagged; matters
+  for Color tracking only).
+- **Parameters of each processing step**: the settings are saved as they are at save time and
+  the history names the steps, but not each step's own parameters.
+- **Raw frames dropped by a slow disk** are counted per session, not listed; a replay skips them.
+- The previous build bundles `raw_rgb.bin` as a core file and does not copy `capture.json`,
+  `tracking.csv` and `calibration/` when it saves a project to another place.
+- The GUI `--replay` still takes only a marker recording + `camparam.yaml`; replaying a pass in
+  the window (rather than headless) is not built.

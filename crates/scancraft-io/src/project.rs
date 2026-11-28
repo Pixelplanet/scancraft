@@ -78,6 +78,10 @@ pub struct ProjectFile {
     /// Application settings worth restoring (free-form).
     #[serde(default)]
     pub settings: serde_json::Value,
+    /// Free-text notes about the project ("metal part, scanning spray, 2026-11-28"), edited in
+    /// the Save card. Older versions keep it as an unknown field.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub notes: String,
     /// Fields this version does not know (written by a later one), kept as they are: a save
     /// writes them back ([`save_project`]).
     #[serde(flatten)]
@@ -722,6 +726,7 @@ mod tests {
             passes: vec![pass(1, "reference"), pass(2, "aligned"), pass(3, "unaligned")],
             outputs: vec![OutputRecord { kind: "merged".into(), file: "outputs/merged.ply".into(), points: 42, passes: vec![1, 2] }],
             settings: serde_json::json!({ "min_mm": 150.0 }),
+            notes: String::new(),
             other: Default::default(),
         };
         let kfs = vec![(1, vec![keyframe(0, 10), keyframe(1, 0)]), (2, vec![keyframe(5, 100)]), (3, Vec::new())];
@@ -760,6 +765,7 @@ mod tests {
             }],
             outputs: Vec::new(),
             settings: serde_json::json!({}),
+            notes: String::new(),
             other: Default::default(),
         }
     }

@@ -209,9 +209,17 @@ struct SaveInput {
     merged: Option<(PointCloud, Vec<u32>)>,
     mesh: Option<scancraft_core::Mesh>,
     settings: serde_json::Value,
+    notes: String,
 }
 
 impl SaveInput {
+    /// Waits (at most `limit`) until the raw recordings of the passes have been written out: a
+    /// capture that just stopped may still be flushing them. `false` when one is still writing.
+    fn wait_for_recordings(&self, limit: std::time::Duration) -> bool {
+        let stats: Vec<_> = self.passes.iter().filter_map(|p| p.4.capture.as_ref()).filter_map(|c| c.lock().ok().map(|l| l.recording_stats())).flatten().collect();
+        scancraft_driver::recording::wait_finished(&stats, limit)
+    }
+
     /// The project to write, named `name` (runs in the job: it locks the passes' trackers).
     fn into_project(self, name: String) -> Result<StoredProject, String> {
         let mut stored = Vec::with_capacity(self.passes.len());
@@ -219,7 +227,53 @@ impl SaveInput {
             let Ok(t) = tracker.lock() else { return Err("A pass's tracker is unavailable".into()) };
             stored.push(StoredPass { id, name: pass_name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
         }
-        Ok(StoredProject { name, reference: self.reference, next_pass_id: self.next_pass_id, passes: stored, merged: self.merged, cleaned: None, mesh: self.mesh, settings: self.settings })
+        Ok(StoredProject { name, reference: self.reference, next_pass_id: self.next_pass_id, passes: stored, merged: self.merged, cleaned: None, mesh: self.mesh, settings: self.settings, notes: self.notes })
+    }
+}
+
+/// How long a save waits for raw recordings that are still being written out.
+const RECORDING_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Moves the raw recordings (and capture files written next to them) of a staging folder
+/// (`ProjectInfo::staging`) into the project folder `to`: renamed when on the same drive, else
+/// copied and then removed. Files the project already has are not replaced.
+pub(crate) fn move_raw_files(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
+    let mut moved = 0;
+    for entry in std::fs::read_dir(from)?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !entry.path().is_dir() || !name.starts_with("pass-") {
+            continue;
+        }
+        for file in std::fs::read_dir(entry.path())?.flatten() {
+            let fname = file.file_name().to_string_lossy().to_string();
+            if !matches!(fname.as_str(), "raw.bin" | "raw_rgb.bin") {
+                continue;
+            }
+            let dest = to.join(&name).join(&fname);
+            if dest.exists() && !scancraft_io::fsutil::stamp(&dest).is_some_and(|s| s.size == 0) {
+                // Recorded into the project already (a continued pass after the first save).
+                continue;
+            }
+            std::fs::create_dir_all(dest.parent().unwrap_or(to))?;
+            if std::fs::rename(file.path(), &dest).is_err() {
+                std::fs::copy(file.path(), &dest)?;
+                let _ = std::fs::remove_file(file.path());
+            }
+            moved += 1;
+        }
+    }
+    Ok(moved)
+}
+
+/// What a save says about moving the staged raw recordings: nothing when they moved, else why
+/// they stayed where they were (nothing is lost: they are moved on the next save).
+fn staging_note(staging: &std::path::Path, moved: std::io::Result<usize>) -> Option<String> {
+    match moved {
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("raw recordings in {} were not moved into the project: {e}", staging.display());
+            Some(format!(" · the raw recordings stay in {} ({e}); the next save tries again", staging.display()))
+        }
     }
 }
 
@@ -258,6 +312,7 @@ fn read_opened(dir: &std::path::Path) -> Result<OpenedProject, String> {
         cleaned: stored.cleaned,
         mesh,
         settings: stored.settings,
+        notes: stored.notes,
     })
 }
 
@@ -1064,8 +1119,48 @@ impl ScanCraftApp {
                 "merge_outliers": self.settings.merge_outliers,
                 "merge_sigma": self.settings.merge_sigma,
                 "whole_scene": self.settings.whole_scene,
+                // The processing parameters of the later steps (informative: what the outputs
+                // were last made with) and the app that saved them.
+                "processing": self.processing_settings(),
+                "saved_by": crate::capture::app_build(),
             }),
+            notes: self.project.notes.clone(),
         }
+    }
+
+    /// The project's processing history: what was saved with it before, then this session's
+    /// done steps (oldest first; at most `MAX_HISTORY` of a session).
+    pub(crate) fn history_log(&self) -> Vec<serde_json::Value> {
+        let mut log = self.project.history_before.clone();
+        let utc = |t: std::time::SystemTime| scancraft_io::fsutil::format_utc(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        log.extend(self.history.timeline().into_iter().filter(|s| s.done).map(|s| serde_json::json!({ "utc": utc(s.at), "step": s.label, "app": crate::capture::version_label() })));
+        log
+    }
+
+    /// Clean / Reconstruct / Make Solid / Fill Holes settings as saved with the project.
+    pub(crate) fn processing_settings(&self) -> serde_json::Value {
+        let s = &self.settings;
+        serde_json::json!({
+            "point_budget": s.point_budget,
+            "plane_tolerance_mm": s.plane_tolerance_mm,
+            "sor_neighbors": s.sor_neighbors,
+            "sor_std_dev": s.sor_std_dev,
+            "voxel_mm": s.voxel_mm,
+            "mc_cell_mm": s.mc_cell_mm,
+            "mesh_smoothness": s.mesh_smoothness,
+            "mesh_auto_smooth": s.mesh_auto_smooth,
+            "mesh_suppress_artefacts": s.mesh_suppress_artefacts,
+            "mesh_remove_markers": s.mesh_remove_markers,
+            "smooth_iterations": s.smooth_iterations,
+            "smooth_keep_edges": s.smooth_keep_edges,
+            "fill_max_mm": s.fill_max_mm,
+            "fill_keep_largest": s.fill_keep_largest,
+            "solid_cell_mm": s.solid_cell_mm,
+            "solid_remove_markers": s.solid_remove_markers,
+            "solid_sharp_top": s.solid_sharp_top,
+            "decimate_ratio": s.decimate_ratio,
+            "history": self.history_log(),
+        })
     }
 
     /// Save Project into `target`: a project folder, or a bundle when `target` ends in
@@ -1162,6 +1257,8 @@ impl ScanCraftApp {
         let input = self.save_input();
         let contents = self.prefs.bundle_contents;
         let old_dir = self.project.store.data_dir();
+        // Raw streams recorded before the project had a folder of its own (`ProjectInfo::staging`).
+        let staging = self.project.staging.clone().filter(|d| d.is_dir());
         let n = input.passes.len();
         let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
         if as_bundle {
@@ -1189,7 +1286,11 @@ impl ScanCraftApp {
                 }
                 self.spawn_job("Saving the bundle", move || {
                     let saved = (|| {
+                        let flushed = input.wait_for_recordings(RECORDING_FLUSH);
                         project::save(&dir, &input.into_project(name.clone())?)?;
+                        if !flushed {
+                            log::warn!("a raw recording was still being written while saving");
+                        }
                         let mut work = work.lock().map_err(|_| "the working folder is unavailable".to_string())?;
                         // Save keeps everything the bundle holds (the working folder, its only
                         // other copy, goes when the tab closes) and adds what the settings ask
@@ -1220,6 +1321,7 @@ impl ScanCraftApp {
                         Err(e) => return JobResult::Failed(format!("Could not save the bundle: {e}")),
                     };
                     let saved = (|| {
+                        input.wait_for_recordings(RECORDING_FLUSH);
                         project::save_carrying(work.dir(), &input.into_project(name.clone())?, old_dir.as_deref())?;
                         // From now on the folder holds the project (for a new one, its only copy
                         // on disk): a crash while the bundle is written leaves it recoverable.
@@ -1228,10 +1330,13 @@ impl ScanCraftApp {
                         if let (Some(old), true) = (&old_dir, contents.includes(Item::RawRecordings)) {
                             workdir::copy_item_files(old, work.dir(), Item::RawRecordings).map_err(|e| e.to_string())?;
                         }
-                        work.save(&contents).map_err(|e| e.to_string())
+                        // Recorded before the project had a place: into the working folder (the
+                        // tab's data from now on), whatever the bundle takes.
+                        let note = staging.as_deref().and_then(|st| staging_note(st, move_raw_files(st, work.dir())));
+                        work.save(&contents).map(|r| (r, note)).map_err(|e| e.to_string())
                     })();
                     match saved {
-                        Ok(report) => JobResult::Saved { message: bundle_message(&passes, &report), path: target, name, store: Some(Store::bundle(work)) },
+                        Ok((report, note)) => JobResult::Saved { message: format!("{}{}", bundle_message(&passes, &report), note.unwrap_or_default()), path: target, name, store: Some(Store::bundle(work)) },
                         Err(e) => {
                             let _ = work.close();
                             JobResult::Failed(format!("Could not save the bundle: {e}"))
@@ -1283,21 +1388,28 @@ impl ScanCraftApp {
         };
         self.spawn_job("Saving the project", move || {
             let saved = (|| {
+                let flushed = input.wait_for_recordings(RECORDING_FLUSH);
                 project::save_carrying(&target, &input.into_project(name.clone())?, old_dir.as_deref())?;
                 // From a bundle (or another folder): bring the files the app does not hold.
                 if let (Some(_), Some(old)) = (&lock, &old_dir) {
                     workdir::copy_item_files(old, &target, Item::RawRecordings).map_err(|e| e.to_string())?;
                 }
-                Ok::<_, String>(())
+                // Recorded before the project had a folder: moved in.
+                let mut note = staging.as_deref().and_then(|st| staging_note(st, move_raw_files(st, &target)));
+                if !flushed {
+                    log::warn!("a raw recording was still being written while saving; save again once the capture has stopped");
+                    note.get_or_insert_with(|| " · a raw recording was still being written: save again".into());
+                }
+                Ok::<_, String>(note)
             })();
             match saved {
-                Ok(()) => {
+                Ok(note) => {
                     // What the project file is now: the next save checks nobody else saved since.
                     let stamp = scancraft_io::project::project_file_stamp(&target);
                     if let Some(Ok(mut s)) = seen.as_ref().map(|s| s.lock()) {
                         *s = stamp;
                     }
-                    JobResult::Saved { message: format!("Saved {passes} to {}", target.display()), path: target, name, store: lock.map(|l| Store::folder(l, stamp)) }
+                    JobResult::Saved { message: format!("Saved {passes} to {}{}", target.display(), note.unwrap_or_default()), path: target, name, store: lock.map(|l| Store::folder(l, stamp)) }
                 }
                 Err(e) => JobResult::Failed(format!("Could not save the project: {e}")),
             }
@@ -1681,15 +1793,16 @@ impl ScanCraftApp {
             self.settings.merge_outliers = v;
         }
         self.settings.whole_scene = opened.settings.get("whole_scene").and_then(|v| v.as_bool()).unwrap_or(false);
+        let history_before: Vec<serde_json::Value> = opened.settings.get("processing").and_then(|p| p.get("history")).and_then(|h| h.as_array()).cloned().unwrap_or_default();
         // A recovered project holds changes its bundle does not have yet.
         let saved_generation = if opened.recovered { 0 } else { self.next_generation };
         if opened.read_only {
             // A copy with no place on disk: Save proposes a new one beside the original.
-            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store, proposed: None };
+            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store, proposed: None, notes: opened.notes.clone(), staging: None, history_before: history_before.clone() };
             self.propose_beside(&opened.path);
         } else {
             self.settings.project_path = opened.path.display().to_string();
-            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store, proposed: None };
+            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store, proposed: None, notes: opened.notes.clone(), staging: None, history_before: history_before.clone() };
         }
         self.selection = None;
         self.tool = None;

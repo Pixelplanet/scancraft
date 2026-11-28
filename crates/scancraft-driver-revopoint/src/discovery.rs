@@ -104,6 +104,22 @@ pub async fn discover(wait: Duration) -> Vec<Announcement> {
     found.into_values().collect()
 }
 
+/// Asks the scanner at `ip` for its announcement (unicast, as Revo Scan also does to known
+/// addresses): used at connect for the firmware and algorithm versions. `None` when it does not
+/// answer within `wait`.
+pub async fn query(ip: Ipv4Addr, wait: Duration) -> Option<Announcement> {
+    let socket = UdpSocket::bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))).await.ok()?;
+    socket.send_to(REQUEST, (ip, PORT)).await.ok()?;
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut buf = [0u8; 2048];
+    while let Ok(Ok((n, from))) = tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
+        if let Some(a) = Announcement::parse(&buf[..n]).filter(|a| from.ip() == IpAddr::V4(ip) || a.ip == ip.to_string()) {
+            return Some(a);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

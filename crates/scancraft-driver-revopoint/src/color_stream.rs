@@ -156,6 +156,12 @@ pub async fn configure(ctl: &Control) -> Result<(), DriverError> {
 /// Downloads and parses the RGB calibration (`/data/camparam/Prgb.bin`, `Distort.bin`,
 /// `LC_RT.bin`; formats in [`crate::calibration::parse_color_calibration`]).
 pub async fn download_calibration(ctl: &Control) -> Result<ColorCamera, DriverError> {
+    download_calibration_files(ctl).await.map(|(camera, _)| camera)
+}
+
+/// [`download_calibration`], also returning the three files as received (name, bytes), so a
+/// recording can be decoded offline.
+pub async fn download_calibration_files(ctl: &Control) -> Result<(ColorCamera, Vec<(String, Vec<u8>)>), DriverError> {
     let mut files = Vec::new();
     for name in ["Prgb.bin", "Distort.bin", "LC_RT.bin"] {
         let url = format!("{}?download=/data/camparam/{name}", ctl.endpoints.base_url);
@@ -163,8 +169,10 @@ pub async fn download_calibration(ctl: &Control) -> Result<ColorCamera, DriverEr
         let bytes = resp.error_for_status().map_err(|e| DriverError::Protocol(format!("{name}: {e}")))?.bytes().await;
         files.push(bytes.map_err(|e| DriverError::Protocol(format!("{name}: {e}")))?);
     }
-    crate::calibration::parse_color_calibration(&files[0], &files[1], &files[2])
-        .ok_or_else(|| DriverError::Protocol(format!("unexpected RGB calibration sizes {:?}", files.iter().map(|f| f.len()).collect::<Vec<_>>())))
+    let camera = crate::calibration::parse_color_calibration(&files[0], &files[1], &files[2])
+        .ok_or_else(|| DriverError::Protocol(format!("unexpected RGB calibration sizes {:?}", files.iter().map(|f| f.len()).collect::<Vec<_>>())))?;
+    let named = ["Prgb.bin", "Distort.bin", "LC_RT.bin"].iter().zip(files).map(|(n, b)| (n.to_string(), b.to_vec())).collect();
+    Ok((camera, named))
 }
 
 /// Streams RGB frames into `sync` until the task is aborted. JPEG decoding runs on its own
@@ -174,7 +182,7 @@ pub fn spawn(
     camera: Option<Arc<ColorCamera>>,
     sync: Arc<ColorSync>,
     paused: Arc<AtomicBool>,
-    mut recorder: Option<std::io::BufWriter<std::fs::File>>,
+    recorder: Option<scancraft_driver::RawRecorder>,
 ) -> JoinHandle<()> {
     let (packet_tx, packet_rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
     let decode_sync = sync.clone();
@@ -206,16 +214,9 @@ pub fn spawn(
                     if paused.load(Ordering::Relaxed) {
                         continue;
                     }
-                    if let Some(file) = recorder.as_mut() {
-                        use std::io::Write;
-                        let written = file
-                            .write_all(&PACKET_MAGIC)
-                            .and_then(|_| file.write_all(&(packet.len() as u32).to_le_bytes()))
-                            .and_then(|_| file.write_all(&packet));
-                        if let Err(e) = written {
-                            log::warn!("RGB recording stopped: {e}");
-                            recorder = None;
-                        }
+                    // Recorded through the writer thread: never waits for the disk.
+                    if let Some(rec) = recorder.as_ref() {
+                        rec.push(crate::device::wire_record(&packet));
                     }
                     match packet_tx.try_send(packet) {
                         Ok(()) | Err(std::sync::mpsc::TrySendError::Full(_)) => {}

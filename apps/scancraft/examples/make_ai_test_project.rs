@@ -174,6 +174,7 @@ fn write_project(out_dir: &Path) -> Result<(), String> {
         }],
         outputs: Vec::new(),
         settings: serde_json::json!({}),
+        notes: String::new(),
         other: Default::default(),
     };
 

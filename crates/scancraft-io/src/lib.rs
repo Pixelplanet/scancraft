@@ -1,4 +1,5 @@
 pub mod bundle;
+pub mod capture;
 pub mod fsutil;
 pub mod import;
 pub mod lock;

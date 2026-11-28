@@ -119,6 +119,7 @@ pub fn write_demo_project(dir: &Path) -> Result<(), String> {
         cleaned: None,
         mesh: None,
         settings: serde_json::json!({}),
+        notes: String::new(),
     };
     project::save(dir, &project)
 }

@@ -451,12 +451,24 @@ pub enum DeviceEvent {
     ConnectFailed(String),
     PreviewStarted(mpsc::Receiver<scancraft_core::PreviewFrame>),
     PreviewFailed(String),
-    ScanStarted(mpsc::Receiver<SensorFrame>, ScanConfig),
+    ScanStarted(mpsc::Receiver<SensorFrame>, ScanConfig, Box<CaptureStart>),
     ScanFailed(String),
     ScanStopped,
     Paused(bool),
     ParameterFailed(String),
     Disconnected,
+}
+
+/// What came with a started scan, for the pass's capture record (`crate::capture`).
+pub struct CaptureStart {
+    /// The driver's description of the stream, the setup sent and the calibration files.
+    pub info: Option<scancraft_driver::RecordingInfo>,
+    /// Where the raw streams are recorded (`None`: not recorded into the project).
+    pub target: Option<scancraft_driver::RecordingTarget>,
+    /// The pass folder the target lies in.
+    pub pass_dir: Option<std::path::PathBuf>,
+    /// Why the raw streams are not recorded, when they are not (said to the user).
+    pub not_recorded: Option<String>,
 }
 
 /// One processed frame from the scan worker.
@@ -584,6 +596,7 @@ pub struct OpenedProject {
     pub cleaned: Option<PointCloud>,
     pub mesh: Option<(Mesh, MeshAnalysis)>,
     pub settings: serde_json::Value,
+    pub notes: String,
 }
 
 /// Restorable geometry for undo: the project as it was before an action. Layers are shared with

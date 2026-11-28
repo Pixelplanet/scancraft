@@ -37,6 +37,10 @@ pub trait DepthSource: Send {
     fn sensor_static(&self) -> bool {
         false
     }
+    /// Turntable capture: the capture volume, once it was found (for the capture record).
+    fn turntable_region(&self) -> Option<TurntableRegion> {
+        None
+    }
 }
 
 /// How an overlay point took part in this frame's tracking.
@@ -254,6 +258,12 @@ impl PassPipeline {
         if let Some(c) = &self.color {
             c.colorize_new_points(points);
         }
+    }
+
+    /// Turntable capture: the capture volume found in the first frames (`None` before that and
+    /// for handheld passes).
+    pub fn turntable_region(&self) -> Option<TurntableRegion> {
+        self.depth.turntable_region()
     }
 
     /// True if the pose estimator reports an overlay (marker tracking).

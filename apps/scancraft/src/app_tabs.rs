@@ -278,6 +278,7 @@ impl ScanCraftApp {
         self.pending_close = false;
         let closing = self.project.name.clone();
         std::mem::take(&mut self.project.store).close();
+        crate::app::remove_staging(self.project.staging.take());
         if self.tabs.len() == 1 {
             let name = ProjectInfo::default().name;
             // Park the closing project in its slot, then replace it there.

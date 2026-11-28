@@ -11,6 +11,9 @@ pub struct Control {
     pub http: reqwest::Client,
     pub endpoints: RevopointCgiEndpoints,
     pub ip: String,
+    /// While `Some`, every control query sent (shared by all clones): the setup of a stream as
+    /// it was actually sent, for the capture record ([`Control::start_transcript`]).
+    transcript: std::sync::Arc<std::sync::Mutex<Option<Vec<String>>>>,
 }
 
 impl Control {
@@ -19,7 +22,27 @@ impl Control {
             .timeout(Duration::from_secs(3))
             .build()
             .map_err(|e| DriverError::Other(e.to_string()))?;
-        Ok(Self { http, endpoints: RevopointCgiEndpoints::new(ip), ip: ip.to_string() })
+        Ok(Self { http, endpoints: RevopointCgiEndpoints::new(ip), ip: ip.to_string(), transcript: Default::default() })
+    }
+
+    /// Starts keeping every control query sent from now on (a running transcript is restarted).
+    pub fn start_transcript(&self) {
+        if let Ok(mut t) = self.transcript.lock() {
+            *t = Some(Vec::new());
+        }
+    }
+
+    /// Ends the transcript and returns the queries sent since [`Self::start_transcript`].
+    pub fn take_transcript(&self) -> Vec<String> {
+        self.transcript.lock().ok().and_then(|mut t| t.take()).unwrap_or_default()
+    }
+
+    fn note(&self, query: &str) {
+        if let Ok(mut t) = self.transcript.lock() {
+            if let Some(list) = t.as_mut().filter(|l| l.len() < 2000) {
+                list.push(query.to_string());
+            }
+        }
     }
 
     /// Issues a `zx_cmd.cgi` query, retrying while the firmware reports it is busy.
@@ -36,6 +59,7 @@ impl Control {
     /// One `zx_cmd.cgi` request; `Ok(None)` when the firmware says it is busy. Busy replies arrive
     /// either as HTTP 503 or as HTTP 200 with a `503 Service Unavailable ----please wait` body.
     pub async fn cgi_once(&self, query: &str) -> Result<Option<String>, DriverError> {
+        self.note(query);
         let url = format!("{}?{query}", self.endpoints.base_url);
         // A running 5-8 MB/s stream can starve a control request; they are idempotent, so retry.
         let mut attempt = 0;

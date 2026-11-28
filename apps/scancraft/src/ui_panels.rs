@@ -820,6 +820,75 @@ pub(crate) fn switch_save_form(path: &str, bundle: bool) -> String {
     }
 }
 
+/// What a captured pass recorded about itself (`crate::capture`): raw stream size, frames tracked
+/// and lost, the app version that captured it.
+fn capture_rows(app: &ScanCraftApp, ui: &mut egui::Ui, p: &crate::model::ScanPass) {
+    let Some(capture) = p.meta.capture.as_ref() else { return };
+    let Ok(log) = capture.lock() else { return };
+    let t = Tokens::get();
+    let bytes = log.raw_bytes();
+    let dropped = log.dropped_records();
+    let raw = match (&log.record.raw_main, bytes) {
+        (None, _) => "Not recorded".to_string(),
+        (Some(_), 0) => "Recording…".to_string(),
+        (Some(_), b) => scancraft_io::fsutil::format_bytes(b),
+    };
+    let tip = match &log.record.raw_main {
+        Some(f) => format!("Raw stream ({f}{}): replay with scancraft --replay-pass <project> {}", log.record.raw_rgb.as_deref().map(|r| format!(", {r}")).unwrap_or_default(), p.id),
+        None => "The raw stream was not recorded (see Record raw streams in the Save Project card)".into(),
+    };
+    kit::row(ui, "Raw stream", |ui| kit::value_text(ui, &raw, log.record.raw_main.is_none())).on_hover_text(tip);
+    if dropped > 0 {
+        kit::status_line(ui, &format!("{} frames not recorded (disk too slow)", thousands(dropped as usize)), t.warning);
+    }
+    let f = log.record.total_frames();
+    if f.processed > 0 {
+        let text = format!("{} tracked · {} lost of {}", thousands((f.tracking + f.slow) as usize), thousands(f.lost as usize), thousands(f.processed as usize));
+        kit::row(ui, "Tracking", |ui| kit::value_text(ui, &text, true)).on_hover_text(format!(
+            "Frames the tracker processed in {} capture{} ({} received; {} skipped for newer ones). Per frame: pass-{}/tracking.csv",
+            log.record.captures.len(),
+            if log.record.captures.len() == 1 { "" } else { "s" },
+            thousands(f.received as usize),
+            thousands(f.skipped_for_newer as usize),
+            p.id
+        ));
+    }
+    if let Some(fw) = log.record.device.get("firmware_version").and_then(|v| v.as_str()).filter(|v| !v.is_empty() && *v != "—") {
+        kit::row(ui, "Firmware", |ui| kit::value_text(ui, fw, true));
+    }
+    let short: String = log.record.app.git_commit.chars().take(7).collect();
+    kit::row(ui, "Captured with", |ui| kit::value_text(ui, &format!("ScanCraft {} ({short})", log.record.app.version), true));
+    let _ = app;
+}
+
+/// The project's notes and raw-stream recording, at the top of the Save Project card.
+fn notes_and_recording(app: &mut ScanCraftApp, ui: &mut egui::Ui, as_bundle: bool) {
+    let t = Tokens::get();
+    kit::sized_row(ui, "Notes", t.control_height * 3.0, |ui| {
+        let mut notes = app.project.notes.clone();
+        let edit = egui::TextEdit::multiline(&mut notes).desired_rows(3).desired_width(ui.available_width()).hint_text("Part, material, spray, setup… (saved with the project)");
+        if ui.add(edit).changed() {
+            app.set_notes(notes);
+        }
+    });
+    let mut record = app.prefs.record_raw;
+    if kit::checkbox(ui, "Record raw streams of real scanners", &mut record)
+        .on_hover_text("Writes each pass's raw scanner stream into the project (pass-<id>/raw.bin, raw_rgb.bin), so the scan can be replayed and processed again later. Several MB per second; a slow disk drops frames from the recording, never from the scan.")
+        .changed()
+    {
+        app.prefs.record_raw = record;
+        app.save_prefs();
+    }
+    let bytes = app.project_raw_bytes();
+    if bytes > 0 {
+        kit::row(ui, "Recorded", |ui| kit::value_text(ui, &scancraft_io::fsutil::format_bytes(bytes), true));
+        if as_bundle && !app.prefs.bundle_contents.raw_recordings {
+            kit::status_line(ui, "This project has raw recordings, but the bundle leaves them out (tick Raw stream recordings, or save a project folder)", t.warning);
+        }
+    }
+    ui.add_space(t.space_4);
+}
+
 /// The Save Project card: a project folder or a bundle file and, for a bundle, what goes into it
 /// and where opened bundles are unpacked. (Both become part of Settings once there is a Settings
 /// window; they are kept across starts.)
@@ -838,6 +907,7 @@ fn save_project_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
     kit::row(ui, if as_bundle { "File" } else { "Folder" }, |ui| path_field(app, ui, if as_bundle { PickPurpose::SaveBundle } else { PickPurpose::SaveFolder }));
     let n = app.passes.len();
     kit::row(ui, "Passes", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
+    notes_and_recording(app, ui, as_bundle);
     if !as_bundle {
         ui.add_space(t.space_4);
         let note = if is_bundle_tab {
@@ -1556,6 +1626,7 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 let stored = p.keyframes.len();
                 kit::row(ui, "Keyframes", |ui| kit::value_text(ui, &if kept == stored { thousands(stored) } else { format!("{} of {} kept", thousands(kept), thousands(stored)) }, false));
                 kit::row(ui, "Mode", |ui| kit::value_text(ui, &format!("{} · {}", p.meta.scan_config.light.label(), p.meta.scan_config.tracking.label()), false));
+                capture_rows(app, ui, p);
             }
             let t = Tokens::get();
             kit::row(ui, "Alignment", |ui| kit::status_line(ui, &p.meta.alignment.label(), align_colour(p.meta.alignment, &t)));

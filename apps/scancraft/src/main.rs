@@ -8,12 +8,14 @@
 mod ai_pack;
 mod ai_segment;
 mod alignment;
+mod capture;
 mod app;
 mod cli;
 mod dev;
 mod file_picker;
 mod imports;
 mod isolation;
+mod logfile;
 mod model;
 mod project;
 mod replay;
@@ -161,11 +163,15 @@ impl eframe::App for ScanCraft {
 }
 
 fn main() -> eframe::Result<()> {
-    env_logger::init();
+    logfile::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cli = cli::parse(&args);
     for a in &cli.unknown {
         eprintln!("scancraft: ignoring the argument {a}");
+    }
+    // Headless: replay a pass of a project from its raw recording, then end.
+    if let Some((project, id)) = &cli.replay_pass {
+        std::process::exit(replay::replay_pass_cli(project, *id, cli.all_frames, cli.out.as_deref()));
     }
     if let Some(dir) = &cli.demo_project {
         match dev::write_demo_project(std::path::Path::new(dir)) {

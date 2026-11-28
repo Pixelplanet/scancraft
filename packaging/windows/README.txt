@@ -18,10 +18,18 @@ STARTING
                                     (.scancraftz) or project folder. The installer
                                     registers both file types: a double-click opens
                                     them, in the running ScanCraft as a new tab.
-  "ScanCraft (record).bat"          As scancraft.exe, and the raw stream of every scan
-                                    is saved to the "recordings" folder next to it, for
-                                    later analysis. Several MB per second: delete
-                                    recordings you no longer need.
+  scancraft.exe --replay-pass <project> <pass id>
+                                    Replays a scanned pass from its raw recording (no
+                                    window) and compares the poses with the live run.
+  "ScanCraft (record).bat"          As scancraft.exe, and when the project's own
+                                    recording is switched off, the raw stream of every
+                                    scan goes to the "recordings" folder next to it.
+
+RAW RECORDINGS
+  Every scan with a real scanner is recorded into the project (pass-<n>aw.bin,
+  raw_rgb.bin, with capture.json, tracking.csv and the calibration), about 6-8 MB
+  per second. Switch: "Record raw streams of real scanners" in the Save Project
+  card. It needs 2 GB free to start and stops below 1 GB (scanning goes on).
 
 BEFORE SCANNING WITH A REVOPOINT POP 4
   - Close Revo Scan. Only one program can use the scanner at a time.

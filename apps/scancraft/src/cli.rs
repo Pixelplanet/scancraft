@@ -4,7 +4,12 @@
 //! scancraft [<project>] [--mock | --connect <ip> | --replay <recording.bin> <camparam.yaml>]
 //!           [--new-instance] [--auto <steps>] [--mock-modes pop4] [--open <project>]
 //! scancraft --demo-project <dir>
+//! scancraft --replay-pass <project> <pass id> [--all-frames] [--out <folder>]
 //! ```
+//!
+//! `--replay-pass` replays a pass of a project (folder, `.scancraft` file or bundle) from its raw
+//! recording, headless (no window), and prints how the poses compare with the live run
+//! (`crate::replay::replay_pass`).
 //!
 //! `<project>` is a project file (`.scancraft`), a bundle (`.scancraftz`) or a project folder; it
 //! opens in a tab. Explorer passes it on a double-click (the file association of
@@ -41,18 +46,36 @@ pub struct Cli {
     pub new_app_options: Vec<String>,
     /// Arguments that were not understood (reported, then ignored).
     pub unknown: Vec<String>,
+    /// `--replay-pass <project> <id>`: replay that pass headless and end.
+    pub replay_pass: Option<(PathBuf, u32)>,
+    /// With `--replay-pass`: every recorded frame instead of the ones the live run processed.
+    pub all_frames: bool,
+    /// With `--replay-pass`: where the replay's tracking log and points are written.
+    pub out: Option<PathBuf>,
 }
 
 impl Cli {
     /// Whether this start may hand its project to a running ScanCraft and end instead.
     pub fn single_instance(&self) -> bool {
-        !self.new_instance && self.auto.is_none() && self.demo_project.is_none()
+        !self.new_instance && self.auto.is_none() && self.demo_project.is_none() && self.replay_pass.is_none()
     }
 }
 
 /// Parses the arguments after the program name.
 pub fn parse(args: &[String]) -> Cli {
-    let mut cli = Cli { project: None, start: StartConnection::None, auto: None, demo_project: None, mock_modes: None, new_instance: false, new_app_options: Vec::new(), unknown: Vec::new() };
+    let mut cli = Cli {
+        project: None,
+        start: StartConnection::None,
+        auto: None,
+        demo_project: None,
+        mock_modes: None,
+        new_instance: false,
+        new_app_options: Vec::new(),
+        unknown: Vec::new(),
+        replay_pass: None,
+        all_frames: false,
+        out: None,
+    };
     let (mut replay, mut mock, mut connect) = (None, false, None);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -80,6 +103,16 @@ pub fn parse(args: &[String]) -> Cli {
                 cli.new_app_options.push("--mock".into());
             }
             "--new-instance" => cli.new_instance = true,
+            "--replay-pass" => {
+                let project = value().map(PathBuf::from);
+                let id = it.next().and_then(|v| v.parse::<u32>().ok());
+                match (project, id) {
+                    (Some(p), Some(id)) => cli.replay_pass = Some((std::path::absolute(&p).unwrap_or(p), id)),
+                    _ => cli.unknown.push("--replay-pass needs <project> <pass id>".into()),
+                }
+            }
+            "--all-frames" => cli.all_frames = true,
+            "--out" => cli.out = value().map(PathBuf::from),
             a if a.starts_with("--") => cli.unknown.push(a.to_string()),
             a if cli.project.is_none() && !a.is_empty() => cli.project = Some(PathBuf::from(a)),
             a => cli.unknown.push(a.to_string()),
@@ -134,6 +167,11 @@ mod tests {
         assert_eq!(cli.new_app_options, vec!["--mock".to_string(), "--connect 10.0.0.7".into(), "--mock-modes pop4".into()]);
         assert!(cli.single_instance(), "options alone still hand over (and are reported)");
         assert!(parse(&args(&["Part.scancraft"])).new_app_options.is_empty());
+
+        let cli = parse(&args(&["--replay-pass", "Part", "3", "--all-frames", "--out", "E:/r"]));
+        assert_eq!(cli.replay_pass, Some((std::path::absolute("Part").unwrap(), 3)));
+        assert!(cli.all_frames && cli.out == Some(PathBuf::from("E:/r")) && !cli.single_instance());
+        assert!(parse(&args(&["--replay-pass", "Part"])).replay_pass.is_none());
 
         let cli = parse(&args(&["--demo-project", "E:/demo"]));
         assert_eq!(cli.demo_project.as_deref(), Some("E:/demo"));

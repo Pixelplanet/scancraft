@@ -78,7 +78,7 @@ pub enum Item {
     Results,
     /// `pass-<id>/markers.json`.
     MarkerMaps,
-    /// `pass-<id>/raw.bin`, `pass-<id>/raw/`, and a pass's `raw_recording` when it lies inside
+    /// `pass-<id>/raw.bin`, `pass-<id>/raw_rgb.bin`, `pass-<id>/raw/`, and a pass's `raw_recording` when it lies inside
     /// the project folder.
     RawRecordings,
 }
@@ -205,7 +205,7 @@ pub fn classify(rel: &str, raw_recordings: &[String]) -> Option<Item> {
             return Some(match rest {
                 "keyframes.bin" => Item::Keyframes,
                 "markers.json" => Item::MarkerMaps,
-                "raw.bin" => Item::RawRecordings,
+                "raw.bin" | "raw_rgb.bin" => Item::RawRecordings,
                 r if r.starts_with("rgb/") => Item::ColourKeyframes,
                 r if r.starts_with("raw/") => Item::RawRecordings,
                 _ => Item::Core,
@@ -874,6 +874,7 @@ pub(crate) mod tests {
             passes: vec![pass(1, None), pass(2, Some("pass-2/raw.bin"))],
             outputs: Vec::new(),
             settings: serde_json::json!({}),
+            notes: String::new(),
             other: Default::default(),
         };
         let file = project::save_project(dir, &project, &[(1, vec![keyframe(0, 50)]), (2, vec![keyframe(1, 80), keyframe(2, 10)])]).unwrap();
@@ -914,6 +915,10 @@ pub(crate) mod tests {
             ("pass-3/rgb/keyframes.json", Some(Item::ColourKeyframes)),
             ("pass-3/markers.json", Some(Item::MarkerMaps)),
             ("pass-3/raw.bin", Some(Item::RawRecordings)),
+            ("pass-3/raw_rgb.bin", Some(Item::RawRecordings)),
+            ("pass-3/capture.json", Some(Item::Core)),
+            ("pass-3/tracking.csv", Some(Item::Core)),
+            ("pass-3/calibration/camparam.yaml", Some(Item::Core)),
             ("pass-3/raw/frames-0001.bin", Some(Item::RawRecordings)),
             ("recordings/take1/a.bin", Some(Item::RawRecordings)),
             ("recordings/take10/a.bin", Some(Item::Core)),

@@ -299,6 +299,7 @@ pub async fn scan_worker(
     tracker: SharedTracker,
     paused: Arc<AtomicBool>,
     live_ai: Arc<LiveAiState>,
+    capture: Option<(crate::capture::SharedCapture, usize)>,
 ) {
     // The scan mode decides how frames become geometry and poses (docs/architecture/scan-sessions.md).
     let mut pipeline = match scancraft_pipeline::pipeline_for(&scan_config, config.min_mm, config.max_mm) {
@@ -318,13 +319,24 @@ pub async fn scan_worker(
     let mut carried_keyframes: Vec<KeyframeInfo> = Vec::new();
     let mut carried_rgb_keyframes: Vec<scancraft_color::RgbKeyframe> = Vec::new();
     let (mut incoming, mut processed, mut marker) = (RateWindow::default(), RateWindow::default(), RateWindow::default());
+    let mut region_logged = false;
     while let Some(mut frame) = frames.recv().await {
         incoming.tick(std::time::Instant::now());
+        let mut skipped = 0u64;
         // Always work on the newest frame.
         while let Ok(newer) = frames.try_recv() {
             incoming.tick(std::time::Instant::now());
             frame = newer;
+            skipped += 1;
         }
+        let host_ms = capture.as_ref().and_then(|(c, seg)| {
+            let mut log = c.lock().ok()?;
+            let ms = log.now_ms();
+            let f = &mut log.record.captures.get_mut(*seg)?.frames;
+            f.received += skipped + 1;
+            f.skipped_for_newer += skipped;
+            Some(ms)
+        });
         processed.tick(std::time::Instant::now());
 
         while let Ok(res) = ai_out.try_recv() {
@@ -377,15 +389,33 @@ pub async fn scan_worker(
         let mut overlay = None;
         if !paused.load(Ordering::Relaxed) {
             let Ok(mut tracker) = tracker.lock() else { break };
-            if let Some(status) = pipeline.process(&frame, &mut tracker) {
+            let t0 = std::time::Instant::now();
+            let status = pipeline.process(&frame, &mut tracker);
+            let proc_ms = t0.elapsed().as_secs_f32() * 1000.0;
+            if let Some(status) = status {
                 new_points = tracker.take_new_points();
                 pipeline.colorize(&mut new_points);
                 keyframe = status.keyframe.and_then(|id| tracker.keyframes().iter().find(|k| k.id == id)).map(KeyframeInfo::of);
                 tracking = Some(status);
                 seed = Some(tracker.seed_state()).filter(|s| *s != scancraft_slam::SeedState::None);
             }
+            if let Some((c, seg)) = capture.as_ref() {
+                log_frame(c, *seg, &frame, tracking.as_ref(), new_points.len(), &tracker.current_pose, host_ms.unwrap_or(0), proc_ms);
+                if !region_logged {
+                    if let Some(region) = pipeline.turntable_region() {
+                        region_logged = true;
+                        if let Ok(mut log) = c.lock() {
+                            log.set_turntable_region(&scan_config, Some(region));
+                        }
+                    }
+                }
+            }
             overlay = pipeline.overlay();
             carried_rgb_keyframes.extend(pipeline.take_new_rgb_keyframes());
+        } else if let Some((c, seg)) = capture.as_ref() {
+            if let Some(s) = c.lock().ok().as_mut().and_then(|l| l.record.captures.get_mut(*seg)) {
+                s.frames.paused += 1;
+            }
         }
         let now = std::time::Instant::now();
         // Count a marker update only for frames the pipeline actually processed (repeated IR
@@ -423,6 +453,57 @@ pub async fn scan_worker(
                 carried_rgb_keyframes = update.rgb_keyframes;
             }
             Err(mpsc::error::TrySendError::Closed(_)) => break,
+        }
+    }
+}
+
+/// One processed frame into the pass's tracking log and frame counts.
+#[allow(clippy::too_many_arguments)]
+fn log_frame(
+    capture: &crate::capture::SharedCapture,
+    segment: usize,
+    frame: &SensorFrame,
+    status: Option<&scancraft_slam::TrackingStatus>,
+    new_points: usize,
+    current_pose: &scancraft_core::Transform,
+    host_ms: u64,
+    proc_ms: f32,
+) {
+    let Ok(mut log) = capture.lock() else { return };
+    let pose = status.map_or(*current_pose, |s| s.current_pose);
+    let row = scancraft_io::capture::TrackRow {
+        segment: segment as u32,
+        frame: frame.frame_index,
+        device_ms: frame.timestamp_ms,
+        host_ms,
+        state: status.map_or("no_geometry", |s| crate::capture::state_name(s.state)).to_string(),
+        relocalized: status.is_some_and(|s| s.relocalized),
+        inliers: status.map_or(0, |s| s.inliers as u64),
+        rmse_mm: status.map_or(0.0, |s| s.rmse_mm),
+        conflict: status.map_or(0.0, |s| s.visibility_conflict),
+        keyframe: status.and_then(|s| s.keyframe),
+        new_points: new_points as u64,
+        total_points: status.map_or(0, |s| s.total_points_fused as u64),
+        rotation: pose.rotation.to_array(),
+        translation: pose.translation.to_array(),
+        imu: frame.imu.map(|i| i.orientation.to_array()),
+        proc_ms,
+    };
+    log.rows.push(row);
+    let Some(f) = log.record.captures.get_mut(segment).map(|s| &mut s.frames) else { return };
+    f.processed += 1;
+    f.fused_points += new_points as u64;
+    match status {
+        None => f.no_geometry += 1,
+        Some(s) => {
+            match s.state {
+                scancraft_slam::TrackingState::Tracking => f.tracking += 1,
+                scancraft_slam::TrackingState::Slow => f.slow += 1,
+                scancraft_slam::TrackingState::Lost => f.lost += 1,
+                scancraft_slam::TrackingState::Idle => {}
+            }
+            f.relocalized += s.relocalized as u64;
+            f.keyframes += s.keyframe.is_some() as u64;
         }
     }
 }

@@ -497,6 +497,18 @@ pub struct ScanCraftApp {
     pub inset_width: f32,
     /// Where the camera view was drawn last frame (the browser makes room for it).
     pub inset_rect: Option<egui::Rect>,
+    /// Development and tests: record the simulator's streams into the project too (real
+    /// scanners are recorded whenever `prefs.record_raw` is on).
+    pub record_simulator: bool,
+    /// The id of the pass the starting capture creates (taken when the capture is asked for, so
+    /// the raw files can be named before the stream starts).
+    reserved_pass: Option<u32>,
+    /// Last check of the recording drive's free space and of dropped records while capturing.
+    recording_check: Option<Instant>,
+    recording_dropped_seen: u64,
+    /// Free space a drive needs for a recording to start, and below which a running one stops
+    /// (`crate::capture::MIN_FREE_TO_START` / `MIN_FREE_WHILE_RECORDING`; tests lower them).
+    pub min_free_to_record: (u64, u64),
 }
 
 /// Device to connect as soon as the app starts.
@@ -628,6 +640,11 @@ impl ScanCraftApp {
             rates: None,
             inset_width: crate::ui_viewport::INSET_DEFAULT_W,
             inset_rect: None,
+            record_simulator: false,
+            reserved_pass: None,
+            recording_check: None,
+            recording_dropped_seen: 0,
+            min_free_to_record: (crate::capture::MIN_FREE_TO_START, crate::capture::MIN_FREE_WHILE_RECORDING),
         };
         app.camera.set_view_preset(CameraPreset::Isometric);
         app.camera.target = glam::Vec3::new(0.0, 250.0, 0.0);
@@ -809,21 +826,25 @@ impl ScanCraftApp {
     pub fn connect_replay(&mut self, recording: std::path::PathBuf, camparam: std::path::PathBuf) {
         match crate::replay::ReplayDevice::open(recording, camparam) {
             Ok(device) => {
-                use scancraft_driver::ScannerDevice;
-                let info = device.info().clone();
-                let capabilities = device.capabilities().clone();
-                let device: Box<dyn ScannerDevice> = Box::new(device);
-                let device = Arc::new(tokio::sync::Mutex::new(device));
                 // The recording is a Full-field HD marker stream.
                 self.scan_config.tracking = scancraft_driver::TrackingMode::Marker;
-                self.connecting = true;
-                let tx = self.dev_tx.clone();
-                self.rt.spawn(async move {
-                    let _ = tx.send(DeviceEvent::Connected { device, info, capabilities, driver_id: "replay".into() }).await;
-                });
+                self.connect_device(Box::new(device), "replay");
             }
             Err(e) => self.say(Tone::Error, format!("Cannot open the recording: {e}")),
         }
+    }
+
+    /// Connects an already opened device (a recording, or a simulator set up by a test).
+    pub fn connect_device(&mut self, device: Box<dyn scancraft_driver::ScannerDevice>, driver_id: &str) {
+        let info = device.info().clone();
+        let capabilities = device.capabilities().clone();
+        let device = Arc::new(tokio::sync::Mutex::new(device));
+        self.connecting = true;
+        let tx = self.dev_tx.clone();
+        let driver_id = driver_id.to_string();
+        self.rt.spawn(async move {
+            let _ = tx.send(DeviceEvent::Connected { device, info, capabilities, driver_id }).await;
+        });
     }
 
     pub fn connect_mock(&mut self) {
@@ -989,17 +1010,151 @@ impl ScanCraftApp {
         self.say(Tone::Normal, "Starting capture…");
         let config = self.scan_config.clone();
         let tx = self.dev_tx.clone();
+        // The pass this capture fills, and where its raw streams are recorded.
+        let pass = match self.continue_pass {
+            Some(id) => id,
+            None => {
+                let id = self.next_pass_id;
+                self.next_pass_id += 1;
+                self.reserved_pass = Some(id);
+                id
+            }
+        };
+        let (target, pass_dir, mut not_recorded) = match self.recording_target(pass) {
+            Ok(Some((t, dir))) => (Some(t), Some(dir), None),
+            Ok(None) => (None, None, None),
+            Err(why) => (None, None, Some(why)),
+        };
         self.rt.spawn(async move {
             let mut dev = device.lock().await;
+            let mut target = target;
+            if let Some(t) = target.clone() {
+                if !dev.set_recording(Some(t)) {
+                    target = None;
+                    not_recorded = Some("this scanner has no raw stream to record".into());
+                }
+            }
             match dev.start_scan(&config).await {
                 Ok(rx) => {
-                    let _ = tx.send(DeviceEvent::ScanStarted(rx, config)).await;
+                    let info = dev.recording_info(&config);
+                    let start = Box::new(crate::model::CaptureStart { info, target, pass_dir, not_recorded });
+                    let _ = tx.send(DeviceEvent::ScanStarted(rx, config, start)).await;
                 }
                 Err(e) => {
+                    let _ = dev.set_recording(None);
                     let _ = tx.send(DeviceEvent::ScanFailed(e.to_string())).await;
                 }
             }
         });
+    }
+
+    /// The folder raw streams of this tab are recorded into: the project folder or a bundle's
+    /// working folder, else (a new or read-only project) a staging folder under the
+    /// working-folder root that the first save moves into the project.
+    pub fn capture_dir(&mut self) -> Result<std::path::PathBuf, String> {
+        if matches!(self.project.store, crate::storage::Store::Folder { .. } | crate::storage::Store::Bundle { .. }) {
+            if let Some(dir) = self.project.store.data_dir() {
+                return Ok(dir);
+            }
+        }
+        if let Some(dir) = &self.project.staging {
+            return Ok(dir.clone());
+        }
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+        let dir = self.prefs.work_root().join("captures").join(format!("{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        self.project.staging = Some(dir.clone());
+        Ok(dir)
+    }
+
+    /// Where pass `pass`'s raw streams go, or why they are not recorded (`Ok(None)`: not wanted,
+    /// nothing to say: the simulator, a replay).
+    fn recording_target(&mut self, pass: u32) -> Result<Option<(scancraft_driver::RecordingTarget, std::path::PathBuf)>, String> {
+        let Some(conn) = &self.connection else { return Ok(None) };
+        let simulator = matches!(conn.info.active_transport, DeviceTransport::Virtual { .. }) || conn.driver_id == "replay";
+        if simulator && !self.record_simulator {
+            return Ok(None);
+        }
+        if !self.prefs.record_raw {
+            return Err("raw recording is turned off (Save Project card)".into());
+        }
+        let dir = self.capture_dir()?;
+        let free = scancraft_io::fsutil::free_space(&dir).unwrap_or(u64::MAX);
+        if free < self.min_free_to_record.0 {
+            return Err(format!("only {} free on the drive of {}", scancraft_io::fsutil::format_bytes(free), dir.display()));
+        }
+        let pass_dir = dir.join(scancraft_io::project::pass_dir(pass));
+        let main = pass_dir.join("raw.bin");
+        // A continued pass appends to its recording; a new pass starts one.
+        let append = self.continue_pass == Some(pass) && main.is_file();
+        let target = scancraft_driver::RecordingTarget::new(main, pass_dir.join("raw_rgb.bin"), append);
+        Ok(Some((target, pass_dir)))
+    }
+
+    /// Notes something about the running capture in its pass's capture record.
+    fn capture_event(&mut self, what: String) {
+        let Some(capture) = self.active_pass.and_then(|id| self.passes.iter().find(|p| p.id == id)).and_then(|p| p.meta.capture.clone()) else { return };
+        if let Ok(mut log) = capture.lock() {
+            log.event(what);
+        };
+    }
+
+    /// While capturing: stops the raw recording when its drive is nearly full and warns once
+    /// when the disk could not keep up (records were dropped). Scanning goes on either way.
+    fn watch_recording(&mut self) {
+        if !matches!(self.capture, Capture::Running | Capture::Paused) {
+            return;
+        }
+        if self.recording_check.is_some_and(|t| t.elapsed() < Duration::from_secs(2)) {
+            return;
+        }
+        self.recording_check = Some(Instant::now());
+        let Some(capture) = self.active_pass.and_then(|id| self.passes.iter().find(|p| p.id == id)).and_then(|p| p.meta.capture.clone()) else { return };
+        let (stats, dropped) = match capture.lock() {
+            Ok(log) => (log.recording_stats(), log.dropped_records()),
+            Err(_) => return,
+        };
+        if stats.is_empty() {
+            return;
+        }
+        let dir = self.project.store.data_dir().filter(|_| self.project.staging.is_none()).or_else(|| self.project.staging.clone());
+        if let Some(free) = dir.and_then(|d| scancraft_io::fsutil::free_space(&d).ok()) {
+            if free < self.min_free_to_record.1 && !stats.iter().all(|s| s.stop.load(Ordering::Relaxed)) {
+                for s in &stats {
+                    s.stop.store(true, Ordering::Relaxed);
+                }
+                let msg = format!("Raw recording stopped: only {} left on the drive. Scanning goes on", scancraft_io::fsutil::format_bytes(free));
+                self.capture_event(msg.clone());
+                self.say(Tone::Warning, msg);
+            }
+        }
+        if dropped > self.recording_dropped_seen {
+            if self.recording_dropped_seen == 0 {
+                let msg = format!("The disk cannot keep up with the raw stream: {dropped} frames were not recorded. Scanning goes on");
+                self.show_toast(msg.clone());
+                self.say(Tone::Warning, msg);
+            }
+            self.capture_event(format!("{} frames not recorded so far (disk too slow)", dropped));
+            self.recording_dropped_seen = dropped;
+        }
+    }
+
+    /// The raw stream bytes recorded for a pass (shown in the interface).
+    pub fn raw_bytes(&self, pass: &ScanPass) -> u64 {
+        pass.meta.capture.as_ref().and_then(|c| c.lock().ok().map(|l| l.raw_bytes())).unwrap_or(0)
+    }
+
+    /// Changes the project's notes (an unsaved change).
+    pub fn set_notes(&mut self, notes: String) {
+        if notes != self.project.notes {
+            self.project.notes = notes;
+            self.next_generation += 1;
+        }
+    }
+
+    /// The raw stream bytes recorded in this project.
+    pub fn project_raw_bytes(&self) -> u64 {
+        self.passes.iter().map(|p| self.raw_bytes(p)).sum()
     }
 
     pub fn toggle_pause(&mut self) {
@@ -1014,6 +1169,7 @@ impl ScanCraftApp {
             self.paused_flag.store(true, Ordering::Relaxed);
         }
         let device = conn.device.clone();
+        self.capture_event(if pause { "paused".into() } else { "resumed".into() });
         let tx = self.dev_tx.clone();
         self.rt.spawn(async move {
             let mut dev = device.lock().await;
@@ -1049,6 +1205,10 @@ impl ScanCraftApp {
 
     /// Send a runtime parameter to the device (exposure, gain, laser power).
     pub fn set_parameter(&mut self, param: DeviceParam) {
+        if self.connection.is_none() {
+            return;
+        }
+        self.capture_event(format!("set {param:?}"));
         let Some(conn) = &self.connection else { return };
         let device = conn.device.clone();
         let tx = self.dev_tx.clone();
@@ -1127,7 +1287,7 @@ impl ScanCraftApp {
                     self.preview_starting = false;
                     self.say(Tone::Error, format!("Preview failed: {e}"));
                 }
-                DeviceEvent::ScanStarted(rx, scan_config) => {
+                DeviceEvent::ScanStarted(rx, scan_config, start) => {
                     if self.capture != Capture::Starting {
                         continue;
                     }
@@ -1143,8 +1303,11 @@ impl ScanCraftApp {
                         }
                         None => {
                             self.capture_markers.clear();
-                            let id = self.next_pass_id;
-                            self.next_pass_id += 1;
+                            let id = self.reserved_pass.take().unwrap_or_else(|| {
+                                self.next_pass_id += 1;
+                                self.next_pass_id - 1
+                            });
+                            self.next_pass_id = self.next_pass_id.max(id + 1);
                             let generation = self.generation();
                             let tracker = worker::new_tracker(&config);
                             let device = self.connection.as_ref().map(|c| c.info.clone());
@@ -1184,16 +1347,23 @@ impl ScanCraftApp {
                     self.selection = Some(Node::Pass(id));
                     self.paused_flag = Arc::new(AtomicBool::new(false));
                     self.live_ai_status = None;
+                    // The capture record of the pass: one session per capture.
+                    let session = self.begin_capture_record(id, &scan_config, &config, &start, verb == "Continuing");
                     let (tx, urx) = mpsc::channel(4);
                     self.updates = Some(urx);
                     self.fps.clear();
-                    self.rt.spawn(worker::scan_worker(rx, tx, config, scan_config, tracker, self.paused_flag.clone(), Arc::clone(&self.live_ai)));
-                    self.say(Tone::Normal, format!("{verb} pass {id}"));
+                    self.rt.spawn(worker::scan_worker(rx, tx, config, scan_config, tracker, self.paused_flag.clone(), Arc::clone(&self.live_ai), session));
+                    match &start.not_recorded {
+                        Some(why) => self.say(Tone::Warning, format!("{verb} pass {id} · raw streams not recorded: {why}")),
+                        None if start.target.is_some() => self.say(Tone::Normal, format!("{verb} pass {id} · recording the raw stream")),
+                        None => self.say(Tone::Normal, format!("{verb} pass {id}")),
+                    }
                 }
                 DeviceEvent::ScanFailed(e) => {
                     if self.capture == Capture::Starting {
                         self.capture = Capture::Idle;
                         self.continue_pass = None;
+                        self.reserved_pass = None;
                     }
                     self.say(Tone::Error, format!("Capture failed: {e}"));
                 }
@@ -1209,6 +1379,7 @@ impl ScanCraftApp {
                     self.fps.clear();
                     self.tracking = None;
                     let finished = self.active_pass.take();
+                    self.end_capture_record(finished);
                     // Updates still in flight were dropped with the channel: take the pass's
                     // model and frame list from its tracker so the two agree.
                     if let Some(pass) = finished.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)) {
@@ -1257,6 +1428,7 @@ impl ScanCraftApp {
     }
 
     pub fn poll_updates(&mut self, ctx: &egui::Context) {
+        self.watch_recording();
         let Some(rx) = self.updates.as_mut() else { return };
         let mut updates = Vec::new();
         while let Ok(u) = rx.try_recv() {
@@ -2882,6 +3054,17 @@ impl ScanCraftApp {
                     self.project.name = name;
                     self.project.saved_generation = self.next_generation;
                     self.project.proposed = None;
+                    // Staged raw recordings moved into the project: the staging folder goes
+                    // (it stays while one of them could not be moved).
+                    if self.project.store.data_dir().is_some() {
+                        if let Some(staging) = self.project.staging.take() {
+                            if crate::app::staging_holds_raw(&staging) {
+                                self.project.staging = Some(staging);
+                            } else {
+                                let _ = std::fs::remove_dir_all(&staging);
+                            }
+                        }
+                    }
                     self.tool = None;
                     self.say(Tone::Success, message);
                     if std::mem::take(&mut self.pending_close) {
@@ -2934,8 +3117,10 @@ impl ScanCraftApp {
         // Every tab is closed: locks released, bundles' working folders removed (the user saved
         // or chose to quit without saving).
         std::mem::take(&mut self.project.store).close();
+        remove_staging(self.project.staging.take());
         for tab in &mut self.tabs {
             std::mem::take(&mut tab.project.store).close();
+            remove_staging(tab.project.staging.take());
         }
         if let Some(conn) = self.connection.take() {
             self.rt.block_on(async move {
@@ -2949,6 +3134,94 @@ impl ScanCraftApp {
                     log::warn!("Scanner shutdown timed out; the device may still be streaming");
                 }
             });
+        }
+    }
+}
+
+/// Whether a staging folder still holds a raw recording.
+pub(crate) fn staging_holds_raw(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.path().join("raw.bin").is_file() || e.path().join("raw_rgb.bin").is_file())
+}
+
+/// Removes a closed tab's staging folder (raw streams of a project that was never saved).
+pub(crate) fn remove_staging(dir: Option<std::path::PathBuf>) {
+    if let Some(dir) = dir {
+        if let Err(e) = std::fs::remove_dir_all(&dir) {
+            log::warn!("could not remove {}: {e}", dir.display());
+        }
+    }
+}
+
+impl ScanCraftApp {
+    /// Starts the capture record session of pass `id` (see `crate::capture`) and returns what the
+    /// scan worker logs into.
+    fn begin_capture_record(&mut self, id: u32, scan_config: &ScanConfig, worker: &WorkerConfig, start: &crate::model::CaptureStart, continued: bool) -> Option<(crate::capture::SharedCapture, usize)> {
+        let (device, capabilities) = match &self.connection {
+            Some(c) => (Some(c.info.clone()), Some(c.capabilities.clone())),
+            None => (None, None),
+        };
+        let live_ai = self.live_ai.enabled.load(Ordering::Relaxed);
+        let settings = serde_json::json!({
+            "min_mm": worker.min_mm,
+            "max_mm": worker.max_mm,
+            "point_pitch_mm": worker.point_pitch_mm,
+            "point_budget": self.settings.point_budget,
+            "live_ai_segment": live_ai,
+        });
+        let pass = self.passes.iter_mut().find(|p| p.id == id)?;
+        let tracker = format!("{:?}", project::tracker_config(scan_config, pass.meta.device.as_ref()));
+        let seeded = pass.meta.alignment == AlignState::Locating;
+        let capture = pass.meta.capture.get_or_insert_with(crate::capture::CaptureLog::shared).clone();
+        let mut log = capture.lock().ok()?;
+        let segment = log.begin(crate::capture::SessionStart {
+            scan_config,
+            device: device.as_ref(),
+            capabilities: capabilities.as_ref(),
+            settings,
+            tracker: serde_json::Value::String(tracker),
+            info: start.info.as_ref(),
+            target: start.target.as_ref(),
+            pass_dir: start.pass_dir.as_deref(),
+            continued,
+            seeded,
+            live_ai,
+            not_recorded: start.not_recorded.clone(),
+        });
+        // The recording, as the project file names it (relative when inside the project).
+        if let Some(raw) = log.record.raw_main.clone() {
+            pass.meta.raw_recording = Some(if scancraft_io::fsutil::is_safe_relative(&raw) { format!("{}/{raw}", scancraft_io::project::pass_dir(id)) } else { raw });
+        }
+        drop(log);
+        self.recording_dropped_seen = 0;
+        self.recording_check = None;
+        Some((capture, segment))
+    }
+
+    /// Ends the capture record session of the pass that just stopped, and writes its capture
+    /// files next to its raw recording, so the recording folder describes itself even before
+    /// the project is saved.
+    fn end_capture_record(&mut self, pass: Option<u32>) {
+        let Some(pass) = pass.and_then(|id| self.passes.iter().find(|p| p.id == id)) else { return };
+        let Some(capture) = pass.meta.capture.clone() else { return };
+        let id = pass.id;
+        let recorded = capture.lock().map(|mut l| {
+            l.end();
+            l.has_raw_in_project()
+        });
+        if recorded.unwrap_or(false) {
+            let dir = self.project.store.data_dir().filter(|_| self.project.staging.is_none()).or_else(|| self.project.staging.clone());
+            if let Some(dir) = dir.filter(|d| !matches!(self.project.store, crate::storage::Store::ReadOnly { .. }) || self.project.staging.as_deref() == Some(d.as_path())) {
+                // In the background: the recorders may still be flushing.
+                std::thread::spawn(move || {
+                    let stats = capture.lock().map(|l| l.recording_stats()).unwrap_or_default();
+                    scancraft_driver::recording::wait_finished(&stats, Duration::from_secs(30));
+                    if let Ok(mut log) = capture.lock() {
+                        if let Err(e) = crate::capture::write(&dir, id, &mut log) {
+                            log::warn!("capture record of pass {id}: {e}");
+                        }
+                    }
+                });
+            }
         }
     }
 }
@@ -4275,6 +4548,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         crate::project::save(&dir, &stored).unwrap();
 
@@ -4347,6 +4621,7 @@ mod tests {
                 cleaned: None,
                 mesh: None,
                 settings: serde_json::json!({}),
+                notes: String::new(),
             },
         )
         .unwrap();
@@ -5558,5 +5833,243 @@ mod tests {
         assert_eq!(switch_save_form(r"C:\Scans\Bracket.SCANCRAFTZ", false), r"C:\Scans\Bracket");
         assert_eq!(switch_save_form(r"C:\Scans\Bracket.scancraftz", true), r"C:\Scans\Bracket.scancraftz");
         assert_eq!(switch_save_form("", true), "");
+    }
+
+    // ------------------------------------------------------------ capture records and replay
+
+    /// Runs the app's event loop until `done`, at most `limit`.
+    fn pump(app: &mut ScanCraftApp, limit: Duration, what: &str, done: &dyn Fn(&ScanCraftApp) -> bool) {
+        let t0 = Instant::now();
+        let ctx = egui::Context::default();
+        while !done(app) {
+            assert!(t0.elapsed() < limit, "timed out waiting for {what}: {}", app.status);
+            app.poll_device_events();
+            app.poll_updates(&ctx);
+            app.poll_jobs();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Rows of the pass's tracking log.
+    fn logged(app: &ScanCraftApp, id: u32) -> usize {
+        app.passes.iter().find(|p| p.id == id).and_then(|p| p.meta.capture.as_ref()).map_or(0, |c| c.lock().unwrap().rows.len())
+    }
+
+    /// One capture of `frames` processed frames with the simulator (`config`'s mode), stopped
+    /// cleanly. Returns the pass id.
+    fn capture_pass(app: &mut ScanCraftApp, config: ScanConfig, frames: usize) -> u32 {
+        app.scan_config.turntable_mode = config.turntable_mode;
+        app.scan_config.tracking = config.tracking;
+        app.scan_config.color_texture = config.color_texture;
+        app.start_scan();
+        pump(app, Duration::from_secs(20), "the capture to start", &|a| a.capture == Capture::Running);
+        let id = app.active_pass.unwrap();
+        pump(app, Duration::from_secs(120), "frames to be tracked", &|a| logged(a, id) >= frames);
+        app.stop_scan();
+        pump(app, Duration::from_secs(20), "the capture to stop", &|a| a.capture == Capture::Idle);
+        id
+    }
+
+    fn simulator(app: &mut ScanCraftApp, motion: scancraft_driver::mock::MockMotion) {
+        let device = scancraft_driver::MockDevice::new(DeviceTransport::Virtual { name: "simulated_scanner_0".into() }).with_motion(motion);
+        app.connect_device(Box::new(device), "mock");
+        pump(app, Duration::from_secs(10), "the simulator", &|a| a.connection.is_some());
+    }
+
+    fn capture_of(app: &ScanCraftApp, id: u32) -> crate::capture::SharedCapture {
+        app.passes.iter().find(|p| p.id == id).and_then(|p| p.meta.capture.clone()).expect("a capture record")
+    }
+
+    #[test]
+    fn a_scanned_pass_keeps_its_raw_stream_capture_record_and_tracking_log_and_replays_to_the_same_poses() {
+        let dir = temp_dir("capture-record");
+        let mut app = app();
+        app.prefs.work_root = Some(dir.join("work"));
+        // The simulator is recorded like a real scanner (its own wire format). (The test drive
+        // may be nearly full: a lower free-space limit than the app's.)
+        app.record_simulator = true;
+        app.min_free_to_record = (200 << 20, 100 << 20);
+        simulator(&mut app, scancraft_driver::mock::MockMotion { period_ms: 90, ..Default::default() });
+        let config = ScanConfig { color_texture: true, ..ScanConfig::default() };
+        let id = capture_pass(&mut app, config, 30);
+        let capture = capture_of(&app, id);
+        let (rows, raw_main, raw_rgb, counts, bytes) = {
+            let log = capture.lock().unwrap();
+            (log.rows.len(), log.record.raw_main.clone(), log.record.raw_rgb.clone(), log.record.total_frames(), log.raw_bytes())
+        };
+        assert!(rows >= 30, "{rows} rows");
+        assert_eq!((raw_main.as_deref(), raw_rgb.as_deref()), (Some("raw.bin"), Some("raw_rgb.bin")));
+        assert_eq!(counts.processed as usize, rows);
+        assert!(counts.tracking > 20 && counts.received >= counts.processed, "{counts:?}");
+        assert!(bytes > 10 << 20, "raw bytes {bytes}");
+        assert_eq!(app.passes[0].meta.raw_recording.as_deref(), Some("pass-1/raw.bin"));
+        // Unsaved: recorded into the staging folder under the working-folder root.
+        let staging = app.project.staging.clone().expect("a staging folder");
+        assert!(staging.starts_with(dir.join("work")) && staging.join("pass-1/raw.bin").is_file());
+        app.set_notes("Metal bracket, scanning spray (vanishes within hours)".into());
+        assert!(app.dirty());
+
+        // Save as a project folder: the recording moves in, the capture files are written.
+        let folder = dir.join("Bracket");
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        assert!(!app.dirty(), "{}", app.status);
+        // (Frames in flight when Stop was pressed are logged after it; the save waited for the
+        // recording to be written out.)
+        let rows = logged(&app, 1);
+        let bytes = app.raw_bytes(&app.passes[0]);
+        for f in ["raw.bin", "raw_rgb.bin", "capture.json", "tracking.csv", "calibration/mock.json", "keyframes.bin"] {
+            assert!(folder.join("pass-1").join(f).is_file(), "pass-1/{f} is missing: {}", app.status);
+        }
+        assert!(!staging.exists() && app.project.staging.is_none(), "the staging folder is gone once its recordings moved");
+        let raw_size = std::fs::metadata(folder.join("pass-1/raw.bin")).unwrap().len();
+        let file = scancraft_io::project::load_project(&folder).unwrap().0;
+        assert_eq!(file.notes, "Metal bracket, scanning spray (vanishes within hours)");
+        let device = &file.passes[0].device;
+        assert!(device["serial_number"].as_str().unwrap().starts_with("sha256:"), "no serial number in the project: {device}");
+        assert!(!std::fs::read_to_string(folder.join("pass-1/capture.json")).unwrap().contains("SIM-SCAN-001"));
+        assert!(file.settings["saved_by"]["git_commit"].as_str().is_some_and(|c| !c.is_empty()));
+
+        // And as a bundle with its raw recordings.
+        app.prefs.bundle_contents.raw_recordings = true;
+        let bundle = dir.join("Bracket.scancraftz");
+        app.save_project(bundle.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        let mut b = scancraft_io::bundle::Bundle::open(&bundle).unwrap();
+        for f in ["raw.bin", "raw_rgb.bin", "capture.json", "tracking.csv", "calibration/mock.json"] {
+            assert!(b.read(&format!("pass-1/{f}")).is_ok(), "pass-1/{f} is not in the bundle");
+        }
+        assert_eq!(b.read("pass-1/raw.bin").unwrap().len() as u64, raw_size);
+        release(&mut app);
+
+        // Opened again: notes, capture record and tracking log are back.
+        let mut other = self::app();
+        other.prefs.work_root = Some(dir.join("work"));
+        other.open_project(folder.clone());
+        wait_for_jobs(&mut other, Duration::from_secs(60));
+        assert_eq!(other.passes.len(), 1, "{}", other.status);
+        assert_eq!(other.project.notes, "Metal bracket, scanning spray (vanishes within hours)");
+        assert_eq!(logged(&other, 1), rows);
+        assert_eq!(other.raw_bytes(&other.passes[0]), bytes, "the recorded size is shown after opening");
+        release(&mut other);
+
+        // Replayed from the project folder: the same frames give the same poses.
+        let r = crate::replay::replay_pass(&folder, 1, crate::replay::ReplayFrames::Logged).unwrap();
+        let c = r.comparison.unwrap();
+        println!("replay: {} decoded, {} processed, {} missing; {c:?}", r.decoded, r.rows.len(), r.missing);
+        assert_eq!((r.rows.len(), r.missing), (rows, 0));
+        assert!(c.frames + 2 >= rows && c.max_translation_mm < 0.05 && c.max_rotation_deg < 0.01 && c.state_differs == 0, "{c:?}");
+        // From the bundle, headless, as on the command line.
+        assert_eq!(crate::replay::replay_pass_cli(&bundle, 1, false, Some(&dir.join("replay"))), 0);
+        assert!(dir.join("replay/replay-pass-1.csv").is_file() && dir.join("replay/replay-pass-1.ply").is_file());
+        // Every recorded frame, as offline re-processing does it.
+        let all = crate::replay::replay_pass(&folder, 1, crate::replay::ReplayFrames::All).unwrap();
+        assert!(all.rows.len() >= rows && all.decoded == all.rows.len());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_recording_can_be_turned_off_and_the_simulator_is_not_recorded_by_default() {
+        let dir = temp_dir("capture-off");
+        let mut app = app();
+        app.prefs.work_root = Some(dir.join("work"));
+        simulator(&mut app, scancraft_driver::mock::MockMotion { period_ms: 90, ..Default::default() });
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        {
+            let log = capture_of(&app, id);
+            let log = log.lock().unwrap();
+            assert!(log.record.raw_main.is_none() && log.rows.len() >= 5, "a capture record and log, no recording");
+        }
+        assert!(app.project.staging.is_none(), "nothing was staged");
+        app.record_simulator = true;
+        app.prefs.record_raw = false;
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        let log = capture_of(&app, id);
+        let log = log.lock().unwrap();
+        assert!(log.record.raw_main.is_none());
+        assert!(log.record.captures[0].events.iter().any(|e| e.what.contains("turned off")), "{:?}", log.record.captures[0].events);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turntable_passes_with_feature_and_marker_tracking_record_their_region_replay_and_align_with_a_handheld_pass() {
+        let dir = temp_dir("capture-turntable");
+        let mut app = app();
+        app.prefs.work_root = Some(dir.join("work"));
+        app.record_simulator = true;
+        app.min_free_to_record = (200 << 20, 100 << 20);
+        // A manual turntable at ~20 degrees a second, ~7 frames a second as the POP 4 delivers.
+        simulator(&mut app, scancraft_driver::mock::MockMotion { turntable_step_rad: 2.5f32.to_radians(), period_ms: 140, ..Default::default() });
+        assert!(app.modes().unwrap().can_scan(scancraft_driver::LightSource::FullFieldHd, scancraft_driver::TrackingMode::Marker, scancraft_driver::ObjectType::General));
+        let turntable = |tracking| ScanConfig { turntable_mode: scancraft_driver::TurntableMode::TurntableContinuous, tracking, color_texture: false, ..ScanConfig::default() };
+        let mut ids = Vec::new();
+        for tracking in [scancraft_driver::TrackingMode::Feature, scancraft_driver::TrackingMode::Marker] {
+            app.next_start = crate::project::PassStart::Moved;
+            let id = capture_pass(&mut app, turntable(tracking), 50);
+            let log = capture_of(&app, id);
+            let log = log.lock().unwrap();
+            let f = log.record.total_frames();
+            let region = &log.record.turntable["region"];
+            println!("turntable {tracking:?}: {f:?}; region {region}");
+            assert_eq!(log.record.turntable["mode"], "TurntableContinuous");
+            assert!(region["radius_mm"].as_f64().is_some_and(|r| r > 60.0 && r < 250.0), "the capture volume is recorded: {region}");
+            assert!(f.lost * 10 <= f.processed && f.tracking + f.slow >= 40, "{tracking:?}: {f:?}");
+            // The object turned under the fixed scanner: the tracked sensor orbits it.
+            let first = log.rows.iter().find(|r| r.has_pose()).unwrap();
+            let last = log.rows.iter().rev().find(|r| r.state == "tracking").unwrap();
+            let turned = glam::Quat::from_array(first.rotation).angle_between(glam::Quat::from_array(last.rotation)).to_degrees();
+            let truth = (last.device_ms - first.device_ms) as f32 / 140.0 * 2.5;
+            assert!((turned - truth).abs() < 3.0, "{tracking:?}: turned {turned:.1} deg, the turntable {truth:.1} deg");
+            ids.push(id);
+        }
+        // A handheld pass of the same scene in the same project (the simulator orbits it).
+        app.next_start = crate::project::PassStart::Moved;
+        simulator_reconnect(&mut app, scancraft_driver::mock::MockMotion { period_ms: 90, ..Default::default() });
+        let hand = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 60);
+        let folder = dir.join("Turntable");
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        // Replays of the turntable passes reproduce their live poses.
+        for id in &ids {
+            let r = crate::replay::replay_pass(&folder, *id, crate::replay::ReplayFrames::Logged).unwrap();
+            let c = r.comparison.unwrap();
+            println!("replay of turntable pass {id}: {c:?}");
+            assert!(c.max_translation_mm < 0.05 && c.max_rotation_deg < 0.01 && c.state_differs == 0, "pass {id}: {c:?}");
+        }
+        // Align All places the turntable passes and the handheld one together.
+        app.set_reference(hand);
+        app.align_all();
+        wait_for_jobs(&mut app, Duration::from_secs(240));
+        assert!(app.poses_preview.is_some(), "{}", app.status);
+        println!("align all: {}", app.status);
+        app.accept_poses();
+        for id in ids.iter().chain([&hand]) {
+            let p = app.passes.iter().find(|p| p.id == *id).unwrap();
+            assert!(p.meta.alignment.is_placed(), "pass {id}: {:?} ({})", p.meta.alignment, app.status);
+        }
+        // Against the simulator's ground truth: a pass's frame is its first tracked frame's
+        // sensor frame, in the scene (turntable) frame at `scan_truth`.
+        let first_frame = |id: u32| capture_of(&app, id).lock().unwrap().rows.iter().find(|r| r.has_pose()).map(|r| r.frame).unwrap();
+        let hand_truth = scancraft_driver::MockDevice::scan_truth(&ScanConfig::default(), &scancraft_driver::mock::MockMotion { period_ms: 90, ..Default::default() }, first_frame(hand));
+        let tt_motion = scancraft_driver::mock::MockMotion { turntable_step_rad: 2.5f32.to_radians(), period_ms: 140, ..Default::default() };
+        for (id, tracking) in ids.iter().zip([scancraft_driver::TrackingMode::Feature, scancraft_driver::TrackingMode::Marker]) {
+            let tt_truth = scancraft_driver::MockDevice::scan_truth(&turntable(tracking), &tt_motion, first_frame(*id));
+            let want = scancraft_align::compose(&hand_truth.inverse(), &tt_truth);
+            // (Make Reference keeps the project frame: compare with the handheld pass's place.)
+            let placed = |i: u32| app.passes.iter().find(|p| p.id == i).unwrap().meta.transform;
+            let got = scancraft_align::compose(&placed(hand).inverse(), &placed(*id));
+            let (dt, da) = ((want.translation - got.translation).length(), want.rotation.angle_between(got.rotation).to_degrees());
+            println!("pass {id} placed {dt:.2} mm / {da:.2} deg from the truth");
+            assert!(dt < 3.0 && da < 1.0, "pass {id}: {dt:.2} mm / {da:.2} deg off");
+        }
+        release(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Disconnects and connects a fresh simulator (another motion).
+    fn simulator_reconnect(app: &mut ScanCraftApp, motion: scancraft_driver::mock::MockMotion) {
+        app.disconnect();
+        pump(app, Duration::from_secs(5), "the disconnect", &|a| a.connection.is_none() && !a.connecting);
+        simulator(app, motion);
     }
 }

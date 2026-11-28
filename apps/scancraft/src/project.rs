@@ -144,8 +144,13 @@ pub struct PassMeta {
     /// Used by Merge.
     pub included: bool,
     pub start: PassStart,
+    /// The pass's raw stream recording: `pass-<id>/raw.bin` when recorded into the project, an
+    /// absolute file when recorded elsewhere (`SCANCRAFT_RECORD_DIR`).
     pub raw_recording: Option<String>,
     pub origin: PassOrigin,
+    /// How the pass was captured: capture record, tracking log, calibration files
+    /// (`crate::capture`). Shared with the scan worker while capturing.
+    pub capture: Option<crate::capture::SharedCapture>,
 }
 
 impl PassMeta {
@@ -158,8 +163,9 @@ impl PassMeta {
             alignment: AlignState::Unaligned,
             included: true,
             start,
-            raw_recording: std::env::var("SCANCRAFT_RECORD_DIR").ok(),
+            raw_recording: None,
             origin: PassOrigin::Captured,
+            capture: None,
         }
     }
 
@@ -272,11 +278,20 @@ pub struct ProjectInfo {
     /// that finds it taken meanwhile proposes the next free name instead of replacing what is
     /// there now. Cleared when the project is saved.
     pub proposed: Option<(PathBuf, PathBuf)>,
+    /// Free-text notes, saved in the project file (Save card).
+    pub notes: String,
+    /// Where raw streams of a project that has no folder of its own yet (or only a read-only
+    /// one) are recorded: `<working-folder root>/captures/<id>/pass-<n>/`. Moved into the project
+    /// on its first save; removed when the tab closes.
+    pub staging: Option<PathBuf>,
+    /// The processing history saved with the project before it was opened (the steps of this
+    /// session are added on save; `ScanCraftApp::history_log`).
+    pub history_before: Vec<serde_json::Value>,
 }
 
 impl Default for ProjectInfo {
     fn default() -> Self {
-        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0, store: crate::storage::Store::None, proposed: None }
+        ProjectInfo { name: "Untitled project".into(), path: None, saved_generation: 0, store: crate::storage::Store::None, proposed: None, notes: String::new(), staging: None, history_before: Vec::new() }
     }
 }
 
@@ -460,6 +475,8 @@ pub struct StoredProject {
     pub cleaned: Option<PointCloud>,
     pub mesh: Option<Mesh>,
     pub settings: serde_json::Value,
+    /// Free-text notes (project file `notes`).
+    pub notes: String,
 }
 
 fn to_record(k: &KeyframeData) -> KeyframeRecord {
@@ -740,7 +757,8 @@ pub fn save_carrying(dir: &Path, project: &StoredProject, previous: Option<&Path
             id: p.id,
             name: p.name.clone(),
             scan_config: scan_config_json(p),
-            device: p.meta.device.as_ref().and_then(|d| serde_json::to_value(d).ok()).unwrap_or_default(),
+            // Never the serial number or the network address (projects are shared as test data).
+            device: p.meta.device.as_ref().and_then(|d| serde_json::to_value(crate::capture::sanitized_device(d)).ok()).unwrap_or_default(),
             frames: p.frames,
             transform: p.meta.transform,
             alignment: alignment_record(p.meta.alignment),
@@ -780,6 +798,10 @@ pub fn save_carrying(dir: &Path, project: &StoredProject, previous: Option<&Path
                 let _ = std::fs::remove_file(dir.join(mask_path(p.id)));
             }
         }
+        if let Some(capture) = &p.meta.capture {
+            let mut log = capture.lock().map_err(|_| "a capture record is unavailable".to_string())?;
+            crate::capture::write(dir, p.id, &mut log)?;
+        }
         let markers = dir.join(files::markers_path(p.id));
         if p.markers.is_empty() {
             let _ = std::fs::remove_file(markers);
@@ -813,6 +835,7 @@ pub fn save_carrying(dir: &Path, project: &StoredProject, previous: Option<&Path
         passes,
         outputs,
         settings: project.settings.clone(),
+        notes: project.notes.clone(),
         other: Default::default(),
     };
     let keyframes: Vec<(u32, Vec<KeyframeRecord>)> = project.passes.iter().map(|p| (p.id, p.keyframes.iter().map(to_record).collect())).collect();
@@ -858,6 +881,8 @@ pub fn load(path: &Path) -> Result<StoredProject, String> {
                 start: if record.start == "same_position" { PassStart::SamePosition } else { PassStart::Moved },
                 raw_recording: record.raw_recording.clone(),
                 origin,
+                // Optional (passes captured before capture records existed have none).
+                capture: crate::capture::read(dir, record.id).map(|c| std::sync::Arc::new(std::sync::Mutex::new(c))),
             },
             keyframes: kfs.into_iter().map(from_record).collect(),
             surface,
@@ -874,7 +899,7 @@ pub fn load(path: &Path) -> Result<StoredProject, String> {
     let merged = output("merged").and_then(|o| cloud(o).map(|c| (c, o.passes.clone())));
     let cleaned = output("cleaned").and_then(cloud);
     let mesh = output("mesh").and_then(|o| files::resolve(dir, &o.file).ok()).and_then(|f| scancraft_io::load_ply(f).ok()).and_then(|(_, m)| m);
-    Ok(StoredProject { name: file.name, reference: file.reference_pass, next_pass_id: file.next_pass_id, passes, merged, cleaned, mesh, settings: file.settings })
+    Ok(StoredProject { name: file.name, reference: file.reference_pass, next_pass_id: file.next_pass_id, passes, merged, cleaned, mesh, settings: file.settings, notes: file.notes })
 }
 
 /// A loaded pass with its tracker rebuilt and its surface placed in the project frame.
@@ -949,6 +974,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({ "min_mm": 150.0 }),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         let loaded = load(&dir).unwrap();
@@ -1033,6 +1059,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         assert!(dir.join(surface_path(2)).is_file());
@@ -1082,6 +1109,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         let loaded = load(&dir).unwrap();
@@ -1142,6 +1170,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         let loaded = load(&dir).unwrap();
@@ -1188,6 +1217,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         assert!(dir.join(files::markers_path(1)).is_file() && !dir.join(files::markers_path(2)).exists());
@@ -1246,6 +1276,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         // What older versions wrote: the scan settings without an origin.
@@ -1299,6 +1330,7 @@ mod tests {
             cleaned: None,
             mesh: None,
             settings: serde_json::json!({}),
+            notes: String::new(),
         };
         save(&dir, &project).unwrap();
         assert!(dir.join(rgb_manifest_rel(1)).is_file());

@@ -82,7 +82,7 @@ project                       passes, alignments, outputs
 
 - Each light source is a **depth source** module; each tracking mode a **tracker** behind one trait. A pass instantiates the pair its mode requires. New vendors add drivers; new modes add a depth source or tracker without touching the others.
 - Driver work per mode: device setup sequence, stream format, decoding into `SensorFrame`. Host work: the depth source / tracker.
-- **Raw recordings** (`SCANCRAFT_RECORD_DIR`) are kept per pass so a pass can be re-processed with improved algorithms.
+- **Raw recordings** are kept per pass (`pass-<id>/raw.bin`, section 8) so a pass can be re-processed with improved algorithms; `SCANCRAFT_RECORD_DIR` still records elsewhere when the project's recording is off.
 
 ## 6. Noise (known issue)
 
@@ -134,12 +134,77 @@ on unfiltered (free-space evidence for visibility check and carving). `DepthSour
 makes `PassPipeline` withhold the IMU from the tracker. Verified on synthetic data only so far;
 a real turntable recording is needed (`replay_track` with `TURNTABLE=1`).
 
+**Simulator check (2026-11-28).** The MockDevice has a turntable scene for `TurntableContinuous`
+/ `TurntableStep` passes: the scanner fixed at 330 mm and 30 degrees elevation, the turntable
+(105 mm disc, vase, canister, block, 16 marker stickers on the rim) turning under it, a static
+table 8 mm below the disc top and a static wall behind; its IMU reports a scanner standing still.
+Results (`crates/scancraft-pipeline/tests/mock_turntable.rs`, 2 degrees per frame, a full turn):
+Feature tracking 179/179 frames tracked, pose error max 0.51 deg / 2.2 mm, vase surface median
+0.06 mm / 95 % 0.21 mm from the true one; Marker tracking (markers on the turntable) 0.49 deg /
+2.1 mm, 0.15 / 0.39 mm; no point of the static table or the disc top fused. Without the turntable
+mode the static table and wall hold the pose still (0 of 30 degrees). Through the app (`app.rs`
+test `turntable_passes_…`, 2.5 degrees per frame at 7 fps): both modes track, the capture record
+stores the mode, the filter settings and the region, replays reproduce the live poses, and Align
+All places both turntable passes onto a handheld pass of the scene within 0.4 mm / 0.06 deg.
+Two things found: the plane RANSAC with 2 mm inliers chose a plane tilted ~2 degrees through
+disc top and table (now 1 mm); and a depth window whose near limit cuts the turning object is an
+edge fixed to the sensor that biases tracking to "no motion" (3.7 % too little turn with the POP 4
+Full-field window 250-500 mm and the object at 230-260 mm): keep the whole object inside the
+window.
+
+Not known for a real turntable: the plane fit needs the table normal to have >= 0.3 along the
+sensor's up axis (a view more than ~70 degrees down fails; `TurntableConfig::min_up`); the object
+is the nearest sizeable cluster within 15 degrees of the optical axis (aim at it at the start);
+markers belong on the turntable (they turn with the part), markers on the static table would track
+the table instead; real depth noise, a turntable whose top is not flat, and hands in view while
+turning a manual turntable are untested.
+
 Single-shot capture (frames taken on click rather than continuously) is a capture option of any
 pass, useful for step-wise turntable scans; the frames are tracked like any other.
 
 ## 8. Persistence
 
-Project folder (form A): `<name>.scancraft`, the project file (JSON: passes, modes, alignments, settings, output metadata; relative paths only; opened by double-click) + per pass `pass-<n>/keyframes.bin` (packed points), `surface.ply` (imported), `cleaned.ply` + `cleaned_observations.bin`, `object.bin`, `rgb/` (colour keyframes), `raw.bin` (optional recording), `markers.json` (optional marker map: the tracker's, or Revo's `marker_framework.mkf` read with an imported scan) + `outputs/`. Opening a project restores everything editable. One project per folder. Older folders with `project.json` keep opening; saving one writes the `.scancraft` file and turns `project.json` into a stub that older versions refuse ("saved by a newer version") instead of opening a stale copy. Every file is saved atomically (temporary file, then rename), the project file last.
+Project folder (form A): `<name>.scancraft`, the project file (JSON: passes, modes, alignments, settings, output metadata; relative paths only; opened by double-click) + per pass `pass-<n>/keyframes.bin` (packed points), `surface.ply` (imported), `cleaned.ply` + `cleaned_observations.bin`, `object.bin`, `rgb/` (colour keyframes), `raw.bin` / `raw_rgb.bin` (raw streams), `capture.json`, `tracking.csv`, `calibration/` (see below), `markers.json` (optional marker map: the tracker's, or Revo's `marker_framework.mkf` read with an imported scan) + `outputs/`. Opening a project restores everything editable. One project per folder. Older folders with `project.json` keep opening; saving one writes the `.scancraft` file and turns `project.json` into a stub that older versions refuse ("saved by a newer version") instead of opening a stale copy. Every file is saved atomically (temporary file, then rename), the project file last.
+
+**What a captured pass records about itself** (2026-11-28, `scancraft_io::capture`,
+`apps/scancraft/src/capture.rs`), so it can be decoded, tracked, fused and compared again offline:
+
+```text
+pass-<id>/raw.bin          main wire stream (POP 4: the media packets as received, framing
+                           u32 0x11223344, u32 length, packet; simulator: its own records)
+pass-<id>/raw_rgb.bin      colour wire stream (POP 4: JPEG + u32 time stamp per packet)
+pass-<id>/capture.json     capture record: app (version, git commit, dirty, profile, target),
+                           device (vendor, model, firmware, transport kind, resolutions, IMU
+                           mounting, serial only as sha256 hash, no IP), capabilities, scan
+                           settings, app settings (depth window, point pitch, budget), tracker
+                           settings, turntable (mode, filter settings, region found), calibration
+                           file list, raw file names, log file name, and one entry per capture
+                           session: start / end (UTC), continued / seeded / live AI, byte offsets
+                           into the raw files, the session's scan settings, stream layout and the
+                           control commands sent, recording statistics (bytes, dropped records,
+                           most queued, errors), frame counts (received, skipped for newer,
+                           paused, processed, without geometry, tracking, slow, lost, relocalised,
+                           keyframes, fused points), events (exposure / gain changes, pause,
+                           recording warnings)
+pass-<id>/tracking.csv     one row per frame the live tracker processed: session, frame, device
+                           ms, host ms, state, relocalised, inliers, RMS, visibility conflict,
+                           keyframe, new / total points, pose (quaternion, translation), IMU
+                           quaternion, processing ms
+pass-<id>/calibration/     the calibration files the driver downloaded (POP 4: camparam.yaml,
+                           Prgb.bin, Distort.bin, LC_RT.bin, camparam_blue/*; serial blanked)
+```
+
+The raw files are recorded while scanning (writer thread, queue bounded at 192 MB; a full queue
+drops records and counts them, it never blocks the stream: HANDOFF §3). They go into the project
+folder, a bundle's working folder, or for a project not saved yet a staging folder under the
+working-folder root that the first save moves into the project. They belong to the bundle item
+"Raw stream recordings" (off by default in bundles; the Save card warns when a project has
+recordings a bundle would leave out). `capture.json`, `tracking.csv` and `calibration/` are core
+files (always saved and bundled). The project file gains `notes` and, in `settings`, the
+processing parameters, the processing history (the steps of each session, oldest first) and the
+build that saved it. Every addition is optional: older projects open as before, and the previous
+build opens these projects (it keeps `notes` as an unknown field and ignores the new files; it
+does not copy them when saving elsewhere). Replay: HANDOFF §4 "Replaying a pass".
 
 Bundle (form B): `<name>.scancraftz`, a plain ZIP64 of the same layout, entries stored, the project file first and a manifest (`scancraft-bundle.json`: contents, size and SHA-256 per entry) last. Which items go in is a setting (`scancraft_io::bundle::BundleContents`, table in [open-issues.md](../open-issues.md) 4.1). A bundle is opened into a working folder (`scancraft_io::workdir`, a temporary form A under a configurable root) and saved back with unchanged entries copied raw from the old bundle. Lock files (`.scancraft.lock` in a project folder, `<bundle>.lock` beside a bundle) keep two apps from saving over each other. Code: `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`.
 
