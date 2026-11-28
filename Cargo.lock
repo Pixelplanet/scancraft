@@ -6920,6 +6920,7 @@ dependencies = [
  "scancraft-driver-revopoint",
  "scancraft-fusion",
  "scancraft-io",
+ "scancraft-laser",
  "scancraft-mesh",
  "scancraft-pipeline",
  "scancraft-render",

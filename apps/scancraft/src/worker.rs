@@ -320,6 +320,7 @@ pub async fn scan_worker(
     let mut carried_rgb_keyframes: Vec<scancraft_color::RgbKeyframe> = Vec::new();
     let (mut incoming, mut processed, mut marker) = (RateWindow::default(), RateWindow::default(), RateWindow::default());
     let mut region_logged = false;
+    let mut planes_logged = false;
     while let Some(mut frame) = frames.recv().await {
         incoming.tick(std::time::Instant::now());
         let mut skipped = 0u64;
@@ -401,6 +402,15 @@ pub async fn scan_worker(
             }
             if let Some((c, seg)) = capture.as_ref() {
                 log_frame(c, *seg, &frame, tracking.as_ref(), new_points.len(), &tracker.current_pose, host_ms.unwrap_or(0), proc_ms);
+                // Laser lines: where the planes came from (known after the first frame).
+                if !planes_logged {
+                    if let Some((origin, start)) = pipeline.depth.laser_planes().filter(|(o, _)| **o != scancraft_laser::PlanesOrigin::Unknown) {
+                        planes_logged = true;
+                        if let Ok(mut log) = c.lock() {
+                            log.set_laser_planes(*seg, origin, start);
+                        }
+                    }
+                }
                 if !region_logged {
                     if let Some(region) = pipeline.turntable_region() {
                         region_logged = true;

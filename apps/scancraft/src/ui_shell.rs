@@ -295,7 +295,7 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
         ClosePrompt::Tab => (
             "save",
             "Close Project",
-            format!("{} has unsaved changes. Save them before closing?", app.project.name),
+            format!("{} has unsaved changes{}. Save them before closing?", app.project.name, app.staged_raw_note().map(|n| format!(", among them {n}, which Discard deletes")).unwrap_or_default()),
             Some(if app.project.path.is_some() { "Save" } else { "Save…" }),
             "Discard Changes",
         ),
@@ -395,6 +395,22 @@ pub fn recovery_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
         Some(kit::Choice::Primary) => app.recover_leftovers(),
         Some(kit::Choice::Destructive) => app.discard_leftovers(),
         Some(kit::Choice::Cancel) => app.recovery = None,
+        None => {}
+    }
+}
+
+/// The question at start about raw recordings of never-saved projects that a crash left in
+/// staging folders (`kit::confirm_modal`): Keep (also ×, a click outside, Esc) leaves them and
+/// asks again at the next start; Delete removes them. Shown after the recovery question.
+pub fn orphan_captures_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    if app.orphan_captures.is_empty() || app.recovery.is_some() {
+        return;
+    }
+    let message = app.orphan_captures_message();
+    let actions = kit::Actions { primary: Some(("Keep", true)), cancel: None, destructive: Some(("Delete", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("orphan_captures_prompt"), warning_icon(), "Unsaved Recordings", &message, &actions) {
+        Some(kit::Choice::Destructive) => app.delete_orphan_captures(),
+        Some(kit::Choice::Primary) | Some(kit::Choice::Cancel) => app.orphan_captures.clear(),
         None => {}
     }
 }

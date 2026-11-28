@@ -138,6 +138,11 @@ pub fn prepare_added(name: &str, passes: Vec<project::StoredPass>) -> Vec<Loaded
                 p.meta.origin = PassOrigin::Project { source: name.to_string() };
             }
             p.visible = true;
+            // The raw recordings stay in the other project (they are not copied): the added pass
+            // keeps its capture record, which says where they are, and names no raw file here
+            // (it would be the file of whichever pass of this project has the same folder).
+            p.meta.raw_recording = None;
+            p.meta.capture = p.meta.capture.as_ref().and_then(|c| c.lock().ok().map(|l| std::sync::Arc::new(std::sync::Mutex::new(l.without_raw(name, p.id)))));
             p
         })
         .collect();

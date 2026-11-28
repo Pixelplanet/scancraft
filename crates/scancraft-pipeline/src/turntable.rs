@@ -120,6 +120,10 @@ impl DepthSource for TurntableFilter {
         self.region
     }
 
+    fn laser_planes(&self) -> Option<(&scancraft_laser::PlanesOrigin, Option<&scancraft_laser::planes::LaserPlaneSet>)> {
+        self.inner.laser_planes()
+    }
+
     fn process(&mut self, frame: &SensorFrame) -> Option<FrameGeometry> {
         let geometry = self.inner.process(frame)?;
         if self.region.is_none() {

@@ -210,39 +210,119 @@ fn read_all(mut r: Box<dyn std::io::Read>) -> Result<Vec<u8>, String> {
     Ok(v)
 }
 
+/// One capture session's part of a raw recording: file, first byte, end.
+pub(crate) type Span = Option<(PathBuf, u64, u64)>;
+
+/// Where each capture session's data lies in the raw recordings of a pass: (main, colour) per
+/// session, `None` for a stream the session did not record. A session's data starts at its
+/// offset and ends after the bytes it wrote (or, when that is not known, at the next session
+/// recorded into the same file, else at the end of the file). Sessions that recorded nothing
+/// take no part, whatever their offset says.
+pub(crate) fn session_spans(record: &scancraft_io::capture::CaptureRecord, pass_dir: &std::path::Path) -> Vec<(Span, Span)> {
+    use scancraft_io::capture::CaptureSegment;
+    let n = record.captures.len().max(1);
+    let fallback = CaptureSegment::default();
+    let seg = |i: usize| record.captures.get(i).unwrap_or(&fallback);
+    let spans = |rgb: bool| -> Vec<Span> {
+        let base = if rgb { &record.raw_rgb } else { &record.raw_main };
+        // Records of the first version say whether a session recorded only through its counters;
+        // older recordings (SCANCRAFT_RECORD_DIR) not even that: then the whole file is session 0.
+        let explicit = record.captures.iter().any(|c| c.recorded.is_some());
+        let recorded: Vec<bool> = (0..n)
+            .map(|i| {
+                let c = seg(i);
+                match (rgb, explicit) {
+                    (false, true) => c.recorded.unwrap_or(false),
+                    (true, true) => c.rgb_recorded.unwrap_or(false),
+                    (false, false) => !c.recording.is_null(),
+                    (true, false) => !c.rgb_recording.is_null(),
+                }
+            })
+            .collect();
+        let legacy_whole = !recorded.iter().any(|r| *r) && base.is_some();
+        let file = |i: usize| -> Option<PathBuf> {
+            let c = seg(i);
+            let own = if rgb { &c.raw_rgb_file } else { &c.raw_file };
+            own.as_ref().or(base.as_ref()).map(|name| raw_file(pass_dir, name))
+        };
+        (0..n)
+            .map(|i| {
+                if !(recorded[i] || (legacy_whole && i == 0)) {
+                    return None;
+                }
+                let path = file(i).filter(|p| p.is_file())?;
+                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let c = seg(i);
+                let start = if rgb { c.raw_rgb_offset } else { c.raw_offset };
+                let stats = if rgb { &c.rgb_recording } else { &c.recording };
+                let written = stats.get("bytes_written").and_then(|b| b.as_u64()).filter(|_| stats.get("finished").and_then(|f| f.as_bool()) == Some(true));
+                let next = (i + 1..n).filter(|&j| recorded[j] && file(j).as_ref() == Some(&path)).map(|j| if rgb { seg(j).raw_rgb_offset } else { seg(j).raw_offset }).find(|&o| o > start);
+                let end = match (written, next) {
+                    (Some(w), _) => start + w,
+                    (None, Some(o)) => o,
+                    (None, None) => len,
+                }
+                .min(len);
+                (end > start).then_some((path, start, end))
+            })
+            .collect()
+    };
+    let (main, rgb) = (spans(false), spans(true));
+    main.into_iter().zip(rgb).collect()
+}
+
+/// Where a replayed session's laser planes come from: the ones the live session started with
+/// (kept with the pass's calibration files), else calibrated online like the live run did. Never
+/// the plane cache of the computer replaying, which may hold other planes or none.
+pub(crate) fn laser_choice(segment: Option<&scancraft_io::capture::CaptureSegment>, calibration: &[(String, Vec<u8>)]) -> scancraft_pipeline::LaserPlanesChoice {
+    let file = segment.and_then(|s| s.laser_planes.get("file")).and_then(|f| f.as_str());
+    match file.and_then(|f| calibration.iter().find(|(n, _)| n == f)).and_then(|(_, b)| serde_json::from_slice(b).ok()) {
+        Some(planes) => scancraft_pipeline::LaserPlanesChoice::Given(planes),
+        None => scancraft_pipeline::LaserPlanesChoice::Online,
+    }
+}
+
 /// Replays pass `id` of the project folder `dir` from its raw recording: the recorded frames are
-/// decoded with the pass's calibration files and scan settings (`capture.json`) and run through a
-/// fresh pipeline and tracker, as live. See `docs/HANDOFF.md` ("Replaying a pass").
+/// decoded with the pass's calibration files and scan settings (`capture.json`) and run through
+/// the pass's tracker as live: one tracker for the pass, a fresh pipeline per capture session
+/// with that session's settings (a continued pass starts a new one live too). See
+/// `docs/HANDOFF.md` ("Replaying a pass").
 pub fn replay_pass(dir: &std::path::Path, id: u32, which: ReplayFrames) -> Result<PassReplay, String> {
     let log = crate::capture::read(dir, id).ok_or_else(|| format!("pass {id} has no capture record (pass-{id}/capture.json)"))?;
     let record = &log.record;
     let pass_dir = dir.join(scancraft_io::project::pass_dir(id));
-    let main = record.raw_main.as_deref().map(|n| raw_file(&pass_dir, n)).filter(|p| p.is_file()).ok_or_else(|| format!("pass {id} has no raw recording"))?;
-    let rgb = record.raw_rgb.as_deref().map(|n| raw_file(&pass_dir, n)).filter(|p| p.is_file());
+    let spans = session_spans(record, &pass_dir);
+    if spans.iter().all(|(m, _)| m.is_none()) {
+        return Err(match &record.raw_source {
+            Some(source) => format!("pass {id} has no raw recording here: it was added from {source}, replay it there"),
+            None => format!("pass {id} has no raw recording"),
+        });
+    }
     let device: Option<DeviceInfo> = serde_json::from_value(record.device.clone()).ok();
-    let min_mm = record.settings.get("min_mm").and_then(|v| v.as_f64()).unwrap_or(150.0) as f32;
-    let max_mm = record.settings.get("max_mm").and_then(|v| v.as_f64()).unwrap_or(450.0) as f32;
+    let window = |settings: &serde_json::Value| {
+        let get = |k: &str, d: f64| settings.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        (get("min_mm", 150.0), get("max_mm", 450.0))
+    };
     let first_config: ScanConfig = serde_json::from_value(record.scan_config.clone()).map_err(|e| format!("the scan settings of pass {id}: {e}"))?;
-    let mut pipeline = scancraft_pipeline::pipeline_for(&first_config, min_mm, max_mm)?;
     let mut tracker = Tracker::with_config(crate::project::tracker_config(&first_config, device.as_ref()));
     let mut rows: Vec<TrackRow> = Vec::new();
     let (mut decoded, mut missing) = (0usize, 0usize);
-    let main_len = std::fs::metadata(&main).map(|m| m.len()).unwrap_or(0);
-    let rgb_len = rgb.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| m.len()).unwrap_or(0);
-    let sessions = record.captures.len().max(1);
-    for seg in 0..sessions {
+    for (seg, (main_span, rgb_span)) in spans.iter().enumerate() {
         let s = record.captures.get(seg);
-        let following = record.captures.get(seg + 1);
-        let config: ScanConfig = s.and_then(|s| serde_json::from_value(s.scan_config.clone()).ok()).unwrap_or_else(|| first_config.clone());
-        // This session's part of the recordings.
-        let (start, end) = (s.map_or(0, |s| s.raw_offset), following.map_or(main_len, |n| n.raw_offset));
-        let (rgb_start, rgb_end) = (s.map_or(0, |s| s.raw_rgb_offset), following.map_or(rgb_len, |n| n.raw_rgb_offset));
-        if end <= start {
-            continue;
-        }
-        let format = s.and_then(|s| s.stream.get("format")).and_then(|f| f.as_str()).unwrap_or(scancraft_driver_revopoint::offline::STREAM_FORMAT).to_string();
-        // The live run's frames of this session, in order, by device time stamp.
+        // The live frames of this session, in order, by device time stamp.
         let logged: Vec<u64> = log.rows.iter().filter(|r| r.segment as usize == seg).map(|r| r.device_ms).collect();
+        let Some((main, start, end)) = main_span else {
+            // Not recorded: its frames cannot be replayed.
+            if which == ReplayFrames::Logged {
+                missing += logged.len();
+            }
+            continue;
+        };
+        let config: ScanConfig = s.and_then(|s| serde_json::from_value(s.scan_config.clone()).ok()).unwrap_or_else(|| first_config.clone());
+        let (min_mm, max_mm) = window(s.map(|s| &s.settings).filter(|v| !v.is_null()).unwrap_or(&record.settings));
+        let options = scancraft_pipeline::PipelineOptions { laser: laser_choice(s, &log.calibration), ..Default::default() };
+        let mut pipeline = scancraft_pipeline::pipeline_with(&config, min_mm, max_mm, &options)?;
+        let format = s.and_then(|s| s.stream.get("format")).and_then(|f| f.as_str()).unwrap_or(scancraft_driver_revopoint::offline::STREAM_FORMAT).to_string();
         let mut next = 0usize;
         let t0 = std::time::Instant::now();
         let mut each = |frame: SensorFrame| -> bool {
@@ -285,10 +365,10 @@ pub fn replay_pass(dir: &std::path::Path, id: u32, which: ReplayFrames) -> Resul
             });
             true
         };
-        let main_reader = segment_reader(&main, start, end - start)?;
-        let rgb_reader = match &rgb {
-            Some(p) if rgb_end > rgb_start => Some(segment_reader(p, rgb_start, rgb_end - rgb_start)?),
-            _ => None,
+        let main_reader = segment_reader(main, *start, end - start)?;
+        let rgb_reader = match rgb_span {
+            Some((p, a, b)) => Some(segment_reader(p, *a, b - a)?),
+            None => None,
         };
         match format.as_str() {
             scancraft_driver::mock::MOCK_STREAM_FORMAT => {
@@ -357,6 +437,10 @@ pub fn replay_pass_cli(project: &std::path::Path, id: u32, all: bool, out: Optio
                 return 2;
             }
         }
+    } else if project.join(scancraft_io::capture::capture_path(id)).is_file() {
+        // Any folder with the pass's capture record: also a staging folder a crash left, which
+        // has no project file.
+        project.to_path_buf()
     } else {
         match scancraft_io::project::locate(project) {
             Ok(l) => l.root,
@@ -418,6 +502,58 @@ pub fn replay_pass_cli(project: &std::path::Path, id: u32, all: bool, out: Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sessions_that_recorded_nothing_take_no_bytes_of_the_recording() {
+        use scancraft_io::capture::{CaptureRecord, CaptureSegment};
+        let dir = std::env::temp_dir().join(format!("scancraft-spans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("raw.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("raw_rgb.bin"), vec![0u8; 300]).unwrap();
+        std::fs::write(dir.join("raw-2.bin"), vec![0u8; 500]).unwrap();
+        let rec = |main: bool, rgb: bool, offset: u64, rgb_offset: u64| CaptureSegment { recorded: Some(main), rgb_recorded: Some(rgb), raw_offset: offset, raw_rgb_offset: rgb_offset, ..Default::default() };
+        // Session 0 recorded both streams; session 1 nothing (offsets 0); session 2 the main
+        // stream only, into a file of its own.
+        let mut record = CaptureRecord { raw_main: Some("raw.bin".into()), raw_rgb: Some("raw_rgb.bin".into()), ..Default::default() };
+        record.captures = vec![rec(true, true, 0, 0), rec(false, false, 0, 0), CaptureSegment { raw_file: Some("raw-2.bin".into()), ..rec(true, false, 0, 0) }];
+        let spans = session_spans(&record, &dir);
+        assert_eq!(spans[0], (Some((dir.join("raw.bin"), 0, 1000)), Some((dir.join("raw_rgb.bin"), 0, 300))));
+        assert_eq!(spans[1], (None, None));
+        assert_eq!(spans[2], (Some((dir.join("raw-2.bin"), 0, 500)), None));
+        // Colour on, then off, main stream appended: each session gets only its own bytes.
+        record.captures = vec![rec(true, true, 0, 0), rec(true, false, 600, 0)];
+        let spans = session_spans(&record, &dir);
+        assert_eq!(spans[0], (Some((dir.join("raw.bin"), 0, 600)), Some((dir.join("raw_rgb.bin"), 0, 300))));
+        assert_eq!(spans[1], (Some((dir.join("raw.bin"), 600, 1000)), None));
+        // A finished session ends after the bytes it wrote.
+        record.captures[0].recording = serde_json::json!({ "bytes_written": 550, "finished": true });
+        assert_eq!(session_spans(&record, &dir)[0].0, Some((dir.join("raw.bin"), 0, 550)));
+        // A record of the first version (no `recorded`): its counters say it.
+        let mut old = CaptureRecord { raw_main: Some("raw.bin".into()), ..Default::default() };
+        old.captures = vec![CaptureSegment { recording: serde_json::json!({ "bytes_written": 1000 }), ..Default::default() }, CaptureSegment::default()];
+        assert_eq!(session_spans(&old, &dir)[0].0, Some((dir.join("raw.bin"), 0, 1000)));
+        assert_eq!(session_spans(&old, &dir)[1].0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_laser_session_replays_with_the_planes_it_started_with_never_the_local_cache() {
+        use scancraft_pipeline::LaserPlanesChoice;
+        let planes = scancraft_laser::planes::LaserPlaneSet::default();
+        let mut log = crate::capture::CaptureLog::default();
+        log.record.captures.push(Default::default());
+        log.record.captures.push(Default::default());
+        log.set_laser_planes(0, &scancraft_laser::PlanesOrigin::Cache("C:/x/laser_planes_cross_1.json".into()), Some(&planes));
+        log.set_laser_planes(1, &scancraft_laser::PlanesOrigin::Online, None);
+        assert!(log.record.calibration.contains(&"laser_planes-0.json".to_string()), "the planes go with the calibration files");
+        assert_eq!(log.record.captures[0].laser_planes["origin"], "cache");
+        assert!(!log.record.captures[0].laser_planes.to_string().contains("C:/x"), "no local path in the record");
+        assert!(matches!(laser_choice(log.record.captures.first(), &log.calibration), LaserPlanesChoice::Given(p) if p == planes));
+        assert!(matches!(laser_choice(log.record.captures.get(1), &log.calibration), LaserPlanesChoice::Online));
+        // A record without the information (older captures): calibrated online, not the cache.
+        assert!(matches!(laser_choice(None, &[]), LaserPlanesChoice::Online));
+    }
 
     /// A real POP 4 recording (made with `SCANCRAFT_RECORD_DIR` before capture records existed)
     /// replayed through the pass replay: wrapped as a pass with a capture record that names the

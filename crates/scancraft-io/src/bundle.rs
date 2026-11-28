@@ -78,7 +78,7 @@ pub enum Item {
     Results,
     /// `pass-<id>/markers.json`.
     MarkerMaps,
-    /// `pass-<id>/raw.bin`, `pass-<id>/raw_rgb.bin`, `pass-<id>/raw/`, and a pass's `raw_recording` when it lies inside
+    /// `pass-<id>/raw.bin`, `raw_rgb.bin` (and a continued session's `raw-<n>.bin` / `raw_rgb-<n>.bin`), `pass-<id>/raw/`, and a pass's `raw_recording` when it lies inside
     /// the project folder.
     RawRecordings,
 }
@@ -205,7 +205,7 @@ pub fn classify(rel: &str, raw_recordings: &[String]) -> Option<Item> {
             return Some(match rest {
                 "keyframes.bin" => Item::Keyframes,
                 "markers.json" => Item::MarkerMaps,
-                "raw.bin" | "raw_rgb.bin" => Item::RawRecordings,
+                r if !r.contains('/') && crate::capture::is_raw_stream_name(r) => Item::RawRecordings,
                 r if r.starts_with("rgb/") => Item::ColourKeyframes,
                 r if r.starts_with("raw/") => Item::RawRecordings,
                 _ => Item::Core,
@@ -916,6 +916,8 @@ pub(crate) mod tests {
             ("pass-3/markers.json", Some(Item::MarkerMaps)),
             ("pass-3/raw.bin", Some(Item::RawRecordings)),
             ("pass-3/raw_rgb.bin", Some(Item::RawRecordings)),
+            ("pass-3/raw-2.bin", Some(Item::RawRecordings)),
+            ("pass-3/raw_rgb-2.bin", Some(Item::RawRecordings)),
             ("pass-3/capture.json", Some(Item::Core)),
             ("pass-3/tracking.csv", Some(Item::Core)),
             ("pass-3/calibration/camparam.yaml", Some(Item::Core)),

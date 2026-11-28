@@ -475,3 +475,16 @@ laser model are not built.
   tilted through disc and table (inliers 2 → 1 mm). Found: a depth window cutting the object
   biases tracking to "no motion". No scanner used. Notes: scan-sessions.md §7–8, HANDOFF §4,
   open-issues §4.2.
+- 2026-11-28 (branch `agent/integration`, review fixes) — Capture-record review findings fixed,
+  each with a test: recorder never truncates a file with data and waits for an earlier writer of
+  the same file (Continue right after Stop); writers flush when idle (sync 10 s); pass ids of
+  pass folders on disk are skipped (crash before save) and named on open; staged raw moves via a
+  temporary name, failures keep the tab open and dirty; continued sessions that cannot append
+  record into `raw-<n>.bin`; capture files at start and every 30 s; crash leftovers under
+  `<work root>/captures` offered at start (Keep / Delete) and replayable; empty passes with a
+  recording kept; replay per session (byte range, pipeline, settings); laser planes origin + start
+  planes per session (`calibration/laser_planes-<n>.json`, `LaserLineDepth::without_cache`);
+  added passes drop foreign raw references (`raw_source`); serial hash is HMAC with a per-PC key;
+  POP 4 trigger-mode failure ends the stream; build.rs watches sources for `git_dirty`. Workspace
+  tests 535 passed, 13 ignored; Revo e2e (Make Solid of the three Revo scans) passed. Scan-day
+  build and checklist: `E:\Claude\build\scancraft-scanday\`.

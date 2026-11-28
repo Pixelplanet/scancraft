@@ -182,9 +182,17 @@ impl RevopointDevice {
         // frame, and only then the mode's register setup.
         // Everything sent from here until the mode is configured goes into the capture record.
         self.ctl.start_transcript();
-        self.ctl.cgi("close_stream_all").await?;
         let spec = mode.spec();
-        self.ctl.set_stream_format(spec.output_fmt, spec.display_type, spec.width, spec.layout.display_rows(spec.height)).await?;
+        let ctl = &self.ctl;
+        let setup = async {
+            ctl.cgi("close_stream_all").await?;
+            ctl.set_stream_format(spec.output_fmt, spec.display_type, spec.width, spec.layout.display_rows(spec.height)).await
+        };
+        if let Err(e) = setup.await {
+            // Nothing streams yet: the scanner is let go for other clients.
+            self.lock = None;
+            return Err(e);
+        }
         // Verify the switch took effect (another client reconfiguring the device shows up here).
         let fmt = self.ctl.cgi_once("cam_type=mipi&get_depth_output_fmt").await.ok().flatten().unwrap_or_default();
         let reso = self.ctl.cgi_once("cam_type=mipi&get_display_reso").await.ok().flatten().unwrap_or_default();
@@ -275,7 +283,13 @@ impl RevopointDevice {
         }));
         // Give the stream request time to reach the device first (Revo: ~0.6 s).
         tokio::time::sleep(Duration::from_millis(600)).await;
-        self.ctl.cgi_ok("cam_type=mipi&set_trigger_mode=0").await?;
+        // From here on every failure ends the stream cleanly (emitters off, streams closed, lock
+        // released): a stream task left running would go on recording into a pass that does not
+        // exist, with nobody watching the disk.
+        if let Err(e) = self.ctl.cgi_ok("cam_type=mipi&set_trigger_mode=0").await {
+            self.shut_down_stream().await;
+            return Err(e);
+        }
         // Revo's SDK waits up to 20 s for the first frame (the stream task reconnects meanwhile:
         // the first stream after a boot often delivers nothing).
         if tokio::time::timeout(Duration::from_secs(20), first_packet.notified()).await.is_err() {
@@ -641,5 +655,123 @@ fn latest(rx: &mut broadcast::Receiver<ImuSample>) -> Option<ImuSample> {
             Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
             Err(_) => return last,
         }
+    }
+}
+
+#[cfg(test)]
+mod fake_scanner_tests {
+    //! The driver against a fake POP 4 on localhost (control and media CGI over HTTP), for the
+    //! error paths of a stream start, which a real scanner rarely shows.
+
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpListener;
+
+    // Excerpt of a POP 4 camparam.yaml (no device ID).
+    const YAML: &str = r#"%YAML:1.0
+---
+width: "1280"
+height: "1024"
+pL: !!opencv-matrix
+   rows: 3
+   cols: 4
+   dt: d
+   data: [ 1.4845567582803628e+03, 0., 3.4120636749267578e+02, 0., 0.,
+       1.4845567582803628e+03, 4.8513208770751953e+02, 0., 0., 0., 1.,
+       0. ]
+pR: !!opencv-matrix
+   rows: 3
+   cols: 4
+   dt: d
+   data: [ 1.4845567582803628e+03, 0., 9.5103775787353516e+02,
+       -1.7603769057400405e+05, 0., 1.4845567582803628e+03,
+       4.8513208770751953e+02, 0., 0., 0., 1., 0. ]
+"#;
+
+    /// A fake scanner: answers every control query with success except `fail` (when given), and
+    /// streams packets on the media CGI until the client goes away. Returns its address and the
+    /// number of media connections open now.
+    async fn fake_scanner(fail: Option<&'static str>) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let open = Arc::new(AtomicUsize::new(0));
+        let media = open.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let media = media.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match sock.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let path = String::from_utf8_lossy(&head).split_whitespace().nth(1).unwrap_or("").to_string();
+                    if path.contains("zx_media.cgi") {
+                        media.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n").await;
+                        // JPEG-like packets: plausible to the packet parser, recorded as received.
+                        let mut packet = crate::media::PACKET_MAGIC.to_vec();
+                        packet.extend_from_slice(&64u32.to_le_bytes());
+                        packet.extend_from_slice(&[0xff, 0xd8, 0xff]);
+                        packet.resize(8 + 64, 0);
+                        while sock.write_all(&packet).await.is_ok() && sock.flush().await.is_ok() {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        }
+                        media.fetch_sub(1, Ordering::SeqCst);
+                        return;
+                    }
+                    let (status, body) = if path.contains("download=/data/camparam/camparam.yaml") {
+                        ("200 OK", YAML.to_string())
+                    } else if path.contains("download=") {
+                        ("404 Not Found", String::new())
+                    } else if fail.is_some_and(|f| path.contains(f)) {
+                        ("200 OK", r#"{"result":-1}"#.to_string())
+                    } else {
+                        ("200 OK", r#"{"result":0,"return":0}"#.to_string())
+                    };
+                    let reply = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = sock.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        (addr, open)
+    }
+
+    async fn wait_for(limit: Duration, f: impl Fn() -> bool) -> bool {
+        let t0 = tokio::time::Instant::now();
+        while !f() {
+            if t0.elapsed() > limit {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        true
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_trigger_mode_command_ends_the_stream_and_its_recording() {
+        let (addr, media) = fake_scanner(Some("set_trigger_mode")).await;
+        let mut dev = RevopointDevice::new_wifi(&addr, "D00000000B0S00E1B".into()).await.expect("the fake scanner connects");
+        let dir = std::env::temp_dir().join(format!("scancraft-revo-trigger-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let target = scancraft_driver::RecordingTarget::new(dir.join("raw.bin"), dir.join("raw_rgb.bin"), false);
+        let stats = target.main_stats.clone();
+        assert!(dev.set_recording(Some(target)));
+        let started = dev.start_scan(&ScanConfig::default()).await;
+        assert!(started.is_err(), "the trigger mode was refused, so the scan must fail");
+        // The stream is ended (not left recording into a pass the app does not have), the
+        // scanner is let go, and the recording is closed.
+        assert!(wait_for(Duration::from_secs(5), || media.load(Ordering::SeqCst) == 0).await, "the media stream is still open");
+        assert!(wait_for(Duration::from_secs(5), || stats.finished.load(Ordering::SeqCst)).await, "the raw recording is still being written");
+        assert!(dev.lock.is_none(), "the scanner lock is still held");
+        let size = std::fs::metadata(dir.join("raw.bin")).map(|m| m.len()).unwrap_or(0);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(std::fs::metadata(dir.join("raw.bin")).map(|m| m.len()).unwrap_or(0), size, "the recording still grows");
+        let _ = dev.disconnect().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -298,6 +298,8 @@ pub struct PosesPreview {
 /// How long a toast stays up; one that offers a choice stays longer.
 const TOAST_SECONDS: f32 = 6.0;
 const CHOICE_TOAST_SECONDS: f32 = 20.0;
+/// How often a running capture's capture files are written next to its recording.
+const CAPTURE_FILES_EVERY: Duration = Duration::from_secs(30);
 
 /// A choice a toast offers besides Undo.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -404,6 +406,9 @@ pub struct ScanCraftApp {
     pub prefs_path: Option<std::path::PathBuf>,
     /// Working folders a crash left behind, waiting for the Open / Discard / Later question.
     pub recovery: Option<Vec<scancraft_io::workdir::Leftover>>,
+    /// Staging folders with raw recordings of never-saved projects that a crash left behind
+    /// (path, bytes), waiting for the Keep / Delete question.
+    pub orphan_captures: Vec<(std::path::PathBuf, u64)>,
     /// A project another computer has open, waiting for Take Over / Open Read-Only / Cancel.
     pub lock_prompt: Option<crate::storage::LockPrompt>,
     /// A save that would replace someone else's version, waiting for Save Anyway / Save As… /
@@ -506,6 +511,8 @@ pub struct ScanCraftApp {
     /// Last check of the recording drive's free space and of dropped records while capturing.
     recording_check: Option<Instant>,
     recording_dropped_seen: u64,
+    /// When the running capture's capture files were last written next to its recording.
+    capture_files_written: Option<Instant>,
     /// Free space a drive needs for a recording to start, and below which a running one stops
     /// (`crate::capture::MIN_FREE_TO_START` / `MIN_FREE_WHILE_RECORDING`; tests lower them).
     pub min_free_to_record: (u64, u64),
@@ -584,6 +591,7 @@ impl ScanCraftApp {
             prefs: Default::default(),
             prefs_path: None,
             recovery: None,
+            orphan_captures: Vec::new(),
             lock_prompt: None,
             save_conflict: None,
             mesh: None,
@@ -643,6 +651,7 @@ impl ScanCraftApp {
             record_simulator: false,
             reserved_pass: None,
             recording_check: None,
+            capture_files_written: None,
             recording_dropped_seen: 0,
             min_free_to_record: (crate::capture::MIN_FREE_TO_START, crate::capture::MIN_FREE_WHILE_RECORDING),
         };
@@ -1014,8 +1023,12 @@ impl ScanCraftApp {
         let pass = match self.continue_pass {
             Some(id) => id,
             None => {
-                let id = self.next_pass_id;
-                self.next_pass_id += 1;
+                // Never the id of a pass folder already on disk (recorded, not saved, crashed).
+                let mut id = self.next_pass_id;
+                while self.pass_folder_taken(id) {
+                    id += 1;
+                }
+                self.next_pass_id = id + 1;
                 self.reserved_pass = Some(id);
                 id
             }
@@ -1084,11 +1097,59 @@ impl ScanCraftApp {
             return Err(format!("only {} free on the drive of {}", scancraft_io::fsutil::format_bytes(free), dir.display()));
         }
         let pass_dir = dir.join(scancraft_io::project::pass_dir(pass));
-        let main = pass_dir.join("raw.bin");
-        // A continued pass appends to its recording; a new pass starts one.
-        let append = self.continue_pass == Some(pass) && main.is_file();
-        let target = scancraft_driver::RecordingTarget::new(main, pass_dir.join("raw_rgb.bin"), append);
+        let (main, rgb) = (pass_dir.join("raw.bin"), pass_dir.join("raw_rgb.bin"));
+        // A continued pass appends to its recording; a new pass starts one. A continued pass whose
+        // recording is not in this folder (still in the staging folder after a save that could
+        // not move it, or in the read-only original) and a file that already holds a recording
+        // get files of their own for this session (`raw-<n>.bin`): no recording is written over.
+        let continued = self.continue_pass == Some(pass);
+        let log = self.passes.iter().find(|p| p.id == pass).and_then(|p| p.meta.capture.clone());
+        let (sessions, recorded_before) = log.as_ref().and_then(|l| l.lock().ok().map(|l| (l.record.captures.len(), l.has_raw()))).unwrap_or((0, false));
+        let holds = |p: &std::path::Path| std::fs::metadata(p).is_ok_and(|m| m.len() > 0);
+        let target = if continued && main.is_file() {
+            scancraft_driver::RecordingTarget::new(main, rgb, true)
+        } else if !holds(&main) && !holds(&rgb) && !(continued && recorded_before) {
+            scancraft_driver::RecordingTarget::new(main, rgb, false)
+        } else {
+            let mut n = sessions.max(1);
+            while holds(&pass_dir.join(format!("raw-{n}.bin"))) || holds(&pass_dir.join(format!("raw_rgb-{n}.bin"))) {
+                n += 1;
+            }
+            scancraft_driver::RecordingTarget::new(pass_dir.join(format!("raw-{n}.bin")), pass_dir.join(format!("raw_rgb-{n}.bin")), false)
+        };
         Ok(Some((target, pass_dir)))
+    }
+
+    /// Whether pass folder `id` already holds files where this tab records (or in its project
+    /// folder): a pass recorded but never saved before a crash. Its id is not given to a new pass.
+    fn pass_folder_taken(&self, id: u32) -> bool {
+        let name = scancraft_io::project::pass_dir(id);
+        [self.project.store.data_dir(), self.project.staging.clone()].into_iter().flatten().any(|d| std::fs::read_dir(d.join(&name)).is_ok_and(|mut e| e.next().is_some()))
+    }
+
+    /// "raw scan recordings (1.2 GB in <folder>)" when this tab's staging folder holds some (they
+    /// are in no saved project yet).
+    pub fn staged_raw_note(&self) -> Option<String> {
+        let dir = self.project.staging.as_ref()?;
+        let bytes: u64 = raw_files_in(dir).iter().map(|f| f.1).sum();
+        (bytes > 0).then(|| format!("raw scan recordings ({} in {})", scancraft_io::fsutil::format_bytes(bytes), dir.display()))
+    }
+
+    /// Pass folders in the project folder with a recording or capture record of a pass the
+    /// project does not have (scanned, never saved).
+    pub fn unsaved_pass_folders(&self) -> Vec<u32> {
+        let Some(dir) = self.project.store.data_dir() else { return Vec::new() };
+        let mut ids: Vec<u32> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_prefix("pass-")).and_then(|n| n.parse::<u32>().ok()).map(|id| (id, e.path())))
+            .filter(|(id, _)| !self.passes.iter().any(|p| p.id == *id))
+            .filter(|(_, path)| std::fs::read_dir(path).into_iter().flatten().flatten().any(|f| f.file_name().to_str().is_some_and(|n| n == "capture.json" || scancraft_io::capture::is_raw_stream_name(n))))
+            .map(|(id, _)| id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Notes something about the running capture in its pass's capture record.
@@ -1110,14 +1171,24 @@ impl ScanCraftApp {
         }
         self.recording_check = Some(Instant::now());
         let Some(capture) = self.active_pass.and_then(|id| self.passes.iter().find(|p| p.id == id)).and_then(|p| p.meta.capture.clone()) else { return };
-        let (stats, dropped) = match capture.lock() {
-            Ok(log) => (log.recording_stats(), log.dropped_records()),
+        let (stats, dropped, dir) = match capture.lock() {
+            Ok(mut log) => {
+                log.refresh();
+                (log.recording_stats(), log.dropped_records(), log.record_root.clone())
+            }
             Err(_) => return,
         };
         if stats.is_empty() {
             return;
         }
-        let dir = self.project.store.data_dir().filter(|_| self.project.staging.is_none()).or_else(|| self.project.staging.clone());
+        // The capture files are kept current while recording (a crash loses at most this much
+        // of the tracking log; the raw streams are flushed by their writers).
+        if self.capture_files_written.is_none_or(|t| t.elapsed() >= CAPTURE_FILES_EVERY) {
+            self.capture_files_written = Some(Instant::now());
+            if let Some(id) = self.active_pass {
+                write_capture_files(capture.clone(), id, false);
+            }
+        }
         if let Some(free) = dir.and_then(|d| scancraft_io::fsutil::free_space(&d).ok()) {
             if free < self.min_free_to_record.1 && !stats.iter().all(|s| s.stop.load(Ordering::Relaxed)) {
                 for s in &stats {
@@ -1349,6 +1420,12 @@ impl ScanCraftApp {
                     self.live_ai_status = None;
                     // The capture record of the pass: one session per capture.
                     let session = self.begin_capture_record(id, &scan_config, &config, &start, verb == "Continuing");
+                    // The recording describes itself from the start (calibration, stream layout,
+                    // offsets): after a crash it can still be decoded.
+                    if let Some((capture, _)) = &session {
+                        write_capture_files(capture.clone(), id, false);
+                    }
+                    self.capture_files_written = Some(Instant::now());
                     let (tx, urx) = mpsc::channel(4);
                     self.updates = Some(urx);
                     self.fps.clear();
@@ -1398,10 +1475,27 @@ impl ScanCraftApp {
                         }
                     }
                     let points = finished.and_then(|id| self.passes.iter().find(|p| p.id == id)).map(|p| p.layer.len()).unwrap_or(0);
-                    // A pass that caught nothing is not kept.
-                    self.passes.retain(|p| p.layer.len() > 0 || Some(p.id) != finished);
+                    // A pass that caught nothing is not kept, unless it recorded its raw streams:
+                    // that recording is what re-running the tracking offline needs. It stays as
+                    // an unplaced pass, out of the merge, so the next pass can be the reference.
+                    let recorded = |p: &ScanPass| p.meta.capture.as_ref().and_then(|c| c.lock().ok().map(|l| l.has_raw() && (l.raw_bytes() > 0 || l.recording_stats().iter().any(|s| s.max_queued_bytes.load(Ordering::Relaxed) > 0)))).unwrap_or(false);
+                    let mut kept_empty = false;
+                    if let Some(pass) = finished.and_then(|id| self.passes.iter_mut().find(|p| p.id == id)).filter(|p| p.layer.len() == 0) {
+                        if recorded(pass) {
+                            kept_empty = true;
+                            pass.meta.alignment = AlignState::Unaligned;
+                            pass.meta.included = false;
+                        }
+                    }
+                    self.passes.retain(|p| p.layer.len() > 0 || Some(p.id) != finished || kept_empty);
+                    // A capture changes the project (also one that caught no point).
+                    self.next_generation += 1;
                     self.fit_view();
-                    self.say(Tone::Normal, format!("Capture stopped · {} points", thousands(points)));
+                    if kept_empty {
+                        self.say(Tone::Warning, "Capture stopped · no points; the pass is kept for its raw recording (unplaced, not merged)");
+                    } else {
+                        self.say(Tone::Normal, format!("Capture stopped · {} points", thousands(points)));
+                    }
                 }
                 DeviceEvent::Paused(paused) => {
                     if matches!(self.capture, Capture::Running | Capture::Paused) {
@@ -3066,6 +3160,16 @@ impl ScanCraftApp {
                         }
                     }
                     self.tool = None;
+                    // Raw recordings that could not be moved into the project: the tab stays open
+                    // (closing it would delete them) and the project counts as unsaved.
+                    if let Some(staging) = self.project.staging.clone() {
+                        self.pending_close = false;
+                        if self.save_all_queue.take().is_some() {
+                            self.quit_confirmed = false;
+                        }
+                        self.say(Tone::Error, format!("{message} · the raw recordings are still in {}: save again (to a drive with room) before closing", staging.display()));
+                        continue;
+                    }
                     self.say(Tone::Success, message);
                     if std::mem::take(&mut self.pending_close) {
                         self.close_active_tab();
@@ -3138,9 +3242,63 @@ impl ScanCraftApp {
     }
 }
 
+/// The raw recordings in the pass folders of `dir` (a staging folder): (path, size).
+pub(crate) fn raw_files_in(dir: &std::path::Path) -> Vec<(std::path::PathBuf, u64)> {
+    let mut files = Vec::new();
+    for pass in std::fs::read_dir(dir).into_iter().flatten().flatten().filter(|e| e.file_name().to_string_lossy().starts_with("pass-")) {
+        for f in std::fs::read_dir(pass.path()).into_iter().flatten().flatten() {
+            if f.file_name().to_str().is_some_and(scancraft_io::capture::is_raw_stream_name) {
+                files.push((f.path(), f.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
+    }
+    files
+}
+
 /// Whether a staging folder still holds a raw recording.
 pub(crate) fn staging_holds_raw(dir: &std::path::Path) -> bool {
-    std::fs::read_dir(dir).into_iter().flatten().flatten().any(|e| e.path().join("raw.bin").is_file() || e.path().join("raw_rgb.bin").is_file())
+    !raw_files_in(dir).is_empty()
+}
+
+/// Staging folders (`<working-folder root>/captures/<pid>-<ms>`) of ScanCraft processes that are
+/// no longer running and that still hold raw recordings: scans of a project that was never
+/// saved, left by a crash. (path, bytes of recordings)
+pub fn orphaned_captures(roots: &[std::path::PathBuf]) -> Vec<(std::path::PathBuf, u64)> {
+    let mut found = Vec::new();
+    for root in roots {
+        for e in std::fs::read_dir(root.join("captures")).into_iter().flatten().flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Some(pid) = name.split('-').next().and_then(|p| p.parse::<u32>().ok()) else { continue };
+            if pid == std::process::id() || scancraft_io::lock::process_alive(pid) {
+                continue;
+            }
+            let files = raw_files_in(&e.path());
+            if !files.is_empty() {
+                found.push((e.path(), files.iter().map(|f| f.1).sum()));
+            }
+        }
+    }
+    found
+}
+
+/// Writes a pass's capture files (record, tracking log, calibration) next to its raw recording
+/// (`CaptureLog::record_root`), in the background; with `wait`, once the recorders have written
+/// everything out (a capture that just stopped).
+pub(crate) fn write_capture_files(capture: crate::capture::SharedCapture, id: u32, wait: bool) {
+    let Some(dir) = capture.lock().ok().and_then(|l| l.record_root.clone().filter(|_| l.has_raw())) else { return };
+    std::thread::spawn(move || {
+        if wait {
+            let stats = capture.lock().map(|l| l.recording_stats()).unwrap_or_default();
+            scancraft_driver::recording::wait_finished(&stats, Duration::from_secs(30));
+        }
+        let Ok(mut log) = capture.lock() else { return };
+        // Not into a folder that is gone (the tab was closed and its staging folder removed).
+        if dir.is_dir() {
+            if let Err(e) = crate::capture::write(&dir, id, &mut log) {
+                log::warn!("capture record of pass {id}: {e}");
+            }
+        }
+    });
 }
 
 /// Removes a closed tab's staging folder (raw streams of a project that was never saved).
@@ -3204,25 +3362,11 @@ impl ScanCraftApp {
         let Some(pass) = pass.and_then(|id| self.passes.iter().find(|p| p.id == id)) else { return };
         let Some(capture) = pass.meta.capture.clone() else { return };
         let id = pass.id;
-        let recorded = capture.lock().map(|mut l| {
+        if let Ok(mut l) = capture.lock() {
             l.end();
-            l.has_raw_in_project()
-        });
-        if recorded.unwrap_or(false) {
-            let dir = self.project.store.data_dir().filter(|_| self.project.staging.is_none()).or_else(|| self.project.staging.clone());
-            if let Some(dir) = dir.filter(|d| !matches!(self.project.store, crate::storage::Store::ReadOnly { .. }) || self.project.staging.as_deref() == Some(d.as_path())) {
-                // In the background: the recorders may still be flushing.
-                std::thread::spawn(move || {
-                    let stats = capture.lock().map(|l| l.recording_stats()).unwrap_or_default();
-                    scancraft_driver::recording::wait_finished(&stats, Duration::from_secs(30));
-                    if let Ok(mut log) = capture.lock() {
-                        if let Err(e) = crate::capture::write(&dir, id, &mut log) {
-                            log::warn!("capture record of pass {id}: {e}");
-                        }
-                    }
-                });
-            }
         }
+        // In the background: the recorders may still be flushing.
+        write_capture_files(capture, id, true);
     }
 }
 
@@ -5926,7 +6070,7 @@ mod tests {
         let file = scancraft_io::project::load_project(&folder).unwrap().0;
         assert_eq!(file.notes, "Metal bracket, scanning spray (vanishes within hours)");
         let device = &file.passes[0].device;
-        assert!(device["serial_number"].as_str().unwrap().starts_with("sha256:"), "no serial number in the project: {device}");
+        assert!(device["serial_number"].as_str().unwrap().starts_with(scancraft_io::capture::SERIAL_HASH_PREFIX), "no serial number in the project: {device}");
         assert!(!std::fs::read_to_string(folder.join("pass-1/capture.json")).unwrap().contains("SIM-SCAN-001"));
         assert!(file.settings["saved_by"]["git_commit"].as_str().is_some_and(|c| !c.is_empty()));
 
@@ -6071,5 +6215,304 @@ mod tests {
         app.disconnect();
         pump(app, Duration::from_secs(5), "the disconnect", &|a| a.connection.is_none() && !a.connecting);
         simulator(app, motion);
+    }
+
+    // ------------------------------------------------------------------ recordings kept safe
+
+    /// A simulator app that records its raw streams like a real scanner.
+    fn recording_app(dir: &std::path::Path) -> ScanCraftApp {
+        let mut app = app();
+        app.prefs.work_root = Some(dir.join("work"));
+        app.record_simulator = true;
+        app.min_free_to_record = (200 << 20, 100 << 20);
+        simulator(&mut app, scancraft_driver::mock::MockMotion { period_ms: 90, ..Default::default() });
+        app
+    }
+
+    /// Waits until the recorders of pass `id` have written everything out.
+    fn recorded(app: &ScanCraftApp, id: u32) {
+        let stats = capture_of(app, id).lock().unwrap().recording_stats();
+        assert!(scancraft_driver::recording::wait_finished(&stats, Duration::from_secs(30)), "the recording of pass {id} is still being written");
+    }
+
+    /// Continues pass `id` for `frames` more processed frames, stopped cleanly.
+    fn continue_pass(app: &mut ScanCraftApp, id: u32, frames: usize) {
+        let before = logged(app, id);
+        app.continue_scan(id);
+        pump(app, Duration::from_secs(20), "the capture to continue", &|a| a.capture == Capture::Running);
+        pump(app, Duration::from_secs(120), "frames to be tracked", &|a| logged(a, id) >= before + frames);
+        app.stop_scan();
+        pump(app, Duration::from_secs(20), "the capture to stop", &|a| a.capture == Capture::Idle);
+    }
+
+    fn file_len(p: &std::path::Path) -> u64 {
+        std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+    }
+
+    #[test]
+    fn a_pass_recorded_but_never_saved_keeps_its_id_and_its_recording_after_a_crash() {
+        let dir = temp_dir("crash-pass-id");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        assert!(!app.dirty(), "{}", app.status);
+        // Pass 2 is recorded straight into the project folder, then the app stops without saving.
+        let second = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        assert_eq!(second, 2);
+        recorded(&app, second);
+        let raw = folder.join("pass-2/raw.bin");
+        let size = file_len(&raw);
+        assert!(size > 0);
+        release(&mut app);
+        app.disconnect();
+        drop(app);
+
+        let mut again = recording_app(&dir);
+        again.open_project(folder.clone());
+        wait_for_jobs(&mut again, Duration::from_secs(60));
+        assert_eq!(again.passes.len(), 1, "{}", again.status);
+        assert_eq!(again.unsaved_pass_folders(), vec![2]);
+        assert!(again.status.contains("pass-2") && again.status.contains("not in the project"), "{}", again.status);
+        let next = capture_pass(&mut again, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        assert_eq!(next, 3, "the id of the unsaved pass folder is not used again");
+        recorded(&again, next);
+        assert_eq!(file_len(&raw), size, "the unsaved recording was written over");
+        assert!(folder.join("pass-3/raw.bin").is_file());
+        release(&mut again);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_recordings_that_could_not_be_moved_are_kept_until_a_save_moves_them() {
+        let dir = temp_dir("staging-kept");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 8);
+        recorded(&app, id);
+        let staging = app.project.staging.clone().expect("a staging folder");
+        let session0 = file_len(&staging.join("pass-1/raw.bin"));
+        // The move into the project fails (as a copy onto a full drive does): a folder where the
+        // file should go.
+        std::fs::create_dir_all(folder.join("pass-1/raw.bin")).unwrap();
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        assert!(app.status.contains("still in"), "the save says the recordings are not in the project: {}", app.status);
+        assert_eq!(app.project.staging.as_deref(), Some(staging.as_path()));
+        assert_eq!(file_len(&staging.join("pass-1/raw.bin")), session0);
+        // Closing would delete them: it asks first.
+        assert!(app.dirty(), "recordings outside the project are unsaved work");
+        app.request_close_tab(app.active_tab);
+        assert_eq!(app.close_prompt, Some(ClosePrompt::Tab), "the tab closed without asking");
+        assert!(app.staged_raw_note().is_some_and(|n| n.contains(&staging.display().to_string())));
+        app.close_prompt = None;
+        // Continuing the pass now records into the project, into a file of its own (the first
+        // session's file is still in staging).
+        continue_pass(&mut app, id, 6);
+        recorded(&app, id);
+        assert!(folder.join("pass-1/raw-1.bin").is_file(), "the continued session has its own file");
+        // The next save that can, moves the first session in; nothing is lost or mixed.
+        std::fs::remove_dir(folder.join("pass-1/raw.bin")).unwrap();
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        assert!(app.project.staging.is_none() && !staging.exists() && !app.dirty(), "{}", app.status);
+        assert_eq!(file_len(&folder.join("pass-1/raw.bin")), session0);
+        let rows = logged(&app, id);
+        release(&mut app);
+        let r = crate::replay::replay_pass(&folder, id, crate::replay::ReplayFrames::Logged).unwrap();
+        let c = r.comparison.unwrap();
+        println!("two-file replay: {} rows, {} missing; {c:?}", r.rows.len(), r.missing);
+        assert_eq!((r.rows.len(), r.missing), (rows, 0));
+        assert!(c.state_differs == 0 && c.max_translation_mm < 0.05, "{c:?}");
+        assert!(r.rows.iter().any(|r| r.segment == 1), "the continued session was replayed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unsaved_capture_describes_itself_while_recording_and_is_offered_after_a_crash() {
+        let dir = temp_dir("orphan-captures");
+        let mut app = recording_app(&dir);
+        app.scan_config.color_texture = false;
+        app.start_scan();
+        pump(&mut app, Duration::from_secs(20), "the capture to start", &|a| a.capture == Capture::Running);
+        let id = app.active_pass.unwrap();
+        pump(&mut app, Duration::from_secs(60), "frames to be tracked", &|a| logged(a, id) >= 5);
+        let staging = app.project.staging.clone().unwrap();
+        let pass = staging.join("pass-1");
+        // While still recording: the record (with calibration and offsets) and the frames so far
+        // are on disk, not only at Stop.
+        pump(&mut app, Duration::from_secs(10), "the capture record", &|_| pass.join("capture.json").is_file() && pass.join("calibration").is_dir());
+        pump(&mut app, Duration::from_secs(10), "recorded bytes", &|_| file_len(&pass.join("raw.bin")) > 0);
+        app.stop_scan();
+        pump(&mut app, Duration::from_secs(20), "the capture to stop", &|a| a.capture == Capture::Idle);
+        recorded(&app, id);
+        // A crash leaves the staging folder of a process that is gone.
+        let root = dir.join("work");
+        let orphan = root.join("captures").join(format!("{}-1", dead_pid()));
+        pump(&mut app, Duration::from_secs(10), "the capture files", &|_| crate::capture::read(&staging, 1).is_some_and(|l| l.rows.len() >= 5));
+        copy_tree(&staging, &orphan);
+        let mut next = self::app();
+        next.prefs.work_root = Some(root.clone());
+        next.check_leftovers();
+        assert_eq!(next.orphan_captures.len(), 1, "only the dead process's folder: {:?}", next.orphan_captures);
+        assert_eq!(next.orphan_captures[0].0, orphan);
+        assert!(next.orphan_captures[0].1 > 0);
+        assert!(next.orphan_captures_message().contains(&orphan.display().to_string()));
+        // It can be replayed as it is (no project file).
+        assert_eq!(crate::replay::replay_pass_cli(&orphan, 1, false, None), 0);
+        next.delete_orphan_captures();
+        assert!(!orphan.exists() && next.orphan_captures.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap().flatten() {
+            let t = to.join(e.file_name());
+            if e.path().is_dir() {
+                copy_tree(&e.path(), &t);
+            } else {
+                std::fs::copy(e.path(), t).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn a_pass_without_points_is_kept_for_its_recording() {
+        let dir = temp_dir("empty-pass");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        // The part outside the depth window: frames arrive and are recorded, nothing is fused.
+        let window = (app.settings.min_mm, app.settings.max_mm);
+        (app.settings.min_mm, app.settings.max_mm) = (5000.0, 6000.0);
+        let empty = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        let pass = app.passes.iter().find(|p| p.id == empty).expect("the pass is kept");
+        assert_eq!(pass.layer.len(), 0);
+        assert!(!pass.meta.alignment.is_placed() && !pass.meta.included, "{:?}", pass.meta.alignment);
+        assert!(app.dirty());
+        (app.settings.min_mm, app.settings.max_mm) = window;
+        let full = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        assert_eq!(app.passes.iter().find(|p| p.id == full).unwrap().meta.alignment, AlignState::Reference, "the first pass with points is the reference");
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        let file = scancraft_io::project::load_project(&folder).unwrap().0;
+        let record = file.passes.iter().find(|p| p.id == empty).expect("the project names the empty pass");
+        assert_eq!(record.raw_recording.as_deref(), Some("pass-1/raw.bin"));
+        assert!(folder.join("pass-1/raw.bin").is_file() && folder.join("pass-1/capture.json").is_file());
+        release(&mut app);
+        let r = crate::replay::replay_pass(&folder, empty, crate::replay::ReplayFrames::Logged).unwrap();
+        assert!(r.rows.len() >= 5 && r.rows.iter().all(|r| r.state == "no_geometry"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_continued_pass_replays_each_session_with_its_own_settings_and_skips_unrecorded_ones() {
+        let dir = temp_dir("continued-replay");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 12);
+        // Session 1 is not recorded (recording turned off), session 2 again, with a depth
+        // window that leaves nothing of the scene: live, its frames have no geometry.
+        app.prefs.record_raw = false;
+        continue_pass(&mut app, id, 6);
+        app.prefs.record_raw = true;
+        let window = (app.settings.min_mm, app.settings.max_mm);
+        (app.settings.min_mm, app.settings.max_mm) = (5000.0, 6000.0);
+        continue_pass(&mut app, id, 6);
+        (app.settings.min_mm, app.settings.max_mm) = window;
+        recorded(&app, id);
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        let log = capture_of(&app, id);
+        let (rows, unrecorded, last) = {
+            let l = log.lock().unwrap();
+            let count = |s: u32| l.rows.iter().filter(|r| r.segment == s).count();
+            assert_eq!(l.record.captures.len(), 3);
+            assert_eq!(l.record.captures.iter().map(|c| c.recorded).collect::<Vec<_>>(), vec![Some(true), Some(false), Some(true)]);
+            assert_eq!(l.record.captures[2].settings["min_mm"].as_f64(), Some(5000.0), "each session keeps its settings");
+            assert!(l.rows.iter().filter(|r| r.segment == 2).all(|r| r.state == "no_geometry"));
+            (l.rows.len(), count(1), count(2))
+        };
+        release(&mut app);
+        let r = crate::replay::replay_pass(&folder, id, crate::replay::ReplayFrames::Logged).unwrap();
+        let c = r.comparison.unwrap();
+        println!("continued replay: {} rows, {} missing; {c:?}", r.rows.len(), r.missing);
+        assert_eq!(r.missing, unrecorded, "only the frames of the unrecorded session are missing");
+        assert_eq!(r.rows.len(), rows - unrecorded);
+        assert_eq!(r.rows.iter().filter(|r| r.segment == 2).count(), last);
+        assert!(r.rows.iter().all(|r| r.segment != 1));
+        assert!(c.state_differs == 0 && c.max_translation_mm < 0.05, "{c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_continued_pass_of_a_read_only_project_keeps_both_sessions_when_saved_elsewhere() {
+        let dir = temp_dir("read-only-continue");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 8);
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        recorded(&app, id);
+        let session0 = file_len(&folder.join("pass-1/raw.bin"));
+        release(&mut app);
+        app.disconnect();
+        drop(app);
+        foreign_lock(&folder, other_pc());
+
+        let mut other = recording_app(&dir);
+        other.open_project(folder.clone());
+        other.open_read_only();
+        wait_for_jobs(&mut other, Duration::from_secs(60));
+        assert_eq!(other.passes.len(), 1, "{}", other.status);
+        continue_pass(&mut other, id, 6);
+        recorded(&other, id);
+        let staging = other.project.staging.clone().expect("recorded into a staging folder");
+        assert!(staging.join("pass-1/raw-1.bin").is_file(), "the continued session has its own file");
+        let copy = dir.join("Bracket copy");
+        other.save_project(copy.clone());
+        wait_for_jobs(&mut other, Duration::from_secs(60));
+        assert!(other.project.staging.is_none(), "{}", other.status);
+        assert_eq!(file_len(&copy.join("pass-1/raw.bin")), session0);
+        assert!(file_len(&copy.join("pass-1/raw-1.bin")) > 0);
+        let rows = logged(&other, id);
+        release(&mut other);
+        let r = crate::replay::replay_pass(&copy, id, crate::replay::ReplayFrames::Logged).unwrap();
+        let c = r.comparison.unwrap();
+        assert_eq!((r.rows.len(), r.missing), (rows, 0), "{c:?}");
+        assert!(c.state_differs == 0 && c.max_translation_mm < 0.05, "{c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_added_pass_names_no_raw_file_of_this_project() {
+        let dir = temp_dir("added-raw");
+        let folder = dir.join("Bracket");
+        let mut app = recording_app(&dir);
+        let id = capture_pass(&mut app, ScanConfig { color_texture: false, ..ScanConfig::default() }, 5);
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        recorded(&app, id);
+        // The project added to itself: the added pass gets id 2, its recording stays in pass-1.
+        app.add_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        let added = app.passes.iter().find(|p| p.id != id).expect("the added pass");
+        let added_id = added.id;
+        assert_eq!(added.meta.raw_recording, None);
+        {
+            let log = added.meta.capture.as_ref().expect("its capture record").lock().unwrap();
+            assert!(log.record.raw_main.is_none() && log.record.raw_rgb.is_none());
+            assert_eq!(log.record.raw_source.as_deref(), Some(format!("Bracket, pass {id}").as_str()));
+            assert!(!log.rows.is_empty(), "the tracking log comes along");
+        }
+        app.save_project(folder.clone());
+        wait_for_jobs(&mut app, Duration::from_secs(60));
+        let file = scancraft_io::project::load_project(&folder).unwrap().0;
+        assert_eq!(file.passes.iter().find(|p| p.id == added_id).unwrap().raw_recording, None);
+        let err = crate::replay::replay_pass(&folder, added_id, crate::replay::ReplayFrames::Logged).err().expect("nothing to replay here");
+        assert!(err.contains("added from Bracket, pass 1"), "{err}");
+        release(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

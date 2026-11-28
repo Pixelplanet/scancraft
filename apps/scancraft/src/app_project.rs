@@ -234,35 +234,53 @@ impl SaveInput {
 /// How long a save waits for raw recordings that are still being written out.
 const RECORDING_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Moves the raw recordings (and capture files written next to them) of a staging folder
-/// (`ProjectInfo::staging`) into the project folder `to`: renamed when on the same drive, else
-/// copied and then removed. Files the project already has are not replaced.
+/// Moves the raw recordings of a staging folder (`ProjectInfo::staging`) into the project folder
+/// `to`: renamed when on the same drive, else copied (to a temporary name, renamed when complete,
+/// so a failed copy never leaves a partial file under the real name) and then removed. A file
+/// the project already has with the same size was moved before (the source is removed); one
+/// with other content is never replaced: that is an error and the staged file stays. Every
+/// file is tried; the first error is returned after all of them.
 pub(crate) fn move_raw_files(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
     let mut moved = 0;
-    for entry in std::fs::read_dir(from)?.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !entry.path().is_dir() || !name.starts_with("pass-") {
-            continue;
-        }
-        for file in std::fs::read_dir(entry.path())?.flatten() {
-            let fname = file.file_name().to_string_lossy().to_string();
-            if !matches!(fname.as_str(), "raw.bin" | "raw_rgb.bin") {
-                continue;
-            }
-            let dest = to.join(&name).join(&fname);
-            if dest.exists() && !scancraft_io::fsutil::stamp(&dest).is_some_and(|s| s.size == 0) {
-                // Recorded into the project already (a continued pass after the first save).
-                continue;
+    let mut failed: Option<std::io::Error> = None;
+    for (src, size) in crate::app::raw_files_in(from) {
+        let (Some(pass), Some(fname)) = (src.parent().and_then(|p| p.file_name()), src.file_name()) else { continue };
+        let dest = to.join(pass).join(fname);
+        let result = (|| -> std::io::Result<()> {
+            if let Ok(m) = std::fs::metadata(&dest) {
+                if m.len() == size {
+                    // Moved before (its removal from staging failed then).
+                    return std::fs::remove_file(&src);
+                }
+                if m.len() > 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists with other content", dest.display())));
+                }
+                std::fs::remove_file(&dest)?;
             }
             std::fs::create_dir_all(dest.parent().unwrap_or(to))?;
-            if std::fs::rename(file.path(), &dest).is_err() {
-                std::fs::copy(file.path(), &dest)?;
-                let _ = std::fs::remove_file(file.path());
+            if std::fs::rename(&src, &dest).is_ok() {
+                return Ok(());
             }
-            moved += 1;
+            let partial = dest.with_extension("bin.partial.tmp");
+            if let Err(e) = std::fs::copy(&src, &partial).and_then(|_| std::fs::rename(&partial, &dest)) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+            let _ = std::fs::remove_file(&src);
+            Ok(())
+        })();
+        match result {
+            Ok(()) => moved += 1,
+            Err(e) => {
+                log::warn!("raw recording {} not moved to {}: {e}", src.display(), dest.display());
+                failed.get_or_insert(e);
+            }
         }
     }
-    Ok(moved)
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(moved),
+    }
 }
 
 /// What a save says about moving the staged raw recordings: nothing when they moved, else why
@@ -416,9 +434,11 @@ impl ScanCraftApp {
         PASS_COLOURS[1 + k % (PASS_COLOURS.len() - 1)]
     }
 
-    /// Unsaved changes since the project was last saved or opened.
+    /// Unsaved changes since the project was last saved or opened. Raw recordings in a staging
+    /// folder (a project never saved, or a save that could not move them) count too: closing
+    /// the tab would delete them.
     pub fn dirty(&self) -> bool {
-        self.has_geometry() && self.next_generation != self.project.saved_generation
+        ((self.has_geometry() || !self.passes.is_empty()) && self.next_generation != self.project.saved_generation) || self.project.staging.is_some()
     }
 
     pub fn reference_pass(&self) -> Option<u32> {
@@ -1655,6 +1675,31 @@ impl ScanCraftApp {
             self.save_prefs();
         }
         self.recovery = (!ask.is_empty()).then_some(ask);
+        // Raw recordings of never-saved projects: not working folders, so listed on their own.
+        self.orphan_captures = crate::app::orphaned_captures(&self.prefs.work_roots());
+    }
+
+    /// The question about recordings of never-saved projects a crash left (see
+    /// `check_leftovers`).
+    pub fn orphan_captures_message(&self) -> String {
+        let mut lines = vec!["ScanCraft stopped while scanning a project that was never saved. Its raw recordings are still on disk:".to_string()];
+        for (dir, bytes) in &self.orphan_captures {
+            lines.push(format!("• {} ({})", dir.display(), scancraft_io::fsutil::format_bytes(*bytes)));
+        }
+        lines.push("Each pass-<n> folder can be replayed with scancraft --replay-pass <folder> <n>. Keep leaves them for later (asked again at the next start); Delete removes them.".to_string());
+        lines.join("
+")
+    }
+
+    /// Deletes the recordings of never-saved projects that a crash left.
+    pub fn delete_orphan_captures(&mut self) {
+        let list = std::mem::take(&mut self.orphan_captures);
+        let failed: Vec<String> = list.iter().filter_map(|(d, _)| std::fs::remove_dir_all(d).err().map(|e| format!("{} ({e})", d.display()))).collect();
+        if failed.is_empty() {
+            self.say(Tone::Normal, format!("Deleted {} unsaved recording folder{}", list.len(), if list.len() == 1 { "" } else { "s" }));
+        } else {
+            self.say(Tone::Error, format!("Could not delete {}", failed.join(", ")));
+        }
     }
 
     /// The recovery question's message.
@@ -1809,6 +1854,23 @@ impl ScanCraftApp {
         self.framed_radius = 0.0;
         self.fit_view();
         let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
+        // Pass folders on disk that the project file does not name: recorded, never saved (the app
+        // stopped first). Their ids are not used again, and the user is told where they are.
+        let unsaved = self.unsaved_pass_folders();
+        if let (Some(dir), false) = (self.project.store.data_dir(), unsaved.is_empty()) {
+            let names: Vec<String> = unsaved.iter().map(|id| scancraft_io::project::pass_dir(*id)).collect();
+            let notice = format!(
+                "{} in {} hold{} a recording that is not in the project (scanned, never saved); it is kept, replay it with --replay-pass",
+                names.join(", "),
+                dir.display(),
+                if names.len() == 1 { "s" } else { "" }
+            );
+            log::warn!("{notice}");
+            opened.notice = Some(match opened.notice.take() {
+                Some(n) => format!("{n} · {notice}"),
+                None => notice,
+            });
+        }
         if opened.recovered {
             self.say(Tone::Success, format!("Recovered {} · {passes} · Save writes the changes into the bundle", self.project.name));
         } else if opened.read_only {

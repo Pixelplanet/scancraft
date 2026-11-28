@@ -175,7 +175,7 @@ pass-<id>/raw.bin          main wire stream (POP 4: the media packets as receive
 pass-<id>/raw_rgb.bin      colour wire stream (POP 4: JPEG + u32 time stamp per packet)
 pass-<id>/capture.json     capture record: app (version, git commit, dirty, profile, target),
                            device (vendor, model, firmware, transport kind, resolutions, IMU
-                           mounting, serial only as sha256 hash, no IP), capabilities, scan
+                           mounting, serial only as a keyed hash, no IP), capabilities, scan
                            settings, app settings (depth window, point pitch, budget), tracker
                            settings, turntable (mode, filter settings, region found), calibration
                            file list, raw file names, log file name, and one entry per capture
@@ -191,8 +191,22 @@ pass-<id>/tracking.csv     one row per frame the live tracker processed: session
                            keyframe, new / total points, pose (quaternion, translation), IMU
                            quaternion, processing ms
 pass-<id>/calibration/     the calibration files the driver downloaded (POP 4: camparam.yaml,
-                           Prgb.bin, Distort.bin, LC_RT.bin, camparam_blue/*; serial blanked)
+                           Prgb.bin, Distort.bin, LC_RT.bin, camparam_blue/*; serial blanked),
+                           and for laser passes the planes each session started with
+                           (laser_planes-<session>.json)
+pass-<id>/raw-<n>.bin      a continued session that could not append to raw.bin (its first
+pass-<id>/raw_rgb-<n>.bin  recording was elsewhere): the session's own files, named by the
+                           session's `raw_file` / `raw_rgb_file` in capture.json
 ```
+
+Per session the record also says whether it recorded each stream (`recorded`, `rgb_recorded`),
+its app settings (`settings`: a continued session can have another depth window) and for laser
+lines where the planes came from (`laser_planes`). A replay gives each session only its own
+bytes, a fresh pipeline with its own settings, and the pass's one tracker, as live. A new
+recording never replaces a file that holds data, and a pass id whose folder exists on disk is not
+used again. Writers flush whenever their queue runs empty; the capture files are written at the
+start of a capture and every 30 s, so a recording survives a crash with what it needs. Staging
+folders of a crashed, never-saved project are offered at the next start.
 
 The raw files are recorded while scanning (writer thread, queue bounded at 192 MB; a full queue
 drops records and counts them, it never blocks the stream: HANDOFF §3). They go into the project

@@ -8,6 +8,8 @@
 mod ai_pack;
 mod ai_segment;
 mod alignment;
+#[cfg(test)]
+mod build_info;
 mod capture;
 mod app;
 mod cli;
@@ -133,6 +135,7 @@ impl eframe::App for ScanCraft {
         }
         crate::ui_ai::ai_pack_modal(&mut self.app, &ctx);
         ui_shell::recovery_prompt(&mut self.app, &ctx);
+        ui_shell::orphan_captures_prompt(&mut self.app, &ctx);
         ui_shell::lock_prompt(&mut self.app, &ctx);
         ui_shell::conflict_prompt(&mut self.app, &ctx);
         ui_shell::close_prompt(&mut self.app, &ctx);

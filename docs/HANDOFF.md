@@ -10,6 +10,20 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-28, later (branch `agent/integration`): review fixes of the capture records.**
+No recording is written over or deleted without asking any more: a new recording never replaces
+a file with data and a pass folder left by a crash keeps its id; Continue Pass waits for the
+previous writer; staged recordings that a save could not move keep the tab open (it counts as
+unsaved; the close question says what Discard deletes), and a continued session records into its
+own `raw-<n>.bin` when it cannot append. Writers flush continuously, capture files are written at
+the start and every 30 s, crash leftovers of never-saved projects are offered at the next start.
+A pass with no points is kept when it recorded. Replay: per-session byte ranges, pipelines and
+settings; laser planes recorded with the pass. Added passes name no foreign raw file. Serial hash
+keyed per computer. POP 4 driver: a failed trigger-mode command ends the stream. Build script:
+`git_dirty` right after unstaged edits. Scan-day checklist for the user:
+`E:\Claude\build\scancraft-scanday\SCAN-CHECKLIST.md` (outside the repo). List:
+[open-issues.md](open-issues.md) §4.2 "Review fixes".
+
 **Update 2026-11-28 (branch `agent/integration`): a scanned pass records everything needed to
 use it again offline.** Per pass: the raw wire streams (`pass-<id>/raw.bin`, `raw_rgb.bin`,
 recorded by default for real scanners through a non-blocking writer thread), `capture.json`
@@ -234,6 +248,11 @@ tests `a_scanned_pass_keeps_its_raw_stream_…`, `turntable_passes_…` (app) an
 `a_pop4_recording_replays_as_a_pass_and_twice_the_same` (`SCANCRAFT_POP4_RECORDING`,
 `SCANCRAFT_POP4_CAMPARAM`). Not reproduced: a Same Position pass's seed (it replays in its own
 frame), live AI masking, colour pairing that depended on arrival time (Color tracking only).
+A continued pass replays session by session (each with its own byte range, pipeline and
+settings; a session that recorded nothing is reported as missing frames). Laser passes use the
+planes recorded with the pass (or calibrate online as the live run did), never the plane cache of
+the PC replaying. A staging folder left by a crash (`<work root>\captures\<pid>-<ms>`, offered at
+the next start) replays too: pass the folder.
 
 ## 5. Next: tests with a moving scanner
 

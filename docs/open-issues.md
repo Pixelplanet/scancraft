@@ -931,8 +931,6 @@ on the simulator (handheld and turntable, Feature and Marker) and on a POP 4 Ful
 Still not recorded, and why:
 - **IMU samples between frames**: only the sample delivered with each frame (`tracking.csv`);
   firmware v5.3.99 reports the IMU off, so there is nothing to record today.
-- **The laser plane file** (`%LOCALAPPDATA%/ScanCraft/laser_planes_*.json`) is not copied into
-  laser passes; laser passes replay only on a PC with the same file.
 - **Same Position seeds**: a seeded pass replays in its own frame (the record says `seeded`).
 - **Live AI masks** applied to frames before tracking are not stored (the record says `live_ai`).
 - **Colour pairing by arrival time**: live, a depth frame gets the RGB frame that arrived within
@@ -945,3 +943,36 @@ Still not recorded, and why:
   `tracking.csv` and `calibration/` when it saves a project to another place.
 - The GUI `--replay` still takes only a marker recording + `camparam.yaml`; replaying a pass in
   the window (rather than headless) is not built.
+
+**Review fixes (2026-11-28, same branch).** A review of the capture records found ways to lose or
+mix up recordings; all fixed, each with a test:
+- A new recording never replaces a file that holds data, and a pass id whose folder is on disk
+  (scanned, never saved, then a crash) is not used again; opening such a project names the folder.
+- Continue Pass right after Stop waits for the earlier writer of the file (it may still drain a
+  backlog on a slow disk) instead of opening a second writer.
+- Staged recordings (a project not saved yet) are moved with a copy to a temporary name; a move
+  that fails is reported, never skipped; the tab stays open and counts as unsaved until a save
+  moves them, and the close question says Discard deletes them. A continued pass whose first file
+  is not where it records (still in staging, or a read-only original) records into `raw-<n>.bin`.
+- Writers hand their data to the operating system whenever the queue runs empty (sync every
+  10 s); `capture.json` + calibration are written when a capture starts and every 30 s. Staging
+  folders a crash left are offered at the next start (Keep / Delete), and `--replay-pass` takes
+  such a folder.
+- A pass that fused no point but recorded its streams is kept (unplaced, not merged).
+- Replay: each capture session gets its own byte range (sessions that recorded nothing take
+  none), its own pipeline and its own settings (stored per session now); the tracker carries
+  over, as live.
+- Laser passes: where the planes came from (cache, online, ...) is recorded per session and the
+  planes the session started with are kept as `calibration/laser_planes-<n>.json`; a replay
+  uses them, or calibrates online like the live run, and never reads or writes the plane cache
+  of the computer it runs on.
+- Added passes (Add Project / Add Passes) keep their capture record but name no raw file here;
+  the record says where the recording stays (`raw_source`).
+- The serial number is hashed with a secret key of the computer (HMAC,
+  `%LOCALAPPDATA%\ScanCraft\device-key`): with the known serial pattern the plain hash could be
+  reversed. (Names made by the first version start with `sha256:`, new ones with `hmac:`.)
+- The POP 4 driver ends the stream cleanly when the trigger-mode command fails (it kept
+  recording), and lets the scanner lock go when the format setup fails.
+- The build script also watches `apps/`, `crates/` and the manifests, so `git_dirty` is right
+  after an unstaged edit; with `SCANCRAFT_GIT_COMMIT` the flag still comes from git, else from
+  `SCANCRAFT_GIT_DIRTY`.

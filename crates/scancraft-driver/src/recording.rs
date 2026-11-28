@@ -21,6 +21,20 @@ use std::sync::{Arc, Condvar, Mutex};
 /// Default queue limit: about 30 s of a POP 4 depth stream (several MB/s).
 pub const DEFAULT_QUEUE_BYTES: usize = 192 << 20;
 
+/// How long [`RawRecorder::open`] waits for an earlier recorder of the same file to finish
+/// writing out its queue.
+pub const EARLIER_WRITER_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+/// While the queue is idle, written records are handed to the operating system at once (a crash
+/// of the app then loses nothing already written) and synced to the disk this often.
+pub const SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The recordings of this process, by file: a second recorder of a file waits for the first.
+fn active_writers() -> std::sync::MutexGuard<'static, Vec<(PathBuf, Arc<RecordStats>)>> {
+    static ACTIVE: Mutex<Vec<(PathBuf, Arc<RecordStats>)>> = Mutex::new(Vec::new());
+    ACTIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// Counters of one recording, shared between the writer thread and the app.
 #[derive(Debug, Default)]
 pub struct RecordStats {
@@ -149,18 +163,49 @@ pub struct RawRecorder {
 
 impl RawRecorder {
     /// Opens (or appends to) `path` and starts the writer thread.
+    ///
+    /// A new recording (`append == false`) never replaces a file that already holds data (a
+    /// pass id used again after a crash would otherwise truncate the only copy of a scan): that
+    /// is an [`std::io::ErrorKind::AlreadyExists`] error. When an earlier recorder of the same
+    /// file is still writing out its queue (a pass continued right after Stop, with a backlog on
+    /// a slow disk), this waits for it first, at most [`EARLIER_WRITER_WAIT`], and fails instead
+    /// of putting a second writer on the file when it is still writing after that.
     pub fn open(path: &Path, append: bool, stats: Arc<RecordStats>, queue_bytes: usize) -> std::io::Result<Self> {
         if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             std::fs::create_dir_all(dir)?;
         }
-        let file = if append { OpenOptions::new().create(true).append(true).open(path)? } else { File::create(path)? };
+        let key = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+        let earlier: Vec<Arc<RecordStats>> = active_writers().iter().filter(|(p, s)| *p == key && !s.finished.load(Ordering::SeqCst)).map(|(_, s)| s.clone()).collect();
+        if !earlier.is_empty() && !wait_finished(&earlier, EARLIER_WRITER_WAIT) {
+            return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, format!("{} is still being written by the previous recording", path.display())));
+        }
+        let file = if append {
+            OpenOptions::new().create(true).append(true).open(path)?
+        } else {
+            match OpenOptions::new().write(true).create_new(true).open(path) {
+                Ok(f) => f,
+                // An empty file (a recording that never got a record) may be replaced.
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if std::fs::metadata(path).map(|m| m.len()).unwrap_or(1) > 0 {
+                        return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} already holds a recording; it is not replaced", path.display())));
+                    }
+                    File::create(path)?
+                }
+                Err(e) => return Err(e),
+            }
+        };
         let offset = file.metadata().map(|m| m.len()).unwrap_or(0);
         stats.start_offset.store(offset, Ordering::Relaxed);
-        stats.finished.store(false, Ordering::Relaxed);
+        stats.finished.store(false, Ordering::SeqCst);
         let shared = Arc::new(Shared { queue: Mutex::new(Queue { items: VecDeque::new(), bytes: 0, closed: false }), ready: Condvar::new() });
         let (writer_shared, writer_stats) = (shared.clone(), stats.clone());
         let name = path.display().to_string();
         std::thread::Builder::new().name("raw-recorder".into()).spawn(move || write_loop(file, writer_shared, writer_stats, name))?;
+        {
+            let mut active = active_writers();
+            active.retain(|(_, s)| !s.finished.load(Ordering::SeqCst));
+            active.push((key, stats.clone()));
+        }
         Ok(Self { shared, stats, limit: queue_bytes.max(1 << 20), path: path.to_path_buf() })
     }
 
@@ -204,32 +249,76 @@ impl Drop for RawRecorder {
 }
 
 fn write_loop(file: File, shared: Arc<Shared>, stats: Arc<RecordStats>, name: String) {
+    enum Next {
+        Item(Vec<u8>),
+        /// Nothing queued: time to flush (and maybe sync) what was written.
+        Idle,
+        Closed,
+    }
     let mut out = Some(BufWriter::with_capacity(4 << 20, file));
+    // Written but not yet handed to the operating system / not yet synced to the disk.
+    let (mut unflushed, mut unsynced) = (false, false);
+    let mut last_sync = std::time::Instant::now();
     loop {
-        let item = {
+        let next = {
             let Ok(mut q) = shared.queue.lock() else { break };
             loop {
                 if let Some(item) = q.items.pop_front() {
                     q.bytes -= item.len();
                     stats.queued_bytes.store(q.bytes as u64, Ordering::Relaxed);
-                    break Some(item);
+                    break Next::Item(item);
                 }
                 if q.closed {
-                    break None;
+                    break Next::Closed;
                 }
-                q = match shared.ready.wait(q) {
-                    Ok(q) => q,
-                    Err(_) => return,
-                };
+                if unflushed {
+                    break Next::Idle;
+                }
+                if unsynced {
+                    let left = SYNC_INTERVAL.saturating_sub(last_sync.elapsed());
+                    if left.is_zero() {
+                        break Next::Idle;
+                    }
+                    q = match shared.ready.wait_timeout(q, left) {
+                        Ok((q, _)) => q,
+                        Err(_) => return,
+                    };
+                } else {
+                    q = match shared.ready.wait(q) {
+                        Ok(q) => q,
+                        Err(_) => return,
+                    };
+                }
             }
         };
-        let Some(item) = item else { break };
+        let item = match next {
+            Next::Closed => break,
+            Next::Idle => {
+                let sync = unsynced && last_sync.elapsed() >= SYNC_INTERVAL;
+                if let Some(w) = out.as_mut() {
+                    let done = w.flush().and_then(|_| if sync { w.get_ref().sync_data() } else { Ok(()) });
+                    if let Err(e) = done {
+                        log::warn!("raw recording {name} stopped: {e}");
+                        stats.set_error(e.to_string());
+                        out = None;
+                    }
+                }
+                unflushed = false;
+                if sync || out.is_none() {
+                    unsynced = false;
+                    last_sync = std::time::Instant::now();
+                }
+                continue;
+            }
+            Next::Item(item) => item,
+        };
         let stop = stats.stop.load(Ordering::Relaxed);
         match out.as_mut() {
             Some(w) if !stop => match w.write_all(&item) {
                 Ok(()) => {
                     stats.bytes_written.fetch_add(item.len() as u64, Ordering::Relaxed);
                     stats.records_written.fetch_add(1, Ordering::Relaxed);
+                    (unflushed, unsynced) = (true, true);
                 }
                 Err(e) => {
                     log::warn!("raw recording {name} stopped: {e}");
@@ -354,6 +443,77 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         true
+    }
+
+    #[test]
+    fn a_new_recording_never_replaces_an_existing_one() {
+        // A pass id used again after a crash: its raw.bin holds the only copy of that scan.
+        let dir = temp("exists");
+        let path = dir.join("pass-3").join("raw.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, vec![9u8; 5000]).unwrap();
+        let err = RawRecorder::open(&path, false, RecordStats::new(), 1 << 20).err().expect("refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&path).unwrap(), vec![9u8; 5000], "the earlier recording is untouched");
+        // An empty leftover may be replaced.
+        let empty = dir.join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let stats = RecordStats::new();
+        let rec = RawRecorder::open(&empty, false, stats.clone(), 1 << 20).unwrap();
+        rec.push(vec![1; 10]);
+        drop(rec);
+        assert!(wait_finished(&[stats], std::time::Duration::from_secs(5)));
+        assert_eq!(std::fs::read(&empty).unwrap().len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_continuation_waits_for_the_earlier_writer_of_its_file() {
+        // Stop with a backlog in the queue, then Continue at once: the second recorder must not
+        // write while the first one still drains, and starts where the first one ended.
+        let dir = temp("drain");
+        let path = dir.join("raw.bin");
+        let first = RecordStats::new();
+        let rec = RawRecorder::open(&path, false, first.clone(), DEFAULT_QUEUE_BYTES).unwrap();
+        const RECORDS: usize = 96;
+        for i in 0..RECORDS {
+            rec.push(vec![(i % 200) as u8; 1 << 20]);
+        }
+        drop(rec);
+        let second = RecordStats::new();
+        let rec = RawRecorder::open(&path, true, second.clone(), DEFAULT_QUEUE_BYTES).unwrap();
+        assert!(first.finished.load(Ordering::SeqCst), "the earlier writer finished before the file was opened again");
+        let written = first.bytes_written.load(Ordering::Relaxed);
+        assert_eq!(written, (RECORDS as u64) << 20, "nothing of the first session was dropped");
+        assert_eq!(second.start_offset.load(Ordering::Relaxed), written);
+        for _ in 0..4 {
+            rec.push(vec![0xEE; 1 << 20]);
+        }
+        drop(rec);
+        assert!(wait_finished(&[second.clone()], std::time::Duration::from_secs(30)));
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes.len() as u64, written + (4 << 20));
+        assert!(bytes[written as usize..].iter().all(|&b| b == 0xEE), "the continuation is intact after the first session");
+        assert!(bytes[..written as usize].chunks(1 << 20).enumerate().all(|(i, c)| c.iter().all(|&b| b == (i % 200) as u8)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn written_records_reach_the_file_while_recording() {
+        // A crash of the app must not lose what was already written: the buffer is handed to the
+        // operating system whenever the queue runs empty, not only at the end.
+        let dir = temp("flush");
+        let path = dir.join("raw.bin");
+        let stats = RecordStats::new();
+        let rec = RawRecorder::open(&path, false, stats.clone(), 1 << 20).unwrap();
+        for i in 0..10u8 {
+            rec.push(vec![i; 1000]);
+        }
+        assert!(wait_until(|| std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) == 10_000), "the records are in the file before the recording ends");
+        assert!(!stats.finished.load(Ordering::SeqCst));
+        drop(rec);
+        assert!(wait_finished(&[stats], std::time::Duration::from_secs(5)));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

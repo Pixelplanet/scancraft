@@ -44,8 +44,8 @@ pub fn version_label() -> String {
 /// the network address left out (projects are shared as test data).
 pub fn sanitized_device(info: &DeviceInfo) -> DeviceInfo {
     let mut d = info.clone();
-    if !d.serial_number.starts_with("sha256:") {
-        d.serial_number = files::serial_hash(&d.serial_number);
+    if !files::is_serial_hash(&d.serial_number) {
+        d.serial_number = files::serial_hash(&d.serial_number, &files::install_key());
     }
     if let DeviceTransport::WiFi { ip, .. } = &mut d.active_transport {
         *ip = String::new();
@@ -65,12 +65,16 @@ pub struct LiveRecording {
 }
 
 /// A pass's capture record, tracking log and calibration files (see the module docs).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CaptureLog {
     pub record: CaptureRecord,
     pub rows: Vec<TrackRow>,
     pub calibration: Vec<(String, Vec<u8>)>,
     pub live: Vec<LiveRecording>,
+    /// The folder (project, working or staging folder) the running or last session recorded its
+    /// raw streams into: its capture files are written there too, at the start, while
+    /// recording and at the end, so a recording describes itself even after a crash.
+    pub record_root: Option<PathBuf>,
     /// When the running session started (host clock), for row and event times.
     session_start: Option<Instant>,
 }
@@ -119,7 +123,7 @@ impl CaptureLog {
             r.scan_config = config_json.clone();
             r.device = s.device.map(|d| serde_json::to_value(sanitized_device(d)).unwrap_or_default()).unwrap_or_default();
             r.capabilities = s.capabilities.map(|c| serde_json::to_value(c).unwrap_or_default()).unwrap_or_default();
-            r.settings = s.settings;
+            r.settings = s.settings.clone();
             r.tracker = s.tracker;
             r.tracking_log = Some("tracking.csv".into());
             r.turntable = turntable_json(s.scan_config, None);
@@ -140,21 +144,12 @@ impl CaptureLog {
             Some(t) => (files_written.contains(&t.main), files_written.contains(&t.rgb)),
             None => (false, false),
         };
-        if let Some(t) = s.target.filter(|_| main_on) {
-            r.raw_main = Some(name(&t.main));
-        }
-        if let Some(t) = s.target.filter(|_| rgb_on) {
-            r.raw_rgb = Some(name(&t.rgb));
-        }
-        // Recorded elsewhere (SCANCRAFT_RECORD_DIR): the absolute files.
-        if s.target.is_none() {
-            if let Some(f) = files_written.first() {
-                r.raw_main.get_or_insert_with(|| f.display().to_string());
-            }
-            if let Some(f) = files_written.get(1) {
-                r.raw_rgb.get_or_insert_with(|| f.display().to_string());
-            }
-        }
+        // The files this session wrote: the target's, or (SCANCRAFT_RECORD_DIR) the absolute
+        // ones the driver chose, one pair per session.
+        let (main_file, rgb_file) = match s.target {
+            Some(t) => (main_on.then(|| name(&t.main)), rgb_on.then(|| name(&t.rgb))),
+            None => (files_written.first().map(|f| f.display().to_string()), files_written.get(1).map(|f| f.display().to_string())),
+        };
         let (started_utc, started_unix_ms) = utc_now();
         let mut segment = CaptureSegment {
             started_utc,
@@ -164,14 +159,35 @@ impl CaptureLog {
             live_ai: s.live_ai,
             scan_config: config_json,
             stream: s.info.map(|i| i.stream.clone()).unwrap_or_default(),
+            recorded: Some(main_file.is_some()),
+            rgb_recorded: Some(rgb_file.is_some()),
+            settings: s.settings,
             ..Default::default()
         };
+        // The first recorded file is the pass's; a session in another file names its own.
+        if let Some(f) = main_file {
+            match &r.raw_main {
+                None => r.raw_main = Some(f),
+                Some(m) if *m != f => segment.raw_file = Some(f),
+                Some(_) => {}
+            }
+        }
+        if let Some(f) = rgb_file {
+            match &r.raw_rgb {
+                None => r.raw_rgb = Some(f),
+                Some(m) if *m != f => segment.raw_rgb_file = Some(f),
+                Some(_) => {}
+            }
+        }
         if let Some(t) = s.target {
             segment.raw_offset = if main_on { t.main_stats.start_offset.load(std::sync::atomic::Ordering::Relaxed) } else { 0 };
             segment.raw_rgb_offset = if rgb_on { t.rgb_stats.start_offset.load(std::sync::atomic::Ordering::Relaxed) } else { 0 };
         }
         if let Some(why) = &s.not_recorded {
             segment.events.push(CaptureEvent { t_ms: 0, what: format!("raw streams not recorded: {why}") });
+        }
+        if main_on || rgb_on {
+            self.record_root = s.pass_dir.and_then(|d| d.parent()).map(Path::to_path_buf);
         }
         r.captures.push(segment);
         let index = r.captures.len() - 1;
@@ -204,6 +220,32 @@ impl CaptureLog {
             seg.duration_s = (duration * 10.0).round() / 10.0;
         }
         self.refresh();
+    }
+
+    /// Laser lines: where session `segment`'s planes came from; the planes it started with are
+    /// kept as a calibration file (`laser_planes-<segment>.json`), so a replay uses the same
+    /// ones whatever the plane cache of the computer holds.
+    pub fn set_laser_planes(&mut self, segment: usize, origin: &scancraft_laser::PlanesOrigin, start: Option<&scancraft_laser::planes::LaserPlaneSet>) {
+        use scancraft_laser::PlanesOrigin as O;
+        let label = match origin {
+            O::Unknown => "unknown",
+            O::Given => "given",
+            O::Env(_) => "env",
+            O::Cache(_) => "cache",
+            O::Online => "online",
+        };
+        let file = start.and_then(|p| serde_json::to_vec_pretty(p).ok()).map(|bytes| {
+            let name = format!("laser_planes-{segment}.json");
+            self.calibration.retain(|(n, _)| *n != name);
+            self.calibration.push((name.clone(), bytes));
+            if !self.record.calibration.contains(&name) {
+                self.record.calibration.push(name.clone());
+            }
+            name
+        });
+        if let Some(seg) = self.record.captures.get_mut(segment) {
+            seg.laser_planes = serde_json::json!({ "origin": label, "file": file, "planes": start.map(|p| p.planes.len()) });
+        }
     }
 
     /// The turntable capture volume, once the pipeline found it.
@@ -255,9 +297,27 @@ impl CaptureLog {
         self.live.iter().flat_map(|l| [l.main_on.then(|| l.main.clone()), l.rgb_on.then(|| l.rgb.clone())]).flatten().collect()
     }
 
-    /// Whether any session recorded a raw stream into the pass folder.
-    pub fn has_raw_in_project(&self) -> bool {
-        self.record.raw_main.as_deref().is_some_and(scancraft_io::fsutil::is_safe_relative)
+    /// Whether any session recorded a raw stream (anywhere).
+    pub fn has_raw(&self) -> bool {
+        self.record.raw_main.is_some() || self.record.raw_rgb.is_some()
+    }
+
+    /// The capture record of a pass added from another project: everything but the raw
+    /// recordings, which stay in that project (`raw_source` says where).
+    pub fn without_raw(&self, project: &str, pass: u32) -> CaptureLog {
+        let mut log = self.clone();
+        let had = log.has_raw();
+        let r = &mut log.record;
+        if had && r.raw_source.is_none() {
+            r.raw_source = Some(format!("{project}, pass {pass}"));
+        }
+        (r.raw_main, r.raw_rgb) = (None, None);
+        for c in &mut r.captures {
+            (c.raw_file, c.raw_rgb_file) = (None, None);
+        }
+        log.live.clear();
+        log.record_root = None;
+        log
     }
 }
 
@@ -316,7 +376,7 @@ pub fn read(dir: &Path, id: u32) -> Option<CaptureLog> {
     };
     let rows = files::read_tracking_log(&dir.join(files::tracking_log_path(id))).unwrap_or_default();
     let calibration = files::read_calibration(&dir.join(files::calibration_dir(id)), &record.calibration);
-    Some(CaptureLog { record, rows, calibration, live: Vec::new(), session_start: None })
+    Some(CaptureLog { record, rows, calibration, live: Vec::new(), record_root: None, session_start: None })
 }
 
 /// The state name of a tracking status in the tracking log.
