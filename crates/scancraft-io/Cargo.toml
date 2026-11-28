@@ -13,3 +13,17 @@ thiserror.workspace = true
 log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Project bundles (`.scancraftz`): plain ZIP64, entries stored, no encryption features (`deflate`
+# only names the method). Entry data is read raw and checked here: CRC-32 (crc32fast), the manifest's SHA-256
+# (sha2), and flate2 only to read entries another ZIP program re-packed with deflate.
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
+crc32fast = "1"
+flate2 = "1"
+sha2 = "0.10"
+
+# Lock files (is the owning process still running?) and the free-space check.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

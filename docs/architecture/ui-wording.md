@@ -34,7 +34,7 @@ A disabled button, ribbon button or menu entry always says why in its tooltip.
 | **Frame** | One stored keyframe of a pass. | |
 | **Merged model** | The point cloud Merge makes from the included passes. | "merge result", "project model" (that is what a pass is aligned onto) |
 | **Mesh** | The triangle surface from Reconstruct or Make Solid. | "model", "surface" as a noun for the result |
-| **Project** | Everything in one tab; a folder on disk. | "session" |
+| **Project** | Everything in one tab; on disk a project folder (`<name>.scancraft` + pass data) or a bundle (one `.scancraftz` file). | "session" |
 | **Datum** | A plane, axis or point picked on the model that the project is oriented by ("Onto XY (floor)", "Flip"). | |
 
 | Verb | Use for | Examples |
@@ -50,7 +50,9 @@ A disabled button, ribbon button or menu entry always says why in its tooltip.
 | **Scale** | Giving an imported pass its true size from lengths measured on it. | Scale from Lengths…, "× 1.2016" |
 | **Import Scan…** | Adding scan files (PLY, OBJ, STL) as new passes. | |
 | **Add Project…** | Appending the passes of another ScanCraft project. | |
-| **New Project / Open Project… / Save Project…** | Project files; New and Open use a new tab. | |
+| **New Project / Open Project… / Save Project…** | Project files; New and Open use a new tab. The Save card saves as a project folder or a bundle (Save As Project Folder, Save as Bundle… in the notes). **Open Project Folder… / Add Project Folder…** (right-click on the app bar's Open / Add) pick the folder itself. | |
+| **Save Anyway / Save As…** | The answers when the project file or bundle was saved by someone else since it was opened here ("Changed by Someone Else"): Save Anyway (destructive) replaces their version, Save As… opens the Save card with a free name and keeps both. | "Overwrite", "Force" |
+| **Take Over / Open Read-Only** | The answers when another computer has the project open ("Project in Use"): Take Over (destructive) takes its lock, Open Read-Only opens a copy that is saved only to a new place; the tab is named "… (read-only)". Never offered for a ScanCraft running on this computer. | "Break lock", "Steal" |
 | **Close / Quit** | Close a tab; quit the app. | |
 | **Include in Merge / Leave Out of Merge** | Whether Merge uses a pass. | |
 | **Shown / hidden** | The eye in the browser. Tools work on shown passes. | "visible" |

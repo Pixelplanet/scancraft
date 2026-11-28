@@ -404,3 +404,28 @@ laser model are not built.
   or the `.mkf` beside a raw scan): 0.19–0.27° / 0.36–0.81 mm measured, limits 0.5° / 1.2 mm.
   Tests: `scancraft-io` 29, `scancraft-align` 53 + 4 real-data (ignored, all pass), `scancraft-mesh`
   51, `scancraft` 85.
+- 2026-11-26 — Project file format, step 1 (library only, branch `agent/project-file`):
+  `<name>.scancraft` project file (old `project.json` folders still open; saving one leaves a
+  stub older versions refuse), `.scancraftz` bundles (ZIP64, stored, project file first, SHA-256
+  manifest, contents filter, save-back with raw copies of unchanged entries), working folders
+  with crash recovery, lock files. `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`;
+  status and what is left in `docs/open-issues.md` 4.1.
+- 2026-11-26 (later) — Project file format, step 2 (app side, branch `agent/project-file`, not
+  merged or pushed): Open Project… takes `.scancraft` / `.scancraftz` / `project.json`; bundle
+  tabs work in a working folder (`apps/scancraft/src/storage.rs`, `app_project.rs`); the Save
+  Project card saves as folder or bundle (Save As Project Folder / Save as Bundle… move the tab);
+  locks taken on open and save; tab close and quit remove working folders; crash recovery
+  question at start; bundle contents and working-folder root kept in
+  `%LOCALAPPDATA%\ScanCraft\settings.json`; `scancraft.exe <path>` (`cli.rs`); single instance
+  over loopback with a per-launch token (`single_instance.rs`); file association in
+  `packaging/windows/install.ps1` / `uninstall.ps1` (not run). Not tested with a real window or
+  double-click. Status in `docs/open-issues.md` 4.1. The user's report about marker depressions
+  and cross-line laser artifacts on the top surface of the part was not addressed in this track.
+- 2026-11-27 (branch `agent/project-file`) — Shared-folder project files: save-conflict question
+  (Save Anyway / Save As…), lock question for another PC (Take Over / Open Read-Only), Add Project
+  with bundles, folder entries in the dialogs, second-start options named, unknown project-file
+  fields kept, ZIP64 tests. Review fixes: a proposed free name taken meanwhile is never saved
+  over, read-only bundle copies keep raw recordings and later fields, a bundle lock let go is
+  taken back on save, project paths outside the project folder (absolute, `..`, UNC) are refused
+  on open. Unit tests only, nothing tried in a window or Explorer. Status in
+  `docs/open-issues.md` 4.1.

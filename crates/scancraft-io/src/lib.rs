@@ -1,10 +1,14 @@
+pub mod bundle;
+pub mod fsutil;
 pub mod import;
+pub mod lock;
 pub mod normals;
 pub mod obj;
 pub mod ply;
 pub mod project;
 pub mod revo;
 pub mod stl;
+pub mod workdir;
 
 pub use import::{
     detect_format, import_bytes, import_scan, import_scan_with, ImportOptions, ImportedScan, NormalSource,
@@ -29,6 +33,28 @@ pub enum IoError {
     Truncated(String),
     #[error("Unsupported file: {0}")]
     Unsupported(String),
+    /// The path holds no ScanCraft project (see [`project::locate`]).
+    #[error("{0}")]
+    NotAProject(String),
+    /// Another ScanCraft (or this one) has the project open: see [`lock`].
+    #[error("{}", locked_message(path, owner.as_deref()))]
+    Locked { path: std::path::PathBuf, owner: Option<Box<lock::Owner>> },
+    #[error("Not enough free space on the drive of {}: {} needed, {} free", path.display(), fsutil::format_bytes(*needed), fsutil::format_bytes(*free))]
+    NoSpace { path: std::path::PathBuf, needed: u64, free: u64 },
+    /// The file was changed by someone else since it was opened (a bundle replaced behind the
+    /// app's back); saving would lose that change.
+    #[error("Conflict: {0}")]
+    Conflict(String),
+}
+
+fn locked_message(path: &std::path::Path, owner: Option<&lock::Owner>) -> String {
+    let what = lock::locked_target(path);
+    let what = what.display();
+    match owner {
+        Some(o) if o.is_this_process() => format!("{what} is already open in this window"),
+        Some(o) => format!("{what} is in use by {}", o.describe()),
+        None => format!("{what} is being opened by another ScanCraft right now"),
+    }
 }
 
 #[cfg(test)]

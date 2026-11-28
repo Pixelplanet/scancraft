@@ -1,12 +1,15 @@
 //! ScanCraft: a desktop workbench for 3D scanners, in SolidCraft's look.
 //!
-//! `scancraft --mock` connects the built-in simulated scanner at start;
-//! `scancraft --connect <ip>` connects a network scanner at start.
+//! `scancraft <project>` opens a project file, bundle or project folder (what a double-click in
+//! Explorer does); `scancraft --mock` connects the built-in simulated scanner at start;
+//! `scancraft --connect <ip>` connects a network scanner at start. See `cli.rs`. A start while
+//! ScanCraft runs hands its project to the running app and ends (`single_instance.rs`).
 
 mod ai_pack;
 mod ai_segment;
 mod alignment;
 mod app;
+mod cli;
 mod dev;
 mod file_picker;
 mod imports;
@@ -15,6 +18,8 @@ mod model;
 mod project;
 mod replay;
 mod scan_modes;
+mod single_instance;
+mod storage;
 mod ui_ai;
 mod ui_history;
 mod ui_orient;
@@ -28,12 +33,16 @@ use std::sync::Arc;
 use eframe::egui;
 use tokio::runtime::Runtime;
 
-use crate::app::{Capture, ScanCraftApp, StartConnection};
+use crate::app::{Capture, ScanCraftApp};
 use crate::model::Stage;
 
 struct ScanCraft {
     app: ScanCraftApp,
     script: Option<dev::Script>,
+    /// Projects handed over by later starts (`single_instance`).
+    handovers: Option<std::sync::mpsc::Receiver<single_instance::Handover>>,
+    /// Set when the app ends: later starts are no longer handed over to it.
+    closing: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 impl ScanCraft {
@@ -92,10 +101,21 @@ impl eframe::App for ScanCraft {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.shortcuts(&ctx);
-        // Scan files and project folders dropped on the window are added as passes.
+        // Project files and bundles dropped on the window open in tabs; scan files and project
+        // folders are added as passes.
         let dropped: Vec<std::path::PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if !dropped.is_empty() {
-            self.app.queue_imports(dropped);
+        let (open, add): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| p.is_file() && storage::OpenTarget::of(p).is_some());
+        for p in open {
+            self.app.request_open(storage::OpenRequest::Path(p));
+        }
+        if !add.is_empty() {
+            self.app.queue_imports(add);
+        }
+        // A later start handed over a project (or asked for the window).
+        while let Some(h) = self.handovers.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            self.app.take_handover(h);
         }
         self.app.poll_picker();
         self.app.poll_jobs();
@@ -110,6 +130,9 @@ impl eframe::App for ScanCraft {
             self.app.close_prompt = Some(app::ClosePrompt::Quit);
         }
         crate::ui_ai::ai_pack_modal(&mut self.app, &ctx);
+        ui_shell::recovery_prompt(&mut self.app, &ctx);
+        ui_shell::lock_prompt(&mut self.app, &ctx);
+        ui_shell::conflict_prompt(&mut self.app, &ctx);
         ui_shell::close_prompt(&mut self.app, &ctx);
         // Save All on quit has saved everything.
         if std::mem::take(&mut self.app.close_window) {
@@ -124,35 +147,67 @@ impl eframe::App for ScanCraft {
     }
 
     fn on_exit(&mut self) {
+        // From here on no request is read: later starts wait for this app to end instead.
+        if let Some(closing) = &self.closing {
+            closing.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(rx) = &self.handovers {
+            for h in rx.try_iter() {
+                log::warn!("a project handed over while ScanCraft was closing was not opened: {h:?}");
+            }
+        }
         self.app.shutdown();
     }
 }
 
 fn main() -> eframe::Result<()> {
     env_logger::init();
-    let args: Vec<String> = std::env::args().collect();
-    let value = |flag: &str| args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned();
-    if let Some(dir) = value("--demo-project") {
-        match dev::write_demo_project(std::path::Path::new(&dir)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = cli::parse(&args);
+    for a in &cli.unknown {
+        eprintln!("scancraft: ignoring the argument {a}");
+    }
+    if let Some(dir) = &cli.demo_project {
+        match dev::write_demo_project(std::path::Path::new(dir)) {
             Ok(()) => println!("wrote a demo project to {dir}"),
             Err(e) => eprintln!("demo project: {e}"),
         }
         return Ok(());
     }
-    let open = value("--open");
-    let script = value("--auto").map(|s| dev::Script::new(&s));
-    let start = if let Some(i) = args.iter().position(|a| a == "--replay") {
-        // Development: play a recorded marker scan as if it came from a scanner.
-        let recording = args.get(i + 1).cloned().unwrap_or_default();
-        let camparam = args.get(i + 2).cloned().unwrap_or_default();
-        StartConnection::Replay(recording.into(), camparam.into())
-    } else if args.iter().any(|a| a == "--mock") {
-        StartConnection::Mock
-    } else if let Some(ip) = args.iter().position(|a| a == "--connect").and_then(|i| args.get(i + 1)) {
-        StartConnection::Ip(ip.clone())
+    // One app per user: a later start hands its project to the running one and ends.
+    let mut handovers = None;
+    let mut wake = None;
+    let mut closing = None;
+    let _instance_guard = if cli.single_instance() {
+        match single_instance::start(&single_instance::default_dir(), cli.project.as_deref(), &cli.new_app_options) {
+            single_instance::Start::HandedOver => {
+                // The running app names them too (this start has no window).
+                if !cli.new_app_options.is_empty() {
+                    eprintln!("scancraft: ScanCraft is already running; the project (if any) opens there, and {} were not used", cli.new_app_options.join(" "));
+                }
+                return Ok(());
+            }
+            // The running app refused the project and shows why; never a second app.
+            single_instance::Start::Refused(why) => {
+                eprintln!("scancraft: ScanCraft is already running and could not open the project: {why}");
+                return Ok(());
+            }
+            single_instance::Start::Primary(primary) => {
+                let (guard, rx, w) = primary.split();
+                handovers = Some(rx);
+                wake = Some(w);
+                closing = Some(guard.closing_flag());
+                Some(guard)
+            }
+            single_instance::Start::Alone(why) => {
+                log::warn!("starting without the single-instance check: {why}");
+                None
+            }
+        }
     } else {
-        StartConnection::None
+        None
     };
+    let script = cli.auto.as_deref().map(dev::Script::new);
     let rt = Arc::new(Runtime::new().expect("failed to start the async runtime"));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_title("ScanCraft").with_inner_size([1440.0, 900.0]).with_min_inner_size([1100.0, 680.0]),
@@ -167,15 +222,25 @@ fn main() -> eframe::Result<()> {
             if let Some(rs) = cc.wgpu_render_state.as_ref() {
                 scancraft_render::install(rs, Some(eframe::wgpu::TextureFormat::Depth32Float), 1);
             }
-            let mut app = ScanCraftApp::new(rt, start);
+            if let Some(Ok(mut w)) = wake.as_ref().map(|w| w.lock()) {
+                *w = Some(cc.egui_ctx.clone());
+            }
+            let mut app = ScanCraftApp::new(rt, cli.start.clone());
+            let prefs_path = storage::Prefs::default_path();
+            app.prefs = storage::Prefs::load(&prefs_path);
+            app.prefs_path = Some(prefs_path);
             // Development: `--mock-modes pop4` makes the simulator report the POP 4's mode table.
-            if args.windows(2).any(|w| w[0] == "--mock-modes" && w[1] == "pop4") {
+            if cli.mock_modes.as_deref() == Some("pop4") {
                 app.mock_modes = Some(scancraft_driver_revopoint::modes::pop4_modes());
             }
-            if let Some(dir) = open {
-                app.open_project(std::path::PathBuf::from(dir));
+            // Bundles a crash left open: one question (not in scripted runs).
+            if script.is_none() {
+                app.check_leftovers();
             }
-            Ok(Box::new(ScanCraft { app, script }))
+            if let Some(path) = cli.project.clone() {
+                app.request_open(storage::OpenRequest::Path(path));
+            }
+            Ok(Box::new(ScanCraft { app, script, handovers, closing }))
         }),
     )
 }

@@ -37,6 +37,16 @@ source of those (unmodified, crates.io) files stays available, which it does; it
 obligation on ScanCraft's own code. No GPL/LGPL/AGPL dependency. Brush itself enforces a
 permissive allow-list with `cargo deny`.
 
+## Libraries used for project bundles (`crates/scancraft-io`)
+
+| Dependency | Licence | Use |
+| --- | --- | --- |
+| `zip` 0.6 (<https://github.com/zip-rs/zip>) | MIT | Reading and writing `.scancraftz` bundles (plain ZIP64, stored entries, raw copy of unchanged entries). ScanCraft enables only its `deflate` feature (no encryption). |
+| `crc32fast` | MIT OR Apache-2.0 | ZIP CRC-32 of every bundle entry. |
+| `sha2` (RustCrypto) | MIT OR Apache-2.0 | SHA-256 per entry in a bundle's manifest. |
+| `flate2` with `miniz_oxide` | MIT OR Apache-2.0 | Reading entries that another ZIP program re-packed with deflate. |
+| `windows-sys` (Windows), `libc` (elsewhere) | MIT OR Apache-2.0 | Lock files (is the owning process still running?) and the free-space check. |
+
 ## Assets
 
 - `crates/scancraft-ui/assets/icons/` — SolidCraft UI icon masters from

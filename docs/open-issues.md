@@ -377,3 +377,299 @@ Deferred follow-up to `agent/sam-fast` (after the multi-object test scene in `ag
 - **Pre-capture gating / Live Preview prompting:** `preview_worker` does not accept SAM 2.1 clicks yet, and hitting **Start Capture** starts fusing immediately while `latest_ai` is still `None`, so background points are recorded until the user clicks the object in the Colour inset. Gate recording or allow clicking/locking the object mask in Live Preview first.
 - **Hold on lost mask:** in `worker.rs`, if SAM 2.1 loses tracking or dips below `min_iou`, the worker falls back to passing the unmasked depth frame through instead of holding/skipping fusion for that frame, letting background points leak in.
 - **Discoverability and live controls:** surface the live AI toggle more prominently when enabled, add a **Reset mask** button, and support Shift/right-click **Exclude** points in the live Colour view.
+
+## 4. Planned for later
+
+### 4.1 A real project file that opens with a double-click (user, 2026-11-26) — done (steps 1 and 2)
+
+**Wanted:** the user clicks a project file in Explorer and it opens in ScanCraft. Today a project
+is a folder (`project.json`, `pass-<id>/…`, `outputs/`, `crates/scancraft-io/src/project.rs`),
+and Open Project asks for that folder. Keep the format simple: plain, readable files, no
+encryption, nothing proprietary unless a requirement forces it. The user suggests two forms: a
+simple project file that lives in the project folder next to the scan data, and a full bundle
+that contains all the scan data in one file. (Built: see the two status notes at the end of this
+section.)
+
+**Form A: project file in the project folder** (for example `Part.scancraft` next to `pass-1/`,
+`outputs/`). The file is today's `project.json` under a registered extension, with relative paths
+only.
+
+| Pros | Cons |
+| --- | --- |
+| Saving stays incremental: only changed passes are rewritten (a project is easily 1–10 GB) | Moving or sharing means taking the whole folder |
+| No copy or extraction on open; large files stay memory-mappable | The file can be separated from its data: Open must say clearly what is missing |
+| Readable and diffable, easy to repair by hand or by an agent | Two files with the same name in one folder would share the data: one project per folder |
+| Backups and cloud sync only move what changed | |
+| Old projects migrate trivially (`project.json` is still read; save writes the new name) | |
+
+**Form B: bundle** (one file with everything). Proposal: a plain ZIP64 of the same folder layout
+(like `.3mf` or `.docx`), entries *stored* (point data barely compresses and stored entries can be
+read in place), the project JSON as the first entry, an optional SHA-256 per entry in it for
+integrity.
+
+| Pros | Cons |
+| --- | --- |
+| One file to send, archive or attach; nothing can go missing | Every save rewrites the whole file (minutes for GBs), needs twice the disk space and a temp-file + rename to be crash-safe |
+| Standard tools open it (any ZIP program); no custom container | Cloud sync and backups re-upload the whole file after each save |
+| Self-describing: the file says what it contains and checks itself | Editing in place is impractical: it has to be unpacked to a working folder anyway |
+| | Antivirus scans of large archives slow opening |
+
+**Recommendation (to discuss):** A is the working format and the default. B is for exchange:
+*Save as Bundle…* writes it from a project, and opening a bundle unpacks it into a project folder
+the user picks (or a cache folder, with a prompt to choose a place on the first save). So nobody
+ever edits a multi-GB archive in place. Raw stream recordings (several MB/s) stay out of bundles
+unless the user ticks them in.
+
+**Needed for either form:**
+- **File association:** the installer registers the extension per user (HKCU `Software\Classes`:
+  ProgID, icon, `scancraft.exe "%1"`). The app takes a project path as its argument.
+- **Single instance:** a second double-click must open the project as a tab in the running app
+  (local pipe or socket), not start a second app. Two apps could both try to talk to the scanner,
+  which breaks the one-client rule (HANDOFF §3).
+- **Project lock:** a lock file in the project folder so two apps (or PCs, via a share) don't save
+  over each other.
+- **Robustness:** atomic saves (write temp, then rename), a format version in the file, unknown
+  fields kept on save, and old folder projects keep opening.
+- **Later:** an Explorer thumbnail (a preview image in the folder or bundle).
+
+Precedent: Revo Scan 6 also uses a JSON project file (`.revox`) next to its data folders.
+
+**Decided by the user (2026-11-26): build it as recommended.**
+- Extensions: `.scancraft` for the project file (form A) and `.scancraftz` for the bundle
+  (form B).
+- **Opening a bundle works on a working folder (a temporary form A):**
+  - Open unpacks the bundle into a working folder, and all work goes there.
+  - *Save* writes everything back into the bundle.
+  - Closing the tab removes the working folder.
+- **Bundle contents are chosen in a settings page** (future Settings menu). Each item says what
+  it is needed for (see below).
+
+**Design notes for the working folder:**
+- **Where:** a working-folder root set in Settings. It defaults to the user's local app data,
+  but scans are large, so it must be easy to move to a big drive. Show the space needed (the
+  bundle's size) and refuse with a clear message if it does not fit.
+- **Unpack lazily:** bundle entries are stored, not compressed, so large pass files can be read
+  straight from the bundle. Only files that change are written to the working folder
+  (copy-on-write).
+- **Save:** write a new bundle next to the old one (`*.scancraftz.tmp`), then rename it over
+  the old one.
+  - Changed files come from the working folder.
+  - Unchanged entries are copied raw from the old bundle, without decompressing anything.
+  - That keeps saves at disk speed and crash-safe.
+  - The working folder stays until the tab closes.
+- **Crash recovery:** a working folder records which bundle it belongs to and when that bundle
+  was last saved. On the next start the app offers to recover unsaved work (Open / Discard)
+  rather than deleting it.
+- **Save As Project Folder:** turns an opened bundle into a normal form-A project
+  (and *Save as Bundle…* goes the other way).
+- **The bundle is locked while it is open** (the same lock as for project folders), so a second
+  app or PC cannot open it for writing.
+
+**Bundle contents (settings, with the explanation shown to the user):**
+
+| Item | Needed for | Default |
+| --- | --- | --- |
+| Project file, pass surfaces and alignment, cleaned surfaces, object labels | Opening the project at all, merging, meshing | always |
+| Keyframes (depth frames and poses) | Continuing a pass, discarding frames, re-tracking, Same Position start, adding passes from it | on |
+| Colour keyframes | Colour, AI object segmentation | on |
+| Merged model and mesh | Opening with results ready; otherwise Merge / Reconstruct again (minutes) | on |
+| Marker maps | Make Solid marker removal, marker display | on |
+| Raw stream recordings | Replaying a scan for analysis or bug reports only; several MB per second | off |
+
+**Status 2026-11-26: step 1 (library, `crates/scancraft-io`) done; no UI yet.**
+- `project.rs`: `save_project` writes `<name>.scancraft` (named after the project in a new
+  folder; an existing file keeps its name when the project is renamed), every file through a
+  temporary file + rename, the project file last. `locate` / `load_project` accept the
+  `.scancraft` file, its folder (exactly one `.scancraft`; several are refused with their names)
+  or an older folder with `project.json`. **Old `project.json`:** saving such a project replaces it
+  with a stub (`format: 2`, no passes, `moved_to: "<name>.scancraft"`), so an older ScanCraft
+  says "saved by a newer version" instead of opening a stale copy; this version ignores the stub
+  and says the `.scancraft` file is missing when it is gone. Layout paths (`surface_path`,
+  `cleaned_path`, `rgb_manifest_path`, …) now live in the io crate; the app uses them.
+- `bundle.rs`: `write_bundle`, `Bundle::{open, entries, verify, extract_to, read_project}`,
+  `save_back`. Items map to files with `classify` (`keyframes.bin` → Keyframes, `rgb/` → Colour
+  keyframes, `outputs/` → Merged model and mesh, `markers.json` → Marker maps, `raw.bin`, `raw/`
+  and in-project `raw_recording` paths → Raw recordings, everything else → core; locks, temp
+  files, the working-folder state, `project.json` and `Thumbs.db` never). A left-out file the
+  project cannot open without gets a placeholder (empty keyframe file for a pass with
+  `surface.ply` / `cleaned.ply`, `[]` for a colour manifest); the keyframes of a captured,
+  uncleaned pass are always kept, since they are its only surface. **So "Keyframes off" only
+  saves space for imported or cleaned passes until captured passes store their surface.**
+  Unchanged = same size and time stamp as recorded at extraction / last save, or same SHA-256 when
+  only the time differs, and the old entry still has the recorded size and CRC-32.
+- `workdir.rs`: `WorkFolder::{open, save, save_overwriting, save_as, save_as_folder, close,
+  recover}`, `leftovers`, `discard`, `default_root` (`%LOCALAPPDATA%\ScanCraft\work`). State
+  file `.scancraft-work.json` (bundle, its size and time at open / last save, owner pid + host +
+  process start, opened, per-file state, complete flag), written before unpacking. Free-space
+  check before unpacking and before writing a bundle (`IoError::NoSpace`). Save refuses with
+  `IoError::Conflict` when the bundle was replaced behind the app's back.
+- `lock.rs`: `.scancraft.lock` / `<bundle>.lock` with pid, host, process start time and token; a
+  dead owner on the same host (or a reused pid) is taken over, a live one is refused naming who
+  holds it (`IoError::Locked`), another host's lock counts as live until `take_over`.
+- Zip crate: `zip` 0.6.6 (MIT, already in the lock file), recorded in `apps/scancraft/ATTRIBUTION.md`.
+
+**Status 2026-11-26: step 2 (app side, `apps/scancraft`) done.**
+- **Open Project…** picks a `.scancraft` file, a `.scancraftz` bundle or an older project's
+  `project.json` (the dialog picks files; `storage::OpenTarget`). A bundle is unpacked into a
+  working folder under the working-folder root and the tab works there; the tab shows a small box
+  before its name and names the bundle and the working folder on hover. A project that is open in
+  a tab already is switched to. Project files and bundles dropped on the window open the same way
+  (scan files and project folders are still added as passes).
+- **Save Project** card: *Save as* Project folder / Bundle (one file). Saving where the project
+  is writes it there (a bundle tab: into the working folder, then `WorkFolder::save` back into the
+  bundle). Saving anywhere else moves the tab there: **Save As Project Folder** of a bundle tab
+  (the working folder is removed, the bundle unlocked) and **Save as Bundle…** of any project (a
+  folder project or a new one gets a new working folder, `WorkFolder::create`). Files the app does
+  not hold in memory (raw recordings) are copied over (`workdir::copy_item_files`). A save into
+  the working-folder root is refused (closing a tab removes its working folder). A bundle replaced
+  behind the app's back asks first (Save Anyway / Save As… / Cancel, see the 2026-11-27 status).
+- **Closing a tab** (after the Save / Discard / Cancel question when it has changes) releases the
+  lock and removes a bundle's working folder; quitting does the same for every tab. Quit's
+  **Save All** saves bundle tabs into their bundles.
+- **Locks:** opening or saving a folder project takes `.scancraft.lock`; opening a bundle takes
+  `<bundle>.lock` (through `WorkFolder`). A project open in another app on this PC is refused with
+  who holds it, one on another PC is asked about (Take Over / Open Read-Only / Cancel, see the
+  2026-11-27 status); one open in another window of this process says "already open".
+- **Settings:** there is no Settings window yet, so the bundle contents (each item with its
+  "Needed for" text as the tooltip; the core item shown ticked and disabled) and the
+  working-folder root (*Unpack into*, with a Browse button and the free space in the tooltip) are
+  in the Save Project card when *Bundle* is chosen. They are kept in
+  `%LOCALAPPDATA%\ScanCraft\settings.json` (`storage::Prefs`; unknown keys kept). The app had no
+  persisted settings before; the other settings still are not kept.
+- **Crash recovery:** at start (not in `--auto` runs) the working folders under the root are
+  checked (`check_leftovers`). Leftovers with nothing unsaved (and an unchanged bundle) and
+  stopped removals are removed quietly; the others are listed in one question (*Recover Unsaved
+  Work*: Open / Later / Discard, `kit::confirm_modal`). Open opens each as a tab with its changes
+  (marked unsaved; Save writes them into the bundle). Folders of a running ScanCraft and folders
+  without a state file are never touched.
+- **Command line:** `scancraft.exe <path>` opens a project file, bundle or project folder
+  (`cli.rs`; `--open <path>` still works; `--mock`, `--connect`, `--replay`, `--auto`,
+  `--mock-modes`, `--demo-project` unchanged).
+- **Single instance** (`single_instance.rs`): the first app takes
+  `%LOCALAPPDATA%\ScanCraft\instance.lock` and listens on a loopback port (127.0.0.1, chosen by
+  the system), with port and a 256-bit per-launch token in `instance.json` (the user's own
+  folder; 0600 on Unix). A later start sends `{token, open}` and ends; the running app checks the
+  token and accepts only an absolute, existing `.scancraft` / `.scancraftz` / project folder, then
+  opens it as a tab (queued like a picked project while busy) and comes to the front. A start
+  without a path only brings the window to the front. `--new-instance`, `--auto` and
+  `--demo-project` skip this. If the running app does not answer, the new start runs alone (and
+  says so in the log). **Scanner:** with two apps (only possible with `--new-instance`), the
+  driver's scanner lock (`scanner_lock.rs`, taken when a stream starts) still refuses the second
+  stream, so the one-client rule holds; connecting (control CGI only) is not locked.
+- **Installer:** `install.ps1` registers `.scancraft` (`ScanCraft.Project`) and `.scancraftz`
+  (`ScanCraft.Bundle`) under `HKCU\Software\Classes` (icon, `"scancraft.exe" "%1"`,
+  `OpenWithProgids`) and tells Explorer (`SHChangeNotify`); `uninstall.ps1` removes them, and with
+  `-RemoveData` asks before deleting working folders. Neither was run (parsed only).
+- Tests (`cargo test --release -p scancraft -p scancraft-io`): open / save of both forms through
+  the app, tab close and quit clean the working folder, Save All on a bundle tab, a lock from
+  another PC refused, recovery detection / Open / Discard, CLI parsing, the single-instance
+  hand-over (token, path checks) without a window, preferences.
+
+**Review fixes 2026-11-26** (each with a test unless noted):
+- A new working folder (*Save as Bundle…* of a folder or new project) counts as complete once the
+  project is written into it (`WorkFolder::project_written`), so a crash while the bundle is
+  written offers it for recovery (it can be the only copy) instead of "nothing to recover".
+- *Save as Bundle…* copies a folder project's raw recordings into the working folder only when
+  the bundle takes them (no NoSpace on the system drive, no unused GB copies).
+- A plain *Save* of a bundle keeps everything the bundle holds (its manifest's contents, recorded
+  in the working-folder state) plus what the settings add; only *Save as Bundle…* to a new file
+  uses the settings alone.
+- A removal whose rename to `.closing` fails (a file held open without delete sharing) marks the
+  state `closing` and removes the state file last; the next start finishes it
+  (`LeftoverStatus::Closing`), never offered as work.
+- Queued opens never replace a tab: an open that cannot get a new tab goes back to the queue
+  (`tabs_held` is the app's own check; `tabs_blocked`, which also counts queued opens and
+  imports, is the user's). Save All never saves another tab in place of the next one, and a
+  project opened during Save All stops the quit.
+- Changing *Unpack into* remembers the earlier root (`Prefs::past_work_roots`) until nothing is
+  left in it: recovery checks it and nothing is saved into it.
+- Single instance: a refused handover ends the second start (the running app shows why) instead
+  of starting a second app; an ending app answers `closing` and the second start waits for its
+  lock (up to 15 s) and becomes the running app; "ok" only when the app got the request; each
+  request on its own thread (up to 8) with a whole-request deadline of 3 s.
+- `uninstall.ps1 -Quiet -RemoveData` keeps working folders unless `-RemoveWorkFolders` is given,
+  and they are always kept while any ScanCraft runs (not run, parsed only).
+
+**Status 2026-11-27: the open items of steps 1 and 2 done** (each with a test; no GUI run):
+- **Changed by someone else** (`app_project.rs::save_project_with`, `ui_shell::conflict_prompt`):
+  Save of a bundle whose file changed since it was opened or last saved here (`WorkState::
+  bundle_changed`), or of a project folder whose project file changed (new: the folder tab keeps
+  the project file's size and time stamp, `Store::Folder::seen`, `project::check_unchanged`), no
+  longer just fails. It asks first (*Changed by Someone Else*): **Save Anyway** (destructive,
+  `WorkFolder::save_overwriting` / skip the check), **Save As…** (the Save card with a free name
+  beside it, `storage::free_sibling`: both versions are kept), **Cancel**. Nothing is written
+  before the answer; a close waiting for the save stays open, a Save All on quit stops. A folder
+  tab whose lock was broken by someone who has let go takes it again (the stamp check still
+  catches their save); one held by someone else refuses the save naming them.
+- **Project in use on another computer** (`open_project`, `ui_shell::lock_prompt`): opening a
+  folder or bundle whose lock names another computer (cannot be checked from here) asks:
+  **Open Read-Only** (a copy in a tab with no place on disk, name "… (read-only)": a folder is
+  read in place, a bundle through an unpacked copy, `workdir::UnpackedCopy`, kept until the tab
+  closes or moves; nothing is locked or written there; Save asks for a new place and brings the
+  raw recordings and the fields of later versions along, from a folder and a bundle alike),
+  **Take Over** (destructive;
+  `LockFile::take_over_from` takes it only from the holder shown, refused when someone else holds
+  it by now and always for a running process on this PC), **Cancel**. A lock of a running
+  ScanCraft on this PC is still refused without a question. A lock of a process that has ended
+  on this PC is still taken without asking, but no longer silently: the status after opening says
+  whose lock was taken over (`LockFile::replaced`).
+- **Add Project with a bundle** (`add_project`): a `.scancraftz` is unpacked into a temporary
+  folder under the working-folder root (`UnpackedCopy`, not locked, so a bundle open elsewhere
+  works too), its passes are read and the folder removed. A crash meanwhile leaves a folder that
+  the next start removes quietly (its state says "being removed" from the start). Add Project…
+  now picks files (project files, bundles, `project.json`); a dropped bundle still opens as a tab.
+- **Folders in the dialogs** (`file_picker.rs`): the Windows dialog picks files *or* folders, so
+  the app bar's Open and Add buttons have a right-click menu with **Open Project Folder…** /
+  **Add Project Folder…** (an older `project.json` folder opens by picking the folder itself).
+- **Second start's options** (`cli.rs`, `single_instance.rs`): a start that hands its project to
+  the running app passes only the project. `--mock`, `--connect`, `--replay`, `--mock-modes` are
+  not applied there (the running app may be connected or capturing); they travel in the request
+  (`ignored`) and the running app names them in its status bar ("… were not used. Connect a
+  scanner from the Connect stage."). `--new-instance` still starts a second app that uses them.
+- **Unknown project-file fields are kept** (`ProjectFile::other`, `PassRecord::other`, serde
+  flatten): read, held, and written back; a save also carries those of the file it replaces (the
+  app builds the project from memory) or, on Save As into a new place, of the previous project
+  (`save_project_carrying`). A newer *format* number is still refused. Not kept: unknown keys
+  inside a pass's `scan_config` (the app rewrites it from its own settings) and inside
+  `alignment`.
+- **ZIP64:** tested without writing 4 GiB to disk. `zip64_entries_round_trip` forces ZIP64 size
+  fields on every entry of a real bundle (lowered threshold) and checks open, verify, extract and
+  raw copy on Save; `entries_and_offsets_past_4_gib_round_trip` writes a 4 GiB + 196 kB entry and
+  one behind it (offset past 4 GiB) into an in-memory sparse store with the bundle's own entry
+  options, reads it back with the CRC checked, and raw-copies both into a second archive. Not
+  tested: more than 65 535 entries, and a > 4 GiB bundle on a real disk.
+
+**Review fixes 2026-11-27** (each with a test that failed before; no GUI run):
+- A proposed free name (Save As… after the conflict question, a read-only copy) was worked out
+  once; if another tab, app or computer saved there before Save, that project was silently
+  replaced. The tab remembers the proposal (`ProjectInfo::proposed`); a save to it that finds it
+  taken is refused, and the next free name is proposed (`a_proposed_name_taken_meanwhile_is_never_
+  saved_over`). A name the user types still saves into an existing folder as before.
+- A read-only copy of a bundle dropped its raw recordings and the fields of later versions on
+  Save (its unpacked copy was gone). The copy now stays with the tab (`Store::ReadOnly { copy }`)
+  and Save takes both from it (`a_bundle_open_on_another_pc_opens_read_only_or_taken_over`).
+- A bundle tab whose lock was taken over elsewhere could never be saved again, with a wrong
+  "being opened by another ScanCraft" message. `WorkFolder::relock` takes back a lock that has
+  been let go (as a folder tab does); one held by someone else refuses the save naming them and
+  points to saving under another name (`a_bundle_taken_over_elsewhere_saves_once_it_is_let_go`,
+  io `a_lock_taken_over_and_let_go_is_taken_back_on_save`).
+- The second start's ignored options were replaced at once by the open's own messages, and the
+  text spoke of a project when none was given. They now go with the result of the open
+  (`ScanCraftApp::carried_note`, `take_handover`), and the text has a form without a project.
+- Add Project through the file dialog showed "Shell.scancraft" or "project.json" in the status
+  and history; it now shows the project's name (`project_label`).
+- Quit over an open lock or conflict question: Save All did nothing and said nothing. It is now
+  disabled with the reason, and says it when triggered (`save_all_blocked`). The lock question's
+  Cancel says "Not opened".
+- Paths stored in a project (keyframes, surfaces, cleaned clouds, colour keyframes, outputs) were
+  resolved as given: a crafted project or bundle could make the app read any local file or a UNC
+  share (sending Windows credentials). `project::resolve` now refuses anything but a plain
+  relative path inside the project folder, for folders and bundles alike (raw recordings, never
+  read on open, are the exception): `files_named_outside_the_project_folder_are_never_read`,
+  `projects_naming_files_outside_their_folder_are_refused`.
+
+Not done yet: **lazy extraction** (stored entries could be read in place; today the whole bundle
+is unpacked at disk speed); a real Settings window (the bundle options live in the Save card); a
+Take Over answer when *saving* into a folder or bundle another computer holds (refused with who
+holds it; Save As works); the single-instance check and the file association are not tested by a
+real double-click (no GUI runs on this PC during the benchmarks); an Explorer thumbnail.

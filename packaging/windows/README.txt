@@ -14,6 +14,10 @@ STARTING
                                     Scanner and PC must be on the same network.
   scancraft.exe --connect <ip>      Connect to a scanner at a known address.
   scancraft.exe --mock              Built-in simulated scanner (no hardware needed).
+  scancraft.exe <project>           Open a project file (.scancraft), bundle
+                                    (.scancraftz) or project folder. The installer
+                                    registers both file types: a double-click opens
+                                    them, in the running ScanCraft as a new tab.
   "ScanCraft (record).bat"          As scancraft.exe, and the raw stream of every scan
                                     is saved to the "recordings" folder next to it, for
                                     later analysis. Several MB per second: delete

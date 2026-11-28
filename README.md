@@ -22,6 +22,15 @@ scene; scanning with a moving scanner is only partly tested. See
 
 - `scancraft.exe` — start, then *Connect → Find Scanners* (the scanner must be on the same
   network as the PC).
+- Double-click a project file (`<name>.scancraft`, in the project folder) or a bundle
+  (`<name>.scancraftz`, the whole project in one file) — the installer registers both. While
+  ScanCraft runs, it opens as a new tab there; a second app is never started (only one program may
+  use the scanner). `scancraft.exe <project file, bundle or folder>` does the same (options such
+  as `--mock` or `--connect` then are not applied: the running app says so);
+  `--new-instance` starts a second app anyway.
+- A project open on another PC (a shared folder) can be opened read-only, or taken over after a
+  warning naming that PC; a save over a version someone else saved asks first (Save Anyway /
+  Save As…).
 - `scancraft.exe --connect <scanner ip>` — connect to a known address at start.
 - `scancraft.exe --mock` — a built-in simulated scanner, to try the app without hardware.
 - `ScanCraft (record).bat` — as the first, and every scan's raw stream is written to a
