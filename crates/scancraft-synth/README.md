@@ -163,6 +163,109 @@ Probe failures that show what the mesher does:
 
 The dome, the R 65 barrel and the noise series pass every probe, including all marker sites.
 
+## Evaluation as the app runs it (`synth_eval`, 2026-11-28)
+
+`synth_eval` runs every scene through the app's pipeline with the app's default settings and
+measures Reconstruct and Make Solid against the truth. The app is a binary crate with a GPU
+interface, so the pipeline is copied on library calls in `src/app_pipeline.rs`; the table at the
+top of that file names the app function each step copies (keep them in step when the app
+changes):
+
+1. Import Scan of each pass with the `marker_framework.mkf` beside it;
+2. object isolation on import (the app's default, "whole scene" off; `--whole-scene` turns it
+   off as the app's setting does);
+3. passes placed at their **true poses** (`pass_to_part`), so alignment is out of the mesh
+   evaluation; the pass faults (offsets, depth bias, strays) stay;
+4. an alignment check: the app's Auto Align (`align_robust`) of every further pass against pass
+   1, compared with the true pose (`--no-align` skips it);
+5. Merge (pitch 0.5 mm, outliers 12 / 3.0), Reconstruct (listed markers on the surface, prepare,
+   cell 0.7, detail 3, smoother 4 / 0.7, marker fairing), Make Solid (cell 0.4, markers removed).
+
+```powershell
+cargo run --release -p scancraft-synth --example synth_eval -- E:\Claude\testdata\synthetic E:\Claude\eval\synth [filter] [--no-align] [--no-solid] [--whole-scene]
+python scripts\render_features.py E:\Claude\testdata\synthetic E:\Claude\eval\synth [filter] [--only-failed]
+python scripts\compact_table.py E:\Claude\eval\synth\results.json
+```
+
+Each scene runs in a child process (its own peak memory). Output: `results.txt` (table,
+isolation losses, every failing feature with its reasons and image), `results.json`, and per
+scene `eval.json`, `reconstruct.ply` / `solid.ply` (vertex property `dev` = signed distance to the
+true part) and `merged.ply`. The renders (`img/<scene>__<feature>.png`, plus `__overview` and
+`__overview_tilted`) show truth / Reconstruct / Make Solid in grazing light (12° above the
+surface) and the merged points / Reconstruct / Make Solid coloured by signed distance (±0.1 mm).
+
+What is measured (`src/eval.rs`), always against the exact true shape:
+
+- **global**: output -> truth (area weighted, over vertices within 0.75 mm of a measured point;
+  the rest is reported as made-up surface), truth -> output over the true surface the passes saw
+  (mean, rms, p50/p95/p99, max, share with no mesh within 1 mm), area outside the part (tables)
+  and 0.3–2 mm inside the material (stray layers), topology (watertight, manifold, components,
+  genus against the truth's genus, boundary loops), run time and peak working set per stage;
+- **marker sites / cut-outs**: centre deviation, rms and max over the sticker disc, share left
+  open, radial profile, the largest ring against the surrounding surface and the largest step
+  between 0.5 mm rings, and how much of the true curvature the fill follows (1 = as the surface,
+  0 = flat; on curved surfaces only);
+- **through slots and holes**: open at each station (no surface on the axis through the plate),
+  width at mid-thickness and just under the top; **blind grooves and pockets**: share of the
+  depth kept, width; **boss pilots**: true vs meshed surfaces along the pilot axis, pilot width;
+- **relief**: share of the height (depth) kept at each top probe, against the base round it;
+- **edges**: distance of the mesh from the edge line, the rounding radius that distance means
+  (for the edge's angle; for fillets the radius found), and the bead beside the edge (highest
+  bulge 0.3–3 mm from the edge against the face's level further away);
+- **laser strays**: stray points left after Merge and after Reconstruct's preparation, share of
+  the window with a layer 0.3–1.4 mm inside the material, pits;
+- **pass offset**: mean signed distance on surface seen by pass 1 only, by other passes only and
+  by both; the step between them.
+
+Tests (`src/eval_tests.rs`): three small scenes of their own run in about 2 s in a debug build
+(`cargo test -p scancraft-synth`): a plate with a kept and a cut-out sticker and a 3 mm slot, a
+dome with a kept and a cut-out sticker, a plate with laser strays. `known_failure_*` tests
+(ignored) assert the ideal where the pipeline falls short now. `synth_catalogue` (ignored, about
+4 min in release) runs the whole catalogue from `SCANCRAFT_SYNTH_DATA` and fails when a scene
+fails more features or passes fewer probes than on 2026-11-28, or Make Solid is not watertight:
+
+```powershell
+$env:SCANCRAFT_SYNTH_DATA = "E:\Claude\testdata\synthetic"
+cargo test --release -p scancraft-synth --lib -- --ignored synth_catalogue
+cargo test -p scancraft-synth --lib -- --ignored known_failure
+```
+
+### Findings of the first run (2026-11-28, `agent/synth-scenes` on `agent/mesh-fixes` aafe808)
+
+Results in `E:\Claude\eval\synth` (isolation on, as the app's default) and
+`E:\Claude\eval\synth\whole_scene` (isolation off). Not fixed here.
+
+- **Cut-out marker sites are never used.** Revo lists the stickers it cut out, but
+  `markers_on_surface` keeps a marker only with a point within 3 mm of its centre; a cut-out has
+  none within 5.5 mm. Reconstruct leaves 45 of the 48 cut-outs open (6 scenes; the 3 on the cup
+  count only because the inside of its 2.5 mm wall is within 3 mm); Make
+  Solid closes them with its hole filling, without the marker fairing (dents of 0.05–0.15 mm on
+  the R 15 ball, a 0.2 mm bump on the saddle).
+- **Isolation removes real part** when a part has no table under it: the plate under the R 15
+  ball (39 500 points), the plate under the fins (96 000 of 109 000), half of the grazing
+  cylinder, and the whole plate of the turned-over pass of `plate_screws_bosses_ribs`.
+- **Make Solid of a plate seen from one side** guesses the wall: 3.0 mm normally, but the laser
+  strays (`flat_laser_strays`, 0.97 mm) or the relief (`relief_fine`, 0.82 mm, genus 36 instead
+  of 0) set it, so the made-up bottom lies where the strays were or cuts through the relief.
+- **Laser strays**: Reconstruct's preparation keeps 2 781 of 6 753 (a layer under 29 % of the
+  window, pits to −0.2 mm).
+- **Pass offsets**: Make Solid estimates and removes the 0.15 mm offset of an overlapping pass
+  (`flat_two_pass_offset`, shift 0.143 mm); Reconstruct keeps it (sites −0.15 mm). On the shell
+  (inside pass 0.15 mm too deep, no overlap) Make Solid shifts the *outside* pass by −0.076 mm.
+- **Holes and slots**: Reconstruct caps 72 of 99 1.5 mm holes and narrows slots (1.5 -> 1.0 mm,
+  3 -> 2.4 mm, walls missing on the 4 mm slot); Make Solid keeps them open but 0.3–0.4 mm narrow
+  at mid-thickness and wide at the top (edges rounded).
+- **Edges**: rounded (fillet 0.5 comes out 1.05–1.1 mm), and Make Solid leaves a bead 0.05–0.3 mm
+  proud within 1–2 mm of edges and chamfers.
+- **Thin plate print-through**: on the 2 mm `plate_screws_bosses_ribs` Make Solid shows the ribs
+  and bosses underneath as 0.05–0.1 mm dents on the top.
+- **Auto Align** (geometry only) puts the second pass of every symmetric part (plates, block,
+  shell) 180° round: the parts here are symmetric and their marker lists were not used.
+- **What passes**: domes (all noise levels, density steps) and R 65 barrels — every kept marker
+  site flush and following the curvature in both meshes, Make Solid watertight with the right
+  genus everywhere except `box_edges` (genus 1 for 0) and `relief_fine`; the grille's genus 141
+  is exact.
+
 ## Limits
 
 - No speckle or stripe structure in the noise. The noise is white along the ray, with no

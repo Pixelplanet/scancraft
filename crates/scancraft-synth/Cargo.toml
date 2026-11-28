@@ -14,7 +14,7 @@ glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 rayon.workspace = true
-
-[dev-dependencies]
-# examples/synth_baseline.rs: the app's Reconstruct on a scene, scored against the truth.
+# app_pipeline.rs / eval.rs: the app's Merge, Reconstruct and Make Solid on library calls.
 scancraft-mesh.workspace = true
+scancraft-align.workspace = true
+scancraft-fusion.workspace = true

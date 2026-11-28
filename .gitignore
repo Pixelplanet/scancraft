@@ -9,6 +9,7 @@ calibration/
 !client/*.py
 !tests/*.py
 !tools/sam2/*.py
+!crates/scancraft-synth/scripts/*.py
 3dcamera_exports.txt
 target/
 *.pdb

@@ -7205,7 +7205,9 @@ version = "0.2.0"
 dependencies = [
  "glam 0.29.3",
  "rayon",
+ "scancraft-align",
  "scancraft-core",
+ "scancraft-fusion",
  "scancraft-io",
  "scancraft-mesh",
  "serde",

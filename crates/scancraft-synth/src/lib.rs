@@ -10,8 +10,12 @@
 //! [`write::generate`] writes a scene folder that the app imports as it imports Revo projects;
 //! [`score::score`] checks a mesh against the scene's `truth.json`. See `README.md`.
 
+pub mod app_pipeline;
+pub mod eval;
+pub mod memory;
 pub mod mkf;
 pub mod rng;
+pub mod run;
 pub mod scan;
 pub mod scene;
 pub mod scenes;
@@ -27,3 +31,5 @@ pub use write::{generate, Options, Truth};
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod eval_tests;
