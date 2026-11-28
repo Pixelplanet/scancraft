@@ -754,7 +754,8 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
             };
             let weights_differ = placed.iter().any(|p| (p.1 - placed[0].1).abs() > 1e-6);
             let top = placed.iter().max_by(|a, b| a.1.total_cmp(&b.1)).map(|p| p.0.clone());
-            let markers: usize = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).filter_map(|p| app.marker_maps.get(&p.id)).map(|m| m.len()).sum();
+            let listed: usize = app.passes.iter().filter(|p| p.meta.included && p.meta.alignment.is_placed()).map(|p| p.markers.len()).sum();
+            let (markers, exact) = app.solid_marker_count();
             let s = &mut app.settings;
             kit::row(ui, "Input", |ui| kit::value_field(ui, &input, true));
             if !placed.is_empty() {
@@ -762,8 +763,12 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
                 kit::note_with_tip(ui, &format!("Each pass is a scan of its own: {order}."), "Set a pass's merge weight in its Selected Pass panel. The solid keeps one layer per surface, from the most trusted pass covering it.");
             }
             kit::slider_row(ui, "Cell size", &mut s.solid_cell_mm, 0.25..=1.5, 2, "mm").on_hover_text("The wall should be at least 6 cells thick. Smaller cells keep finer detail and take longer.");
-            let marker_label = if markers > 0 { format!("Remove marker stickers ({markers} from tracking + detected)") } else { "Find and remove marker stickers".to_string() };
-            kit::checkbox(ui, &marker_label, &mut s.solid_remove_markers);
+            let tip = format!(
+                "{listed} marker{} listed in the passes. Make Solid uses those on each pass's surface{} and finds the other stickers in the scan.",
+                if listed == 1 { "" } else { "s" },
+                if s.whole_scene { "" } else { " of the object" }
+            );
+            kit::checkbox(ui, &solid_marker_label(markers, exact), &mut s.solid_remove_markers).on_hover_text(tip);
             if weights_differ {
                 if let Some(top) = top {
                     kit::checkbox(ui, &format!("Sharp edges from {top}"), &mut s.solid_sharp_top).on_hover_text("Treat the most trusted pass as clean and dense: a narrower kernel keeps its edges sharp. Leave off for noisy scans (thin plates can open slits).");
@@ -910,6 +915,16 @@ fn path_field(app: &mut ScanCraftApp, ui: &mut egui::Ui, purpose: PickPurpose) {
             app.pick(&ui.ctx().clone(), purpose);
         }
     });
+}
+
+/// The Make Solid marker option: `markers` listed markers on the passes' surfaces (an upper
+/// bound unless `exact`: a pass not yet isolated still counts its table and blocks).
+pub(crate) fn solid_marker_label(markers: usize, exact: bool) -> String {
+    match (markers, exact) {
+        (0, _) => "Find and remove marker stickers".to_string(),
+        (n, true) => format!("Remove marker stickers ({n} listed on the surface + found)"),
+        (n, false) => format!("Remove marker stickers (up to {n} listed on the surface + found)"),
+    }
 }
 
 fn fill_holes_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {

@@ -1,6 +1,7 @@
 //! Bringing passes in from outside the project: a scan file (PLY, OBJ, STL) becomes a fixed pass,
 //! and the passes of another ScanCraft project are appended with fresh ids. Both arrive
-//! unaligned, so Align All can connect them to the rest.
+//! unaligned, so Align All can connect them to the rest. A scan from a Revo Scan project folder
+//! brings Revo's marker list (`marker_framework.mkf`) along as the pass's marker map.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -8,7 +9,7 @@ use std::sync::Arc;
 use scancraft_core::{Point3D, PointCloud, Transform};
 
 use crate::isolation::{self, MaskCache};
-use crate::project::{self, AlignState, LoadedPass, PassMeta, PassOrigin};
+use crate::project::{self, AlignState, LoadedPass, PassMarker, PassMeta, PassOrigin};
 
 /// A scan whose largest extent is below this many units is taken to be in metres (ScanCraft works
 /// in mm; no real scan is under 2 mm across).
@@ -25,6 +26,10 @@ pub struct ImportedScan {
     /// The file looks like it is in metres.
     pub likely_metres: bool,
     pub normals: scancraft_io::NormalSource,
+    /// Markers read from the marker file next to it (pass frame, as the file's points).
+    pub markers: Vec<PassMarker>,
+    /// The marker file it came with, if any: its name, and the error when it could not be read.
+    pub marker_file: Option<(String, Option<String>)>,
 }
 
 /// Largest edge of the cloud's bounding box (0 for an empty cloud).
@@ -55,7 +60,9 @@ pub fn scaled(cloud: &PointCloud, factor: f32) -> PointCloud {
 }
 
 /// Reads a scan file as a fixed pass. Normals come from the file, else its faces, else they are
-/// estimated (`scancraft_io::import_scan`). Units are assumed to be mm.
+/// estimated (`scancraft_io::import_scan`). Units are assumed to be mm. A `marker_framework.mkf`
+/// in the same folder (Revo Scan writes one per project, in the frame of its `raw_preview.ply`)
+/// becomes the pass's marker map; one that cannot be read is reported, not an error.
 pub fn read_scan(path: &Path) -> Result<ImportedScan, String> {
     let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "scan".into());
     let scan = scancraft_io::import_scan(path).map_err(|e| format!("Could not import {file}: {e}"))?;
@@ -68,7 +75,19 @@ pub fn read_scan(path: &Path) -> Result<ImportedScan, String> {
     let mask = isolation::new_cache();
     // The object is worked out now, as it would be for a captured pass when first needed.
     isolation::mask_for(&mask, &project::fixed_cloud(&surface).points);
-    Ok(ImportedScan { name: pass_name_for(path), meta: PassMeta::imported(file), surface: Arc::new(surface), mask, likely_metres, normals: scan.normal_source })
+    let (markers, marker_file) = markers_beside(path);
+    Ok(ImportedScan { name: pass_name_for(path), meta: PassMeta::imported(file), surface: Arc::new(surface), mask, likely_metres, normals: scan.normal_source, markers, marker_file })
+}
+
+/// The markers of the marker file next to the scan file `path` (see [`read_scan`]). The import
+/// does not move or scale the points, so the markers stay in the file's frame as well.
+fn markers_beside(path: &Path) -> (Vec<PassMarker>, Option<(String, Option<String>)>) {
+    let Some(mkf) = scancraft_io::marker_framework_beside(path) else { return (Vec::new(), None) };
+    let name = scancraft_io::revo::MARKER_FRAMEWORK_FILE.to_string();
+    match scancraft_io::read_marker_framework(&mkf) {
+        Ok(list) => (list.iter().map(PassMarker::from_revo).collect(), Some((name, None))),
+        Err(e) => (Vec::new(), Some((name, Some(e.to_string())))),
+    }
 }
 
 /// File names scanning programs give every export, which say nothing about the scan. Revo Scan
@@ -153,13 +172,29 @@ pub fn remap(passes: &mut [LoadedPass], next_id: u32, taken: &[String], project:
     id
 }
 
+/// Tests: Revo's `marker_framework.mkf` layout (version 3, 104-byte records) with `markers`
+/// (centre, normal, radius).
+#[cfg(test)]
+pub(crate) fn mkf_bytes(markers: &[([f64; 3], [f64; 3], f32)]) -> Vec<u8> {
+    let mut b = [3u32.to_le_bytes(), (markers.len() as u32).to_le_bytes()].concat();
+    for (c, n, r) in markers {
+        let start = b.len();
+        c.iter().chain(n).for_each(|v| b.extend_from_slice(&v.to_le_bytes()));
+        b.extend_from_slice(&(-1i32).to_le_bytes());
+        b.resize(start + 92, 0);
+        b.extend_from_slice(&r.to_le_bytes());
+        b.resize(start + 104, 0);
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use scancraft_driver::ScanConfig;
 
     fn loaded(id: u32, name: &str) -> LoadedPass {
-        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None };
+        let stored = project::StoredPass { id, name: name.into(), frames: 1, visible: true, meta: PassMeta::new(ScanConfig::default(), None, project::PassStart::Moved), keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() };
         project::rebuild(stored)
     }
 
@@ -206,6 +241,33 @@ mod tests {
         let mm = scaled(&scan.surface, 1000.0);
         assert!((largest_extent(&mm) - 190.0).abs() < 0.01);
         assert!(read_scan(&dir.join("missing.ply")).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_revo_scan_brings_its_marker_file() {
+        let dir = std::env::temp_dir().join(format!("scancraft-import-revo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let points: Vec<Point3D> = (0..400).map(|i| Point3D::new([(i % 20) as f32, (i / 20) as f32, 300.0]).with_normal([0.0, 0.0, -1.0])).collect();
+        let path = dir.join("raw_preview.ply");
+        scancraft_io::save_ply_binary(&PointCloud::from_points(points), &path).unwrap();
+        // No marker file: no markers, nothing to report.
+        let scan = read_scan(&path).unwrap();
+        assert!(scan.markers.is_empty() && scan.marker_file.is_none());
+        let mkf_path = dir.join(scancraft_io::revo::MARKER_FRAMEWORK_FILE);
+        std::fs::write(&mkf_path, mkf_bytes(&[([5.0, 6.0, 300.1], [0.0, 0.0, -1.0], 3.05), ([50.0, 60.0, 250.0], [0.6, 0.8, 0.0], 3.0)])).unwrap();
+        let scan = read_scan(&path).unwrap();
+        assert_eq!(scan.marker_file, Some((scancraft_io::revo::MARKER_FRAMEWORK_FILE.to_string(), None)));
+        assert_eq!(scan.markers.len(), 2);
+        let m = scan.markers[0];
+        assert!((m.centre - glam::Vec3::new(5.0, 6.0, 300.1)).length() < 1e-4, "same frame as the points");
+        assert_eq!((m.normal, m.radius_mm), (Some(glam::Vec3::NEG_Z), Some(3.05)));
+        // A broken file does not stop the import; it is reported.
+        std::fs::write(&mkf_path, &mkf_bytes(&[([1.0, 2.0, 3.0], [0.0, 0.0, 1.0], 3.0)])[..50]).unwrap();
+        let scan = read_scan(&path).expect("the scan is still imported");
+        assert!(scan.markers.is_empty());
+        assert!(scan.marker_file.as_ref().is_some_and(|(_, e)| e.is_some()), "{:?}", scan.marker_file);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

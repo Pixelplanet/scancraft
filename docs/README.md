@@ -16,6 +16,7 @@ documents disagree, the one higher in this list wins.
 | [architecture/scan-sessions.md](architecture/scan-sessions.md) | Projects, passes, alignment: the application's data model |
 | [architecture/splatting.md](architecture/splatting.md) | Gaussian-splat output |
 | [architecture/merge-and-ai.md](architecture/merge-and-ai.md) | Merging scans and AI object segmentation: decisions, Revo's approach, alignment test on real scans, plan |
+| [protocol/revo-marker-framework.md](protocol/revo-marker-framework.md) | Revo Scan's per-project marker list `marker_framework.mkf`: byte layout with evidence, how it is used (import, alignment test) |
 | [architecture/ui-wording.md](architecture/ui-wording.md) | UI wording and button placement: the glossary, capitals and disabled-reason rules every text and button in the app follows |
 
 ## Per-mode notebooks (current at the end, history above)

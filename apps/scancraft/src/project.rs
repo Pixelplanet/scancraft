@@ -8,7 +8,7 @@ use glam::{Quat, Vec3};
 use scancraft_align::{PassCloud, Quality, View};
 use scancraft_core::{Mesh, Point3D, PointCloud, Transform};
 use scancraft_driver::{DeviceInfo, LightSource, ScanConfig};
-use scancraft_io::project::{self as files, AlignmentRecord, KeyframeRecord, OutputRecord, PassRecord, ProjectFile};
+use scancraft_io::project::{self as files, AlignmentRecord, KeyframeRecord, MarkerRecord, OutputRecord, PassRecord, ProjectFile};
 use scancraft_slam::{Keyframe, KeyframeData, SeedView, Tracker, TrackerConfig};
 
 use crate::model::{KeyframeInfo, SharedTracker};
@@ -166,6 +166,76 @@ impl PassMeta {
     /// A pass read from the scan file `source` (unaligned, default merge weight).
     pub fn imported(source: String) -> Self {
         PassMeta { raw_recording: None, origin: PassOrigin::File { source }, ..PassMeta::new(ScanConfig::default(), None, PassStart::Moved) }
+    }
+}
+
+/// One marker sticker of a pass's marker map, in the pass frame (mm). It comes from the tracker
+/// while capturing (centre only) or from the marker file next to an imported scan (Revo's
+/// `marker_framework.mkf`, with normal and radius). Saved with the project
+/// (`pass-<id>/markers.json`), shown when the pass is selected and used by Make Solid.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PassMarker {
+    pub centre: Vec3,
+    /// Unit normal out of the surface, when the source gives one.
+    pub normal: Option<Vec3>,
+    pub radius_mm: Option<f32>,
+    /// Matched in the newest frame while capturing (not saved).
+    pub matched: bool,
+}
+
+/// Two marker centres closer than this (mm) are one sticker (stickers are about 6 mm across, so
+/// two different ones are farther apart).
+pub const SAME_MARKER_MM: f32 = 3.0;
+
+impl PassMarker {
+    /// A marker of the tracker's map.
+    pub fn tracked(centre: [f32; 3], matched: bool) -> Self {
+        PassMarker { centre: Vec3::from_array(centre), normal: None, radius_mm: None, matched }
+    }
+
+    /// A marker of Revo's marker file.
+    pub fn from_revo(m: &scancraft_io::RevoMarker) -> Self {
+        let normal = Vec3::from_array(m.normal.map(|v| v as f32)).normalize_or_zero();
+        PassMarker {
+            centre: Vec3::from_array(m.centre.map(|v| v as f32)),
+            normal: (normal != Vec3::ZERO).then_some(normal),
+            radius_mm: (m.radius_mm > 0.0).then_some(m.radius_mm),
+            matched: false,
+        }
+    }
+
+    /// The marker with the pass's coordinates multiplied by `factor` (see `imports::scaled`).
+    pub fn scaled(&self, factor: f32) -> Self {
+        PassMarker {
+            centre: self.centre * factor,
+            normal: self.normal.map(|n| if factor < 0.0 { -n } else { n }),
+            radius_mm: self.radius_mm.map(|r| r * factor.abs()),
+            matched: self.matched,
+        }
+    }
+
+    /// A pass's marker map while capturing: the markers it had when the capture started (`base`,
+    /// kept as they are) and those of the capture's tracker map (`tracked`, pass frame) that are
+    /// not within [`SAME_MARKER_MM`] of one of them. A base marker counts as matched when a
+    /// matched tracker marker lies that close. The capture's tracker starts with an empty map, so
+    /// on Continue Pass its map alone would drop every marker the pass already had.
+    pub fn merged(base: &[PassMarker], tracked: &[([f32; 3], bool)]) -> Vec<PassMarker> {
+        let near = |a: Vec3, b: Vec3| a.distance_squared(b) < SAME_MARKER_MM * SAME_MARKER_MM;
+        let mut out: Vec<PassMarker> = base
+            .iter()
+            .map(|m| PassMarker { matched: tracked.iter().any(|(c, matched)| *matched && near(m.centre, Vec3::from_array(*c))), ..*m })
+            .collect();
+        out.extend(tracked.iter().filter(|(c, _)| !base.iter().any(|m| near(m.centre, Vec3::from_array(*c)))).map(|(c, matched)| PassMarker::tracked(*c, *matched)));
+        out
+    }
+
+    fn record(&self) -> MarkerRecord {
+        MarkerRecord { centre: self.centre.to_array(), normal: self.normal.map(|n| n.to_array()), radius_mm: self.radius_mm }
+    }
+
+    fn from_record(r: &MarkerRecord) -> Self {
+        let normal = r.normal.map(Vec3::from_array).map(Vec3::normalize_or_zero).filter(|n| *n != Vec3::ZERO);
+        PassMarker { centre: Vec3::from_array(r.centre), normal, radius_mm: r.radius_mm.filter(|v| v.is_finite() && *v > 0.0), matched: false }
     }
 }
 
@@ -366,6 +436,8 @@ pub struct StoredPass {
     /// Which surfels are the object (`crate::isolation`), if it was computed. Saved so an opened
     /// project does not segment every pass again; its fingerprint decides whether it still fits.
     pub mask: Option<Arc<crate::isolation::ObjectMask>>,
+    /// Its marker map (empty: none).
+    pub markers: Vec<PassMarker>,
 }
 
 /// What a project folder holds.
@@ -467,6 +539,21 @@ pub fn cleaned_path(id: u32) -> String {
 /// A pass's saved object labels, relative to the project folder.
 pub fn mask_path(id: u32) -> String {
     format!("{}/object.bin", files::pass_dir(id))
+}
+
+/// A pass's marker map: [`files::markers_path`] (optional, like the object labels).
+fn read_markers(dir: &Path, id: u32) -> Vec<PassMarker> {
+    let path = dir.join(files::markers_path(id));
+    if !path.is_file() {
+        return Vec::new();
+    }
+    match files::read_markers(&path) {
+        Ok(records) => records.iter().map(PassMarker::from_record).collect(),
+        Err(e) => {
+            log::warn!("the marker map of pass {id} is not used: {e}");
+            Vec::new()
+        }
+    }
 }
 
 pub fn cleaned_counts_path(id: u32) -> String {
@@ -676,6 +763,13 @@ pub fn save(dir: &Path, project: &StoredProject) -> Result<(), String> {
                 let _ = std::fs::remove_file(dir.join(mask_path(p.id)));
             }
         }
+        let markers = dir.join(files::markers_path(p.id));
+        if p.markers.is_empty() {
+            let _ = std::fs::remove_file(markers);
+        } else {
+            let records: Vec<MarkerRecord> = p.markers.iter().map(PassMarker::record).collect();
+            files::write_markers(&markers, &records).map_err(|e| e.to_string())?;
+        }
     }
     let mut outputs = Vec::new();
     std::fs::create_dir_all(dir.join("outputs")).map_err(|e| e.to_string())?;
@@ -754,6 +848,7 @@ pub fn load(dir: &Path) -> Result<StoredProject, String> {
             rgb_keyframes,
             // Optional: a missing or unreadable file only means it is computed again.
             mask: std::fs::read(dir.join(mask_path(record.id))).ok().and_then(|b| crate::isolation::ObjectMask::from_bytes(&b)).map(Arc::new),
+            markers: read_markers(dir, record.id),
         });
     }
     let output = |kind: &str| file.outputs.iter().find(|o| o.kind == kind);
@@ -829,8 +924,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
-                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 10, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() },
+                StoredPass { id: 2, name: "Flipped".into(), frames: 20, visible: false, meta: aligned.clone(), keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() },
             ],
             merged: Some((merged, vec![1])),
             cleaned: None,
@@ -913,8 +1008,8 @@ mod tests {
             reference: Some(1),
             next_pass_id: 3,
             passes: vec![
-                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None },
-                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None, rgb_keyframes: Vec::new(), mask: None },
+                StoredPass { id: 1, name: "Pass 1".into(), frames: 4, visible: true, meta: reference, keyframes: keyframes.clone(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() },
+                StoredPass { id: 2, name: "shell.ply".into(), frames: 0, visible: true, meta: imported.clone(), keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() },
             ],
             merged: None,
             cleaned: None,
@@ -964,7 +1059,7 @@ mod tests {
             name: "Cleaned".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)), rgb_keyframes: Vec::new(), mask: None }],
+            passes: vec![StoredPass { id: 1, name: "shell.ply".into(), frames: 0, visible: true, meta, keyframes: Vec::new(), surface: Some(Arc::clone(&s)), edit: Some(Arc::clone(&edit)), rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -1018,6 +1113,7 @@ mod tests {
             edit: None,
             rgb_keyframes: Vec::new(),
             mask,
+            markers: Vec::new(),
         };
         let project = StoredProject {
             name: "Quality".into(),
@@ -1044,6 +1140,69 @@ mod tests {
     }
 
     #[test]
+    fn marker_maps_round_trip_and_go_with_their_pass() {
+        let dir = std::env::temp_dir().join(format!("scancraft-app-markers-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut meta = PassMeta::imported("raw_preview.ply".into());
+        meta.alignment = AlignState::Reference;
+        let revo = PassMarker::from_revo(&scancraft_io::RevoMarker { centre: [108.9, 85.9, 260.6], normal: [0.0, 0.6, -0.8], radius_mm: 3.05, id: -1 });
+        let tracked = PassMarker::tracked([1.0, 2.0, 3.0], true);
+        let s = surface();
+        let pass = |id: u32, markers: Vec<PassMarker>| StoredPass {
+            id,
+            name: format!("p{id}"),
+            frames: 0,
+            visible: true,
+            meta: meta.clone(),
+            keyframes: Vec::new(),
+            surface: Some(Arc::clone(&s)),
+            edit: None,
+            rgb_keyframes: Vec::new(),
+            mask: None,
+            markers,
+        };
+        let mut project = StoredProject {
+            name: "Markers".into(),
+            reference: Some(1),
+            next_pass_id: 3,
+            passes: vec![pass(1, vec![revo, tracked]), pass(2, Vec::new())],
+            merged: None,
+            cleaned: None,
+            mesh: None,
+            settings: serde_json::json!({}),
+        };
+        save(&dir, &project).unwrap();
+        assert!(dir.join(files::markers_path(1)).is_file() && !dir.join(files::markers_path(2)).exists());
+        let loaded = load(&dir).unwrap();
+        let back = &loaded.passes[0].markers;
+        assert_eq!(back.len(), 2);
+        assert_eq!((back[0].centre, back[0].normal, back[0].radius_mm), (revo.centre, revo.normal, Some(3.05)));
+        assert_eq!((back[1].centre, back[1].normal, back[1].radius_mm), (tracked.centre, None, None));
+        assert!(!back[1].matched, "the match state of a capture is not saved");
+        assert!(loaded.passes[1].markers.is_empty());
+        // Rebuilt (Open Project, Add Project) the pass keeps them.
+        assert_eq!(rebuild(loaded.passes.into_iter().next().unwrap()).stored.markers.len(), 2);
+        // A damaged file loses the map, not the project.
+        std::fs::write(dir.join(files::markers_path(1)), b"{").unwrap();
+        assert!(load(&dir).unwrap().passes[0].markers.is_empty());
+        // Saved without markers, the file goes.
+        project.passes[0].markers.clear();
+        save(&dir, &project).unwrap();
+        assert!(!dir.join(files::markers_path(1)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scaled_markers_follow_their_pass() {
+        let m = PassMarker { centre: Vec3::new(0.1, 0.2, 0.3), normal: Some(Vec3::Z), radius_mm: Some(0.003), matched: false };
+        let mm = m.scaled(1000.0);
+        assert!((mm.centre - Vec3::new(100.0, 200.0, 300.0)).length() < 1e-3);
+        assert_eq!(mm.normal, Some(Vec3::Z));
+        assert!((mm.radius_mm.unwrap() - 3.0).abs() < 1e-5);
+        assert_eq!(m.scaled(-1.0).normal, Some(-Vec3::Z), "a mirror flips the normal as it flips the surface's");
+    }
+
+    #[test]
     fn an_old_alignment_record_reads_as_partly_measured() {
         let r = AlignmentRecord { status: "aligned".into(), method: Some("auto".into()), overlap: Some(0.5), rmse_mm: Some(0.2), visibility_conflict: Some(0.01), ..Default::default() };
         let AlignState::Aligned { quality: Some(q), .. } = alignment_state(&r) else { panic!() };
@@ -1064,7 +1223,7 @@ mod tests {
             name: "Old".into(),
             reference: Some(1),
             next_pass_id: 2,
-            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None }],
+            passes: vec![StoredPass { id: 1, name: "Pass 1".into(), frames: 1, visible: true, meta, keyframes: Vec::new(), surface: None, edit: None, rgb_keyframes: Vec::new(), mask: None, markers: Vec::new() }],
             merged: None,
             cleaned: None,
             mesh: None,
@@ -1116,6 +1275,7 @@ mod tests {
                 edit: None,
                 rgb_keyframes: vec![kf],
                 mask: None,
+                markers: Vec::new(),
             }],
             merged: None,
             cleaned: None,

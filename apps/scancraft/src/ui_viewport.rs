@@ -869,11 +869,18 @@ fn marker_map_layer(app: &ScanCraftApp, t: &Tokens) -> Option<(u64, Arc<Vec<scan
         (_, Some(Node::Pass(id))) | (_, Some(Node::Frame(id, _))) => id,
         _ => return None,
     };
-    let map: &[([f32; 3], bool)] = match (&app.overlay, app.active_pass) {
-        (Some(o), Some(active)) if active == pass_id && !o.map.is_empty() => &o.map,
-        _ => app.marker_maps.get(&pass_id)?,
-    };
     let pass = app.passes.iter().find(|p| p.id == pass_id)?;
+    // While capturing, the pass's map is its markers merged with the tracker's. Markers listed
+    // where the pass has no points (Revo lists stickers on parts it cut from its preview) are
+    // not drawn: Make Solid does not use them either.
+    let on_scan = app.marker_use(pass);
+    let map: Vec<([f32; 3], bool)> = pass
+        .markers
+        .iter()
+        .enumerate()
+        .filter(|(k, _)| on_scan.as_ref().is_none_or(|u| u.on_scan.get(*k).copied().unwrap_or(true)))
+        .map(|(_, m)| (m.centre.to_array(), m.matched))
+        .collect();
     if map.is_empty() || !pass.layer.visible {
         return None;
     }
