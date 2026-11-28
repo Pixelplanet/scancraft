@@ -10,7 +10,7 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
-**Update 2026-11-28, later (branch `agent/integration`): review fixes of the capture records.**
+**Update 2026-11-28, later (branch `agent/integration`, merged into `main`): review fixes of the capture records.**
 No recording is written over or deleted without asking any more: a new recording never replaces
 a file with data and a pass folder left by a crash keeps its id; Continue Pass waits for the
 previous writer; staged recordings that a save could not move keep the tab open (it counts as
@@ -24,7 +24,7 @@ keyed per computer. POP 4 driver: a failed trigger-mode command ends the stream.
 `E:\Claude\build\scancraft-scanday\SCAN-CHECKLIST.md` (outside the repo). List:
 [open-issues.md](open-issues.md) §4.2 "Review fixes".
 
-**Update 2026-11-28 (branch `agent/integration`): a scanned pass records everything needed to
+**Update 2026-11-28 (branch `agent/integration`, merged into `main`): a scanned pass records everything needed to
 use it again offline.** Per pass: the raw wire streams (`pass-<id>/raw.bin`, `raw_rgb.bin`,
 recorded by default for real scanners through a non-blocking writer thread), `capture.json`
 (app build + git commit, device model / firmware / capabilities, serial only as a hash, scan
@@ -57,7 +57,7 @@ turntable disc and the table. Details and what is not recorded: [scan-sessions.m
 
 Numbers and the open list are in [open-issues.md](open-issues.md) §2.4.
 
-**Update 2026-11-26 (branch `agent/project-file`, not merged): projects open with a
+**Update 2026-11-26 (branch `agent/project-file`, merged into `main` 2026-11-28): projects open with a
 double-click.** A project is a folder with `<name>.scancraft` (older `project.json` folders still
 open) or one `.scancraftz` bundle, which the app unpacks into a working folder while its tab is
 open and writes back on Save. Open Project… takes either; the Save Project card saves as a folder
