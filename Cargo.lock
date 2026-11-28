@@ -6920,6 +6920,7 @@ dependencies = [
  "scancraft-driver-revopoint",
  "scancraft-fusion",
  "scancraft-io",
+ "scancraft-laser",
  "scancraft-mesh",
  "scancraft-pipeline",
  "scancraft-render",
@@ -7046,12 +7047,18 @@ name = "scancraft-io"
 version = "0.2.0"
 dependencies = [
  "byteorder",
+ "crc32fast",
+ "flate2",
  "glam 0.29.3",
+ "libc",
  "log",
  "scancraft-core",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+ "zip",
 ]
 
 [[package]]

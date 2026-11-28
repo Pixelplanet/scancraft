@@ -803,13 +803,156 @@ fn tool_body(app: &mut ScanCraftApp, ui: &mut egui::Ui, tool: Tool) {
         Tool::Scale(id) => crate::ui_orient::scale_form(app, ui, id),
         Tool::IsolateObject => isolate_form(app, ui),
         Tool::AiSegment => crate::ui_ai::ai_segment_form(app, ui),
-        Tool::SaveProject => {
-            kit::row(ui, "Folder", |ui| path_field(app, ui, PickPurpose::SaveFolder));
-            let n = app.passes.len();
-            kit::row(ui, "Contents", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
-            kit::note(ui, "Saves project.json and each pass's keyframes into the folder (created if needed). Saving again overwrites it.");
+        Tool::SaveProject => save_project_form(app, ui),
+    }
+}
+
+/// `path` turned into the other form's path: `<path>.scancraftz` for a bundle, the same path
+/// without that extension for a folder.
+pub(crate) fn switch_save_form(path: &str, bundle: bool) -> String {
+    let ext = format!(".{}", scancraft_io::project::BUNDLE_EXTENSION);
+    let path = path.trim().trim_matches('"').trim().trim_end_matches(['\\', '/']);
+    let has = path.len() > ext.len() && path.is_char_boundary(path.len() - ext.len()) && path[path.len() - ext.len()..].eq_ignore_ascii_case(&ext);
+    match (bundle, has) {
+        (true, false) if !path.is_empty() => format!("{path}{ext}"),
+        (false, true) => path[..path.len() - ext.len()].to_string(),
+        _ => path.to_string(),
+    }
+}
+
+/// What a captured pass recorded about itself (`crate::capture`): raw stream size, frames tracked
+/// and lost, the app version that captured it.
+fn capture_rows(app: &ScanCraftApp, ui: &mut egui::Ui, p: &crate::model::ScanPass) {
+    let Some(capture) = p.meta.capture.as_ref() else { return };
+    let Ok(log) = capture.lock() else { return };
+    let t = Tokens::get();
+    let bytes = log.raw_bytes();
+    let dropped = log.dropped_records();
+    let raw = match (&log.record.raw_main, bytes) {
+        (None, _) => "Not recorded".to_string(),
+        (Some(_), 0) => "Recording…".to_string(),
+        (Some(_), b) => scancraft_io::fsutil::format_bytes(b),
+    };
+    let tip = match &log.record.raw_main {
+        Some(f) => format!("Raw stream ({f}{}): replay with scancraft --replay-pass <project> {}", log.record.raw_rgb.as_deref().map(|r| format!(", {r}")).unwrap_or_default(), p.id),
+        None => "The raw stream was not recorded (see Record raw streams in the Save Project card)".into(),
+    };
+    kit::row(ui, "Raw stream", |ui| kit::value_text(ui, &raw, log.record.raw_main.is_none())).on_hover_text(tip);
+    if dropped > 0 {
+        kit::status_line(ui, &format!("{} frames not recorded (disk too slow)", thousands(dropped as usize)), t.warning);
+    }
+    let f = log.record.total_frames();
+    if f.processed > 0 {
+        let text = format!("{} tracked · {} lost of {}", thousands((f.tracking + f.slow) as usize), thousands(f.lost as usize), thousands(f.processed as usize));
+        kit::row(ui, "Tracking", |ui| kit::value_text(ui, &text, true)).on_hover_text(format!(
+            "Frames the tracker processed in {} capture{} ({} received; {} skipped for newer ones). Per frame: pass-{}/tracking.csv",
+            log.record.captures.len(),
+            if log.record.captures.len() == 1 { "" } else { "s" },
+            thousands(f.received as usize),
+            thousands(f.skipped_for_newer as usize),
+            p.id
+        ));
+    }
+    if let Some(fw) = log.record.device.get("firmware_version").and_then(|v| v.as_str()).filter(|v| !v.is_empty() && *v != "—") {
+        kit::row(ui, "Firmware", |ui| kit::value_text(ui, fw, true));
+    }
+    let short: String = log.record.app.git_commit.chars().take(7).collect();
+    kit::row(ui, "Captured with", |ui| kit::value_text(ui, &format!("ScanCraft {} ({short})", log.record.app.version), true));
+    let _ = app;
+}
+
+/// The project's notes and raw-stream recording, at the top of the Save Project card.
+fn notes_and_recording(app: &mut ScanCraftApp, ui: &mut egui::Ui, as_bundle: bool) {
+    let t = Tokens::get();
+    kit::sized_row(ui, "Notes", t.control_height * 3.0, |ui| {
+        let mut notes = app.project.notes.clone();
+        let edit = egui::TextEdit::multiline(&mut notes).desired_rows(3).desired_width(ui.available_width()).hint_text("Part, material, spray, setup… (saved with the project)");
+        if ui.add(edit).changed() {
+            app.set_notes(notes);
+        }
+    });
+    let mut record = app.prefs.record_raw;
+    if kit::checkbox(ui, "Record raw streams of real scanners", &mut record)
+        .on_hover_text("Writes each pass's raw scanner stream into the project (pass-<id>/raw.bin, raw_rgb.bin), so the scan can be replayed and processed again later. Several MB per second; a slow disk drops frames from the recording, never from the scan.")
+        .changed()
+    {
+        app.prefs.record_raw = record;
+        app.save_prefs();
+    }
+    let bytes = app.project_raw_bytes();
+    if bytes > 0 {
+        kit::row(ui, "Recorded", |ui| kit::value_text(ui, &scancraft_io::fsutil::format_bytes(bytes), true));
+        if as_bundle && !app.prefs.bundle_contents.raw_recordings {
+            kit::status_line(ui, "This project has raw recordings, but the bundle leaves them out (tick Raw stream recordings, or save a project folder)", t.warning);
         }
     }
+    ui.add_space(t.space_4);
+}
+
+/// The Save Project card: a project folder or a bundle file and, for a bundle, what goes into it
+/// and where opened bundles are unpacked. (Both become part of Settings once there is a Settings
+/// window; they are kept across starts.)
+fn save_project_form(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
+    use scancraft_io::bundle::Item;
+    let t = Tokens::get();
+    let as_bundle = scancraft_io::project::has_extension(std::path::Path::new(app.settings.project_path.trim().trim_matches('"')), scancraft_io::project::BUNDLE_EXTENSION);
+    let mut index = usize::from(as_bundle);
+    let is_bundle_tab = app.project.store.is_bundle();
+    kit::row(ui, "Save as", |ui| {
+        if kit::dropdown(ui, "save_project_form", &mut index, &["Project folder", "Bundle (one file)"], &[true, true]) {
+            app.settings.project_path = switch_save_form(&app.settings.project_path, index == 1);
+        }
+    });
+    let as_bundle = index == 1;
+    kit::row(ui, if as_bundle { "File" } else { "Folder" }, |ui| path_field(app, ui, if as_bundle { PickPurpose::SaveBundle } else { PickPurpose::SaveFolder }));
+    let n = app.passes.len();
+    kit::row(ui, "Passes", |ui| kit::value_field(ui, &format!("{n} pass{}{}", if n == 1 { "" } else { "es" }, if app.merged.is_some() || app.mesh.is_some() { " + results" } else { "" }), true));
+    notes_and_recording(app, ui, as_bundle);
+    if !as_bundle {
+        ui.add_space(t.space_4);
+        let note = if is_bundle_tab {
+            "Saves the project file (<name>.scancraft) and each pass's data into the folder; the tab then works on the folder instead of the bundle."
+        } else {
+            "Saves the project file (<name>.scancraft) and each pass's data into the folder (created if needed). Saving again overwrites it."
+        };
+        kit::note(ui, note);
+        return;
+    }
+    ui.add_space(t.space_6);
+    kit::section_heading(ui, "Bundle contents");
+    let mut core = true;
+    ui.add_enabled_ui(false, |ui| kit::checkbox(ui, Item::Core.label(), &mut core)).response.on_disabled_hover_text(format!("Always in a bundle. Needed for: {}", Item::Core.needed_for()));
+    let mut changed = false;
+    for item in Item::ALL.into_iter().filter(|i| *i != Item::Core) {
+        let mut on = app.prefs.bundle_contents.includes(item);
+        if kit::checkbox(ui, item.label(), &mut on).on_hover_text(format!("Needed for: {}", item.needed_for())).changed() {
+            app.prefs.bundle_contents.set(item, on);
+            changed = true;
+        }
+    }
+    if changed {
+        app.save_prefs();
+    }
+    ui.add_space(t.space_6);
+    let root = app.prefs.work_root();
+    let free = scancraft_io::fsutil::free_space(&root);
+    let browsing = app.picker.is_open();
+    let tip = format!(
+        "Where an opened bundle is unpacked while its tab is open (it needs room for the whole bundle). Pick a big drive for large scans.{}",
+        free.map(|f| format!(" {} free there now.", scancraft_io::fsutil::format_bytes(f))).unwrap_or_default()
+    );
+    kit::row(ui, "Unpack into", |ui| {
+        ui.horizontal(|ui| {
+            let button = ui.add_enabled(!browsing, egui::Button::new("Browse…")).on_hover_text("Choose the folder with the Windows file browser");
+            let w = (ui.available_width() - button.rect.width() - ui.spacing().item_spacing.x).max(40.0);
+            ui.allocate_ui(vec2(w, t.control_height), |ui| kit::value_field(ui, &root.display().to_string(), true)).inner.on_hover_text(&tip);
+            if button.clicked() {
+                app.pick(&ui.ctx().clone(), PickPurpose::WorkRoot);
+            }
+        });
+    });
+    ui.add_space(t.space_4);
+    kit::note(ui, "Writes one .scancraftz file with the ticked contents (hover an item: what it is needed for). These choices are kept and move to Settings later.");
 }
 
 /// The point-pair card: the picked pairs and how to pick.
@@ -1483,6 +1626,7 @@ fn selection_section(app: &mut ScanCraftApp, ui: &mut egui::Ui) {
                 let stored = p.keyframes.len();
                 kit::row(ui, "Keyframes", |ui| kit::value_text(ui, &if kept == stored { thousands(stored) } else { format!("{} of {} kept", thousands(kept), thousands(stored)) }, false));
                 kit::row(ui, "Mode", |ui| kit::value_text(ui, &format!("{} · {}", p.meta.scan_config.light.label(), p.meta.scan_config.tracking.label()), false));
+                capture_rows(app, ui, p);
             }
             let t = Tokens::get();
             kit::row(ui, "Alignment", |ui| kit::status_line(ui, &p.meta.alignment.label(), align_colour(p.meta.alignment, &t)));

@@ -37,6 +37,29 @@ pub trait DepthSource: Send {
     fn sensor_static(&self) -> bool {
         false
     }
+    /// Turntable capture: the capture volume, once it was found (for the capture record).
+    fn turntable_region(&self) -> Option<TurntableRegion> {
+        None
+    }
+    /// Laser lines: where the planes came from and the planes the session started with (for
+    /// the capture record; a replay needs them, see [`LaserPlanesChoice`]).
+    fn laser_planes(&self) -> Option<(&scancraft_laser::PlanesOrigin, Option<&scancraft_laser::planes::LaserPlaneSet>)> {
+        None
+    }
+}
+
+/// How a laser-line pipeline gets its planes.
+#[derive(Debug, Clone, Default)]
+pub enum LaserPlanesChoice {
+    /// As live: [`scancraft_laser::PLANES_ENV`], else the per-scanner cache, else calibrated
+    /// online (and saved to the cache).
+    #[default]
+    Live,
+    /// These planes (a replay of a session that started with them).
+    Given(scancraft_laser::planes::LaserPlaneSet),
+    /// Calibrated online, without reading or writing the cache (a replay of a session that
+    /// calibrated online).
+    Online,
 }
 
 /// How an overlay point took part in this frame's tracking.
@@ -189,6 +212,10 @@ impl DepthSource for LaserLines {
         let result = self.0.process(frame)?;
         (!result.cloud.is_empty()).then_some(FrameGeometry { cloud: result.cloud, depth: None })
     }
+
+    fn laser_planes(&self) -> Option<(&scancraft_laser::PlanesOrigin, Option<&scancraft_laser::planes::LaserPlaneSet>)> {
+        Some((self.0.origin(), self.0.start_planes()))
+    }
 }
 
 /// Depth from host stereo matching of the IR pair (VCSEL Rapid; reusable for Hybrid HD).
@@ -256,6 +283,12 @@ impl PassPipeline {
         }
     }
 
+    /// Turntable capture: the capture volume found in the first frames (`None` before that and
+    /// for handheld passes).
+    pub fn turntable_region(&self) -> Option<TurntableRegion> {
+        self.depth.turntable_region()
+    }
+
     /// True if the pose estimator reports an overlay (marker tracking).
     pub fn overlay_capable(&self) -> bool {
         self.pose.as_ref().is_some_and(|p| p.overlay().is_some())
@@ -288,11 +321,21 @@ impl PassPipeline {
 pub struct PipelineOptions {
     /// Used when `ScanConfig::turntable_mode` is a turntable mode.
     pub turntable: TurntableConfig,
+    /// Laser-line modes: where the planes come from.
+    pub laser: LaserPlanesChoice,
 }
 
 /// The pipeline for a scan configuration, or why there is none yet.
 pub fn pipeline_for(config: &ScanConfig, min_mm: f32, max_mm: f32) -> Result<PassPipeline, String> {
     pipeline_with(config, min_mm, max_mm, &PipelineOptions::default())
+}
+
+fn laser_depth(pattern: scancraft_laser::Pattern, choice: &LaserPlanesChoice) -> scancraft_laser::LaserLineDepth {
+    match choice {
+        LaserPlanesChoice::Live => scancraft_laser::LaserLineDepth::new(pattern),
+        LaserPlanesChoice::Given(planes) => scancraft_laser::LaserLineDepth::with_planes(pattern, planes.clone()),
+        LaserPlanesChoice::Online => scancraft_laser::LaserLineDepth::without_cache(pattern),
+    }
 }
 
 /// VCSEL Rapid working range, mm: Revo Scan 6 sends `0x707 200 600` for it (capture 2026-11-01).
@@ -302,8 +345,8 @@ pub const VCSEL_RANGE_MM: (f32, f32) = (200.0, 600.0);
 pub fn pipeline_with(config: &ScanConfig, min_mm: f32, max_mm: f32, options: &PipelineOptions) -> Result<PassPipeline, String> {
     let depth: Box<dyn DepthSource> = match config.light {
         LightSource::FullFieldHd => Box::new(OnDeviceDepth::new(min_mm, max_mm)),
-        LightSource::CrossLines => Box::new(LaserLines(scancraft_laser::LaserLineDepth::new(scancraft_laser::Pattern::Cross))),
-        LightSource::SingleLine => Box::new(LaserLines(scancraft_laser::LaserLineDepth::new(scancraft_laser::Pattern::Single))),
+        LightSource::CrossLines => Box::new(LaserLines(laser_depth(scancraft_laser::Pattern::Cross, &options.laser))),
+        LightSource::SingleLine => Box::new(LaserLines(laser_depth(scancraft_laser::Pattern::Single, &options.laser))),
         LightSource::VcselRapid => {
             // The stereo search covers the VCSEL working range (`VCSEL_RANGE_MM`) at most:
             // a wider window (the app's default near limit is 150 mm) doubles the matcher cost.

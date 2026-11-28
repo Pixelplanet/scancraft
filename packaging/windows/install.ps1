@@ -1,7 +1,9 @@
 # ScanCraft per-user installer (no administrator rights needed).
 # Run by ScanCraft-Setup.exe, or directly: powershell -ExecutionPolicy Bypass -File install.ps1
 # Installs to %LOCALAPPDATA%\Programs\ScanCraft, adds Start menu shortcuts and an entry under
-# Settings > Apps so it can be uninstalled there.
+# Settings > Apps so it can be uninstalled there, and registers .scancraft project files and
+# .scancraftz bundles for this user, so a double-click opens them (in the running ScanCraft as a
+# new tab, if one runs).
 param(
     [string]$Payload = (Join-Path $PSScriptRoot 'payload.zip'),
     [string]$Target = (Join-Path $env:LOCALAPPDATA 'Programs\ScanCraft'),
@@ -66,6 +68,30 @@ try {
         New-Shortcut (Join-Path ([Environment]::GetFolderPath('Desktop')) 'ScanCraft.lnk') $exe '' 'Open 3D scanner software'
     }
 
+    # File association, per user (HKCU\Software\Classes): ProgID with icon and open command, and
+    # the extension pointing at it. uninstall.ps1 removes both.
+    $classes = 'HKCU:\Software\Classes'
+    function Register-FileType($extension, $progId, $description) {
+        $prog = Join-Path $classes $progId
+        New-Item -Path "$prog\DefaultIcon" -Force | Out-Null
+        New-Item -Path "$prog\shell\open\command" -Force | Out-Null
+        Set-ItemProperty -Path $prog -Name '(default)' -Value $description
+        Set-ItemProperty -Path $prog -Name 'FriendlyTypeName' -Value $description
+        Set-ItemProperty -Path "$prog\DefaultIcon" -Name '(default)' -Value "`"$exe`",0"
+        Set-ItemProperty -Path "$prog\shell\open\command" -Name '(default)' -Value "`"$exe`" `"%1`""
+        $ext = Join-Path $classes $extension
+        New-Item -Path "$ext\OpenWithProgids" -Force | Out-Null
+        Set-ItemProperty -Path $ext -Name '(default)' -Value $progId
+        New-ItemProperty -Path "$ext\OpenWithProgids" -Name $progId -Value '' -PropertyType String -Force | Out-Null
+    }
+    Register-FileType '.scancraft' 'ScanCraft.Project' 'ScanCraft project'
+    Register-FileType '.scancraftz' 'ScanCraft.Bundle' 'ScanCraft project bundle'
+    # Tell Explorer, so the icons and the double-click work without signing out.
+    try {
+        Add-Type -Namespace ScanCraftSetup -Name Shell -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32.dll")] public static extern void SHChangeNotify(int eventId, uint flags, System.IntPtr item1, System.IntPtr item2);'
+        [ScanCraftSetup.Shell]::SHChangeNotify(0x08000000, 0, [IntPtr]::Zero, [IntPtr]::Zero)
+    } catch { }
+
     $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\ScanCraft'
     New-Item -Path $key -Force | Out-Null
     $size = [int]((Get-ChildItem $Target -Recurse -File | Measure-Object Length -Sum).Sum / 1KB)
@@ -80,7 +106,7 @@ try {
     Set-ItemProperty -Path $key -Name NoModify -Value 1 -Type DWord
     Set-ItemProperty -Path $key -Name NoRepair -Value 1 -Type DWord
 
-    Show-Message "ScanCraft $version is installed in`n$Target`n`nStart it from the Start menu (ScanCraft). Close Revo Scan before connecting to a scanner."
+    Show-Message "ScanCraft $version is installed in`n$Target`n`nStart it from the Start menu (ScanCraft), or double-click a .scancraft project or .scancraftz bundle. Close Revo Scan before connecting to a scanner."
 } catch {
     Show-Message "Installation failed: $($_.Exception.Message)" 'ScanCraft Setup' 'Error'
     exit 1

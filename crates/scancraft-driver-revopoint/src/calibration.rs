@@ -128,9 +128,59 @@ impl BlueCalibration {
 
 /// Downloads and parses the blue set from the scanner.
 pub async fn download_blue(ctl: &crate::control::Control) -> Result<BlueCalibration, String> {
+    download_blue_files(ctl).await.map(|(blue, _)| blue)
+}
+
+/// [`download_blue`], also returning the files as received, named `camparam_blue/<file>`.
+pub async fn download_blue_files(ctl: &crate::control::Control) -> Result<(BlueCalibration, Vec<(String, Vec<u8>)>), String> {
     let mut files = Vec::new();
     for path in BLUE_FILES {
         files.push(ctl.download(path).await.map_err(|e| e.to_string())?);
+    }
+    let blue = parse_blue_files(&files)?;
+    let named = BLUE_FILES.iter().zip(files).map(|(p, b)| (blue_file_name(p), b)).collect();
+    Ok((blue, named))
+}
+
+/// A calibration file with the device's serial number blanked out, for copies that are saved
+/// with a project: every occurrence of `serial` becomes as many `0`, and a `deviceID:` line of a
+/// YAML file is emptied whatever it holds. The calibration values are untouched (nothing reads
+/// the serial back).
+pub fn redact_serial(bytes: &[u8], serial: &str) -> Vec<u8> {
+    let mut out = bytes.to_vec();
+    let serial = serial.trim().as_bytes();
+    if serial.len() >= 4 {
+        let mut i = 0;
+        while i + serial.len() <= out.len() {
+            if &out[i..i + serial.len()] == serial {
+                out[i..i + serial.len()].fill(b'0');
+                i += serial.len();
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if let Ok(text) = std::str::from_utf8(&out) {
+        if text.lines().any(|l| l.trim_start().starts_with("deviceID:")) {
+            let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+            for l in lines.iter_mut().filter(|l| l.trim_start().starts_with("deviceID:")) {
+                *l = "deviceID: \"\"".into();
+            }
+            return lines.join("\n").into_bytes();
+        }
+    }
+    out
+}
+
+/// `/data/camparam_blue/x.bin` -> `camparam_blue/x.bin` (the name in a pass's calibration folder).
+pub fn blue_file_name(device_path: &str) -> String {
+    device_path.trim_start_matches("/data/").to_string()
+}
+
+/// The blue set from its four files in [`BLUE_FILES`] order.
+pub fn parse_blue_files(files: &[Vec<u8>]) -> Result<BlueCalibration, String> {
+    if files.len() < 4 {
+        return Err("the blue calibration needs four files".into());
     }
     let yaml = String::from_utf8(files[0].clone()).map_err(|_| "blue camparam.yaml is not text".to_string())?;
     BlueCalibration::parse(&yaml, &files[1], &files[2], files[3].clone())

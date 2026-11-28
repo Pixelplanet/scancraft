@@ -404,6 +404,23 @@ laser model are not built.
   or the `.mkf` beside a raw scan): 0.19–0.27° / 0.36–0.81 mm measured, limits 0.5° / 1.2 mm.
   Tests: `scancraft-io` 29, `scancraft-align` 53 + 4 real-data (ignored, all pass), `scancraft-mesh`
   51, `scancraft` 85.
+- 2026-11-26 — Project file format, step 1 (library only, branch `agent/project-file`):
+  `<name>.scancraft` project file (old `project.json` folders still open; saving one leaves a
+  stub older versions refuse), `.scancraftz` bundles (ZIP64, stored, project file first, SHA-256
+  manifest, contents filter, save-back with raw copies of unchanged entries), working folders
+  with crash recovery, lock files. `crates/scancraft-io/src/{project,bundle,workdir,lock,fsutil}.rs`;
+  status and what is left in `docs/open-issues.md` 4.1.
+- 2026-11-26 (later) — Project file format, step 2 (app side, branch `agent/project-file`, not
+  merged or pushed): Open Project… takes `.scancraft` / `.scancraftz` / `project.json`; bundle
+  tabs work in a working folder (`apps/scancraft/src/storage.rs`, `app_project.rs`); the Save
+  Project card saves as folder or bundle (Save As Project Folder / Save as Bundle… move the tab);
+  locks taken on open and save; tab close and quit remove working folders; crash recovery
+  question at start; bundle contents and working-folder root kept in
+  `%LOCALAPPDATA%\ScanCraft\settings.json`; `scancraft.exe <path>` (`cli.rs`); single instance
+  over loopback with a per-launch token (`single_instance.rs`); file association in
+  `packaging/windows/install.ps1` / `uninstall.ps1` (not run). Not tested with a real window or
+  double-click. Status in `docs/open-issues.md` 4.1. The user's report about marker depressions
+  and cross-line laser artifacts on the top surface of the part was not addressed in this track.
 - 2026-11-26 (original PC, branch `agent/mesh-fixes`) — **User ground truth:** the Revo shell
   part's top is perfectly smooth. Every feature on it in our meshes is either a marker sticker site
   or a cross-line laser artefact. The "moulded lettering" of open-issues 2.2 (and the line about it
@@ -425,6 +442,14 @@ laser model are not built.
     discs +0.40 → +0.01 mm; the bracket screw hole is open in the solid (free radius 0.17 → 1.44 mm).
     Images are `E:\Claude\eval\mesh-fixes\compare_top.png` and `compare_bracket_hole.png`.
   - **Open:** see open-issues 2.3.
+- 2026-11-27 (branch `agent/project-file`) — Shared-folder project files: save-conflict question
+  (Save Anyway / Save As…), lock question for another PC (Take Over / Open Read-Only), Add Project
+  with bundles, folder entries in the dialogs, second-start options named, unknown project-file
+  fields kept, ZIP64 tests. Review fixes: a proposed free name taken meanwhile is never saved
+  over, read-only bundle copies keep raw recordings and later fields, a bundle lock let go is
+  taken back on save, project paths outside the project folder (absolute, `..`, UNC) are refused
+  on open. Unit tests only, nothing tried in a window or Explorer. Status in
+  `docs/open-issues.md` 4.1.
 - 2026-11-27 (original PC, branch `agent/mesh-fixes`) — **User:** the round "depressions" at the
   marker sites are flat fills of the holes the stickers leave (in our solids and in Revo Scan's own
   result); the 0.1 mm rounded-rectangle line on the outside is the paint boundary under a white
@@ -436,6 +461,33 @@ laser model are not built.
   Reconstruct's spacing is the mean of the middle fifth over all points (stable). 13 new tests, all
   fail on 41e7b72. Open: the lattice suppression still depends on the support radius; see
   open-issues 2.4.
+- 2026-11-28 (original PC, branch `agent/integration`) — Capture records for the scan day (metal
+  part under scanning spray): every pass of a real scanner records its raw streams into the
+  project (`pass-<id>/raw.bin`, `raw_rgb.bin`) through a non-blocking writer thread
+  (`scancraft_driver::recording`; the old recording wrote inside the HTTP stream task), plus
+  `capture.json` (build + git commit via `apps/scancraft/build.rs`, device with firmware from the
+  scanner's announcement and only a serial hash, settings, setup commands sent, counts, events,
+  turntable region), `tracking.csv` and `calibration/` (serial blanked); project notes; settings
+  JSON with processing parameters and history; app log file (`logfile.rs`). Headless replay
+  `scancraft --replay-pass <project> <id>` reproduces the live poses (< 0.0001 mm on the
+  simulator and a POP 4 recording). Simulator: turntable scene (static table and wall, markers on
+  the turntable, rectified IR pair, Marker tracking). Fixed: turntable plane fit took a plane
+  tilted through disc and table (inliers 2 → 1 mm). Found: a depth window cutting the object
+  biases tracking to "no motion". No scanner used. Notes: scan-sessions.md §7–8, HANDOFF §4,
+  open-issues §4.2.
+- 2026-11-28 (branch `agent/integration`, review fixes) — Capture-record review findings fixed,
+  each with a test: recorder never truncates a file with data and waits for an earlier writer of
+  the same file (Continue right after Stop); writers flush when idle (sync 10 s); pass ids of
+  pass folders on disk are skipped (crash before save) and named on open; staged raw moves via a
+  temporary name, failures keep the tab open and dirty; continued sessions that cannot append
+  record into `raw-<n>.bin`; capture files at start and every 30 s; crash leftovers under
+  `<work root>/captures` offered at start (Keep / Delete) and replayable; empty passes with a
+  recording kept; replay per session (byte range, pipeline, settings); laser planes origin + start
+  planes per session (`calibration/laser_planes-<n>.json`, `LaserLineDepth::without_cache`);
+  added passes drop foreign raw references (`raw_source`); serial hash is HMAC with a per-PC key;
+  POP 4 trigger-mode failure ends the stream; build.rs watches sources for `git_dirty`. Workspace
+  tests 535 passed, 13 ignored; Revo e2e (Make Solid of the three Revo scans) passed. Scan-day
+  build and checklist: `E:\Claude\build\scancraft-scanday\`.
 - 2026-11-28 (branch `agent/synth-scenes`) — Synthetic test scenes (`crates/scancraft-synth`,
   README there): 30 scenes with an exact truth (plates, vents, grille, screw plate, domes, balls,
   cylinders, saddle, cup, block edges, fine relief, fins, the shell, also on its rim). Scanner

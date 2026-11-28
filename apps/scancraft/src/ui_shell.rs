@@ -54,9 +54,19 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         }
         x += 32.0;
         let open = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, open, "open", app.edit_blocked().unwrap_or("Open Project…"), app.can_edit()).clicked() {
+        let open_resp = kit::app_bar_button(ui, open, "open", app.edit_blocked().unwrap_or("Open Project… (.scancraft project or .scancraftz bundle; right-click: Open Project Folder…)"), app.can_edit());
+        if open_resp.clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::OpenProject);
         }
+        // The Windows dialog picks files or folders, not both: the folder is a second entry.
+        open_resp.context_menu(|ui| {
+            if kit::menu_item(ui, "Open Project…", kit::Button::Normal, true, "") {
+                app.pick(&ui.ctx().clone(), PickPurpose::OpenProject);
+            }
+            if kit::menu_item(ui, "Open Project Folder…", kit::Button::Normal, true, "") {
+                app.pick(&ui.ctx().clone(), PickPurpose::OpenProjectFolder);
+            }
+        });
         x += 32.0;
         let save = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
         let save_tip = match &app.project.path {
@@ -77,9 +87,18 @@ pub fn app_bar(app: &mut ScanCraftApp, root: &mut egui::Ui) {
         }
         x += 32.0;
         let add = Rect::from_center_size(pos2(x, r.center().y), vec2(32.0, 32.0));
-        if kit::app_bar_button(ui, add, "folder", app.import_blocked().unwrap_or("Add Project… (append another project's passes)"), app.import_blocked().is_none()).clicked() {
+        let add_resp = kit::app_bar_button(ui, add, "folder", app.import_blocked().unwrap_or("Add Project… (append the passes of another project or bundle; right-click: Add Project Folder…)"), app.import_blocked().is_none());
+        if add_resp.clicked() {
             app.pick(&ui.ctx().clone(), PickPurpose::AddProjects);
         }
+        add_resp.context_menu(|ui| {
+            if kit::menu_item(ui, "Add Project…", kit::Button::Normal, true, "") {
+                app.pick(&ui.ctx().clone(), PickPurpose::AddProjects);
+            }
+            if kit::menu_item(ui, "Add Project Folder…", kit::Button::Normal, true, "") {
+                app.pick(&ui.ctx().clone(), PickPurpose::AddProjectFolders);
+            }
+        });
         x += 26.0;
         kit::app_bar_separator(ui.painter(), r, x);
         // The project tabs, as SolidCraft's document tabs: name, a dot while it has unsaved
@@ -179,7 +198,16 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
         };
         ui.painter().rect_filled(tab, t.radius_sm, fill);
         let ink = if l.active { t.app_bar_text } else { t.app_bar_text.gamma_multiply(0.7) };
-        let text_rect = Rect::from_min_max(pos2(tab.left() + pad, tab.top()), pos2(tab.right() - dot_w - close_w - 4.0, tab.bottom()));
+        // A bundle tab: a small box before the name (one file holding the whole project).
+        let mut text_left = tab.left() + pad;
+        if l.work_dir.is_some() {
+            let b = Rect::from_center_size(pos2(text_left + 4.0, tab.center().y), vec2(9.0, 9.0));
+            let stroke = egui::Stroke::new(1.1, ink);
+            ui.painter().rect_stroke(b, 1.5, stroke, egui::StrokeKind::Inside);
+            ui.painter().line_segment([pos2(b.left(), b.top() + 3.0), pos2(b.right(), b.top() + 3.0)], stroke);
+            text_left += 13.0;
+        }
+        let text_rect = Rect::from_min_max(pos2(text_left, tab.top()), pos2(tab.right() - dot_w - close_w - 4.0, tab.bottom()));
         kit::paint_text(ui.painter(), text_rect, &l.name, font.clone(), ink);
         if l.dirty {
             ui.painter().circle_filled(pos2(tab.right() - close_w - dot_w / 2.0 - 2.0, tab.center().y), 3.0, ink);
@@ -194,10 +222,12 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
         let stroke = egui::Stroke::new(1.3, ink);
         ui.painter().line_segment([pos2(c.x - s, c.y - s), pos2(c.x + s, c.y + s)], stroke);
         ui.painter().line_segment([pos2(c.x - s, c.y + s), pos2(c.x + s, c.y - s)], stroke);
-        let state = match &l.path {
-            Some(p) => format!("{}{}", p.display(), if l.dirty { " · unsaved changes" } else { "" }),
-            None if l.dirty => "Not saved yet · unsaved changes".to_string(),
-            None => "Not saved yet".to_string(),
+        let state = match (&l.path, &l.work_dir) {
+            (Some(p), Some(work)) => format!("Bundle {}{}\nWorking folder {}", p.display(), if l.dirty { " · unsaved changes" } else { "" }, work.display()),
+            (Some(p), None) => format!("{}{}", p.display(), if l.dirty { " · unsaved changes" } else { "" }),
+            (None, _) if l.copy_of.is_some() => format!("Read-only copy of {} · Save asks for a new place{}", l.copy_of.as_deref().map(|p| p.display().to_string()).unwrap_or_default(), if l.dirty { " · unsaved changes" } else { "" }),
+            (None, _) if l.dirty => "Not saved yet · unsaved changes".to_string(),
+            (None, _) => "Not saved yet".to_string(),
         };
         let tip = match blocked {
             Some(why) if !l.active => format!("{}\n{state}\n{why}", l.name),
@@ -260,18 +290,12 @@ fn project_tabs(app: &mut ScanCraftApp, ui: &mut egui::Ui, bar: Rect, left: f32,
 /// the header's ×, a click outside and Esc all answer `Choice::Cancel`.
 pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
     let Some(prompt) = app.close_prompt else { return };
-    let warning = if scancraft_ui::icons::exists("warning") {
-        "warning"
-    } else if scancraft_ui::icons::exists("alert") {
-        "alert"
-    } else {
-        "save"
-    };
+    let warning = warning_icon();
     let (icon, title, message, primary, destructive) = match prompt {
         ClosePrompt::Tab => (
             "save",
             "Close Project",
-            format!("{} has unsaved changes. Save them before closing?", app.project.name),
+            format!("{} has unsaved changes{}. Save them before closing?", app.project.name, app.staged_raw_note().map(|n| format!(", among them {n}, which Discard deletes")).unwrap_or_default()),
             Some(if app.project.path.is_some() { "Save" } else { "Save…" }),
             "Discard Changes",
         ),
@@ -286,7 +310,19 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
         }
     };
     // An empty primary label means "not possible here" (Save All with a never-saved project).
-    let actions = kit::Actions { primary: primary.filter(|l| !l.is_empty()).map(|label| (label, true)), cancel: Some("Cancel"), destructive: Some((destructive, true)), ..Default::default() };
+    // Save All waits while a question is open or a job runs (the window's close button can open
+    // this dialog over the lock or conflict question): disabled, with the reason.
+    let blocked = match prompt {
+        ClosePrompt::Quit => app.save_all_blocked(),
+        ClosePrompt::Tab => None,
+    };
+    let actions = kit::Actions {
+        primary: primary.filter(|l| !l.is_empty()).map(|label| (label, blocked.is_none())),
+        primary_tip: blocked,
+        cancel: Some("Cancel"),
+        destructive: Some((destructive, true)),
+        ..Default::default()
+    };
     let choice = kit::confirm_modal(ctx, egui::Id::new("close_prompt"), icon, title, &message, &actions);
     match (prompt, choice) {
         (_, Some(kit::Choice::Cancel)) => app.close_prompt = None,
@@ -299,6 +335,83 @@ pub fn close_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         _ => {}
+    }
+}
+
+/// The lock question (`kit::confirm_modal`): a project another computer has open. Take Over
+/// (destructive, apart at the left) takes its lock from the holder named; Open Read-Only opens a
+/// copy; Cancel (also the header's ×, a click outside, Esc) leaves it.
+pub fn lock_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    if app.lock_prompt.is_none() {
+        return;
+    }
+    let message = app.lock_prompt_message();
+    let actions = kit::Actions { primary: Some(("Open Read-Only", true)), cancel: Some("Cancel"), destructive: Some(("Take Over", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("lock_prompt"), warning_icon(), "Project in Use", &message, &actions) {
+        Some(kit::Choice::Primary) => app.open_read_only(),
+        Some(kit::Choice::Destructive) => app.take_over_and_open(),
+        Some(kit::Choice::Cancel) => app.cancel_lock_prompt(),
+        None => {}
+    }
+}
+
+/// The conflict question (`kit::confirm_modal`): the project file or bundle was saved by someone
+/// else since it was opened here. Save Anyway (destructive) replaces their version; Save As…
+/// keeps both; Cancel (also ×, a click outside, Esc) saves nothing.
+pub fn conflict_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    let Some(conflict) = &app.save_conflict else { return };
+    let message = format!("{}\nSave Anyway replaces that version with this one. Save As… saves this one under another name and keeps both.", conflict.message);
+    let actions = kit::Actions { primary: Some(("Save As…", true)), cancel: Some("Cancel"), destructive: Some(("Save Anyway", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("conflict_prompt"), warning_icon(), "Changed by Someone Else", &message, &actions) {
+        Some(kit::Choice::Primary) => app.save_conflict_as(),
+        Some(kit::Choice::Destructive) => app.save_anyway(),
+        Some(kit::Choice::Cancel) => app.cancel_save_conflict(),
+        None => {}
+    }
+}
+
+/// The warning icon of the theme (an older icon set calls it "alert").
+fn warning_icon() -> &'static str {
+    if scancraft_ui::icons::exists("warning") {
+        "warning"
+    } else if scancraft_ui::icons::exists("alert") {
+        "alert"
+    } else {
+        "save"
+    }
+}
+
+/// The crash-recovery question at start (`kit::confirm_modal`): working folders of bundles a
+/// crashed ScanCraft left with unsaved changes. Open opens them as tabs, Discard removes them,
+/// Later (and the header's ×, a click outside, Esc) keeps them for the next start.
+pub fn recovery_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    if app.recovery.is_none() {
+        return;
+    }
+    let message = app.recovery_message();
+    let recoverable = app.recovery.as_ref().is_some_and(|l| l.iter().any(|l| matches!(l.status, scancraft_io::workdir::LeftoverStatus::Orphaned { .. })));
+    let actions = kit::Actions { primary: Some(("Open", recoverable)), cancel: Some("Later"), destructive: Some(("Discard", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("recovery_prompt"), "save", "Recover Unsaved Work", &message, &actions) {
+        Some(kit::Choice::Primary) => app.recover_leftovers(),
+        Some(kit::Choice::Destructive) => app.discard_leftovers(),
+        Some(kit::Choice::Cancel) => app.recovery = None,
+        None => {}
+    }
+}
+
+/// The question at start about raw recordings of never-saved projects that a crash left in
+/// staging folders (`kit::confirm_modal`): Keep (also ×, a click outside, Esc) leaves them and
+/// asks again at the next start; Delete removes them. Shown after the recovery question.
+pub fn orphan_captures_prompt(app: &mut ScanCraftApp, ctx: &egui::Context) {
+    if app.orphan_captures.is_empty() || app.recovery.is_some() {
+        return;
+    }
+    let message = app.orphan_captures_message();
+    let actions = kit::Actions { primary: Some(("Keep", true)), cancel: None, destructive: Some(("Delete", true)), ..Default::default() };
+    match kit::confirm_modal(ctx, egui::Id::new("orphan_captures_prompt"), warning_icon(), "Unsaved Recordings", &message, &actions) {
+        Some(kit::Choice::Destructive) => app.delete_orphan_captures(),
+        Some(kit::Choice::Primary) | Some(kit::Choice::Cancel) => app.orphan_captures.clear(),
+        None => {}
     }
 }
 
@@ -501,7 +614,7 @@ fn ribbon_groups(app: &ScanCraftApp) -> Vec<RibbonGroup<'static>> {
                 label: "Add Passes",
                 buttons: vec![
                     rb("import_scan", "import", "Import Scan", app.import_blocked(), false, "Add PLY, OBJ or STL scans (yours or from other scan software) as new passes to align with the others"),
-                    rb("add_project", "folder", "Add Project", app.import_blocked(), false, "Append the passes of other ScanCraft projects, unaligned (or right-click another open tab)"),
+                    rb("add_project", "folder", "Add Project", app.import_blocked(), false, "Append the passes of other ScanCraft projects or bundles, unaligned (or right-click another open tab; a project folder: right-click the app bar's Add Project)"),
                 ],
             },
             RibbonGroup {

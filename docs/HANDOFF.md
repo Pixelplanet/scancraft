@@ -10,6 +10,36 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-28, later (branch `agent/integration`, merged into `main`): review fixes of the capture records.**
+No recording is written over or deleted without asking any more: a new recording never replaces
+a file with data and a pass folder left by a crash keeps its id; Continue Pass waits for the
+previous writer; staged recordings that a save could not move keep the tab open (it counts as
+unsaved; the close question says what Discard deletes), and a continued session records into its
+own `raw-<n>.bin` when it cannot append. Writers flush continuously, capture files are written at
+the start and every 30 s, crash leftovers of never-saved projects are offered at the next start.
+A pass with no points is kept when it recorded. Replay: per-session byte ranges, pipelines and
+settings; laser planes recorded with the pass. Added passes name no foreign raw file. Serial hash
+keyed per computer. POP 4 driver: a failed trigger-mode command ends the stream. Build script:
+`git_dirty` right after unstaged edits. Scan-day checklist for the user:
+`E:\Claude\build\scancraft-scanday\SCAN-CHECKLIST.md` (outside the repo). List:
+[open-issues.md](open-issues.md) §4.2 "Review fixes".
+
+**Update 2026-11-28 (branch `agent/integration`, merged into `main`): a scanned pass records everything needed to
+use it again offline.** Per pass: the raw wire streams (`pass-<id>/raw.bin`, `raw_rgb.bin`,
+recorded by default for real scanners through a non-blocking writer thread), `capture.json`
+(app build + git commit, device model / firmware / capabilities, serial only as a hash, scan
+settings, the setup commands sent, frame counts, recording statistics, exposure/gain changes,
+turntable region), `tracking.csv` (pose, state and scores of every frame the live tracker
+processed) and `calibration/` (the scanner's files, serial blanked). Project notes in the Save
+card. A pass replays headless to the live poses (`--replay-pass`, see §4 "Replaying a pass").
+The simulator now has a turntable scene (fixed scanner, turning turntable with markers, static
+table and wall) and a rectified IR pair: Full-field turntable passes with Feature and Marker
+tracking track a full turn to 0.5 deg / 2 mm, fuse without smear, remove the table, and align
+with a handheld pass (Align All 0.4 mm / 0.06 deg from the truth). Fix found on the way: the
+turntable plane fit (1 mm instead of 2 mm inliers) took a plane tilted ~2 deg through the
+turntable disc and the table. Details and what is not recorded: [scan-sessions.md](architecture/scan-sessions.md)
+§7, §8; [open-issues.md](open-issues.md) §4.2.
+
 **Update 2026-11-27 (original PC, branch `agent/mesh-fixes`).**
 
 - **The marker "depressions" are flat fills** (user). Every sticker leaves a hole in the scan.
@@ -26,6 +56,19 @@ The public repository starts from one squashed commit; the commit-by-commit hist
   fills smoother than the scanned texture.
 
 Numbers and the open list are in [open-issues.md](open-issues.md) §2.4.
+
+**Update 2026-11-26 (branch `agent/project-file`, merged into `main` 2026-11-28): projects open with a
+double-click.** A project is a folder with `<name>.scancraft` (older `project.json` folders still
+open) or one `.scancraftz` bundle, which the app unpacks into a working folder while its tab is
+open and writes back on Save. Open Project… takes either; the Save Project card saves as a folder
+or a bundle (and moves the tab there); projects are locked while open; working folders left by a
+crash are offered for recovery at start; `scancraft.exe <path>` opens a project and a second start
+hands it to the running app (one app per user, so two apps never use the scanner). The installer
+registers both file types. 2026-11-27: a project another PC has open asks Take Over / Open
+Read-Only, a save over someone else's version asks Save Anyway / Save As…, Add Project takes
+bundles, Open / Add Project Folder… are on the app bar buttons' right-click, unknown project-file
+fields are kept. Details, decisions and what is left: [open-issues.md](open-issues.md)
+4.1; layout: [architecture/scan-sessions.md](architecture/scan-sessions.md) section 8.
 
 **Update 2026-11-26 (original PC, branch `agent/mesh-fixes`).**
 
@@ -170,12 +213,46 @@ also in the release zip.
 | `tools/scanner/dsplog_start.sh`, `dsplog_get.sh` | the DSP's own log: what each message meant and whether it was accepted |
 | `tools/scanner/scanner_reboot.sh` | soft restart |
 
-Recording: set `SCANCRAFT_RECORD_DIR=<folder>` before starting the app or a tool; every stream is
+Recording: the app records every scan with a real scanner into the project (`pass-<id>/raw.bin`,
+`raw_rgb.bin`; switch "Record raw streams of real scanners" in the Save Project card,
+`%LOCALAPPDATA%\ScanCraft\settings.json` `record_raw`). A project not saved yet records into
+`<working-folder root>\captures\<id>\` and its first save moves the files in. Recording needs
+2 GB free on that drive to start and stops (scanning goes on) below 1 GB; a disk too slow for the
+stream drops records from the recording, never frames from the scan (the status bar says so).
+Measured 2026-11-28 with `cargo run --release -p scancraft-driver --example record_speed`:
+322 MB/s on E: and 1.45 GB/s on C: (with `sync_data`), 0 records dropped at 8 MB/s; the POP 4
+Full-field stream is 5.8 MB/s (plus ~1.5 MB/s RGB). For the tools, and for the app when its own
+recording is off: set `SCANCRAFT_RECORD_DIR=<folder>` before starting; every stream is
 written as `pop4_<time>.bin` (raw packets) and `pop4_<time>_rgb.bin`. Sizes: Full-field ~5 MB/s,
 Hybrid ~7 MB/s, lasers 1–8 MB/s. Keep recordings out of the repository and delete what is not
 needed. Other switches: `SCANCRAFT_EXPERIMENTAL_MODES=1` (start modes marked not implemented),
 `SCANCRAFT_LASER_PLANES=<file>` (use / write this plane file), `SCANCRAFT_FMT_FIRST=1` (the old,
 wrong format order; only to reproduce the Hybrid hang).
+
+### Replaying a pass
+
+```text
+scancraft --replay-pass <project folder | .scancraft | .scancraftz> <pass id> [--all-frames] [--out <folder>]
+```
+
+Headless (no window, no scanner). Decodes `pass-<id>/raw.bin` (+ `raw_rgb.bin`) with the pass's
+`calibration/` files and the scan settings in `capture.json`, runs the frames through a fresh
+pipeline and tracker, and prints frame counts and how the poses compare with the live run's
+`tracking.csv` (max / median translation, rotation, frames whose state differs). Without
+`--all-frames` it processes exactly the frames the live tracker processed (matched by device time
+stamp): the same code reproduces the live poses (simulator and a POP 4 recording: < 0.0001 mm).
+With `--all-frames` every recorded frame is processed (what a faster PC or a later algorithm
+would see). `--out` writes `replay-pass-<id>.csv` (same columns as `tracking.csv`) and
+`replay-pass-<id>.ply` (fused points). Library: `apps/scancraft/src/replay.rs::replay_pass`;
+tests `a_scanned_pass_keeps_its_raw_stream_…`, `turntable_passes_…` (app) and the ignored
+`a_pop4_recording_replays_as_a_pass_and_twice_the_same` (`SCANCRAFT_POP4_RECORDING`,
+`SCANCRAFT_POP4_CAMPARAM`). Not reproduced: a Same Position pass's seed (it replays in its own
+frame), live AI masking, colour pairing that depended on arrival time (Color tracking only).
+A continued pass replays session by session (each with its own byte range, pipeline and
+settings; a session that recorded nothing is reported as missing frames). Laser passes use the
+planes recorded with the pass (or calibrate online as the live run did), never the plane cache of
+the PC replaying. A staging folder left by a crash (`<work root>\captures\<pid>-<ms>`, offered at
+the next start) replays too: pass the folder.
 
 ## 5. Next: tests with a moving scanner
 

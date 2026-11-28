@@ -129,6 +129,23 @@ pub enum Pattern {
     Single,
 }
 
+/// Where the laser planes a [`LaserLineDepth`] started with came from: what a replay needs to
+/// process the same frames the same way (the per-scanner cache can change or be missing on
+/// another computer).
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanesOrigin {
+    /// No frame processed yet.
+    Unknown,
+    /// Given when made ([`LaserLineDepth::with_planes`]).
+    Given,
+    /// Read from the file in [`PLANES_ENV`].
+    Env(PathBuf),
+    /// Read from the per-scanner cache ([`planes_cache_file`]) at the first frame.
+    Cache(PathBuf),
+    /// None at the start: calibrated online from the first frames.
+    Online,
+}
+
 /// Turns IR pairs with laser lines into sparse point clouds.
 pub struct LaserLineDepth {
     pub params: LaserParams,
@@ -136,6 +153,11 @@ pub struct LaserLineDepth {
     planes: Option<LaserPlaneSet>,
     pending: Vec<FrameCandidates>,
     planes_file: Option<PathBuf>,
+    /// Look the planes up in (and save calibrated ones to) the per-scanner cache.
+    use_cache: bool,
+    origin: PlanesOrigin,
+    /// The planes at the first frame (`None`: calibrated online).
+    start_planes: Option<LaserPlaneSet>,
 }
 
 impl Default for LaserLineDepth {
@@ -152,12 +174,32 @@ impl LaserLineDepth {
             Pattern::Cross => p,
             Pattern::Single => p.with_file_name(format!("{}_single.json", p.file_stem().and_then(|s| s.to_str()).unwrap_or("laser_planes"))),
         });
-        let planes = planes_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok());
-        Self { params: LaserParams::default(), pattern, planes, pending: Vec::new(), planes_file }
+        let planes: Option<LaserPlaneSet> = planes_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok());
+        let origin = match (&planes, &planes_file) {
+            (Some(_), Some(f)) => PlanesOrigin::Env(f.clone()),
+            _ => PlanesOrigin::Unknown,
+        };
+        Self { params: LaserParams::default(), pattern, start_planes: planes.clone(), planes, pending: Vec::new(), planes_file, use_cache: true, origin }
     }
 
     pub fn with_planes(pattern: Pattern, planes: LaserPlaneSet) -> Self {
-        Self { params: LaserParams::default(), pattern, planes: Some(planes), pending: Vec::new(), planes_file: None }
+        Self { params: LaserParams::default(), pattern, start_planes: Some(planes.clone()), planes: Some(planes), pending: Vec::new(), planes_file: None, use_cache: false, origin: PlanesOrigin::Given }
+    }
+
+    /// Calibrates the planes online from the first frames and never reads or writes the
+    /// per-scanner cache or [`PLANES_ENV`]: a replay of a session that calibrated online.
+    pub fn without_cache(pattern: Pattern) -> Self {
+        Self { params: LaserParams::default(), pattern, planes: None, pending: Vec::new(), planes_file: None, use_cache: false, origin: PlanesOrigin::Unknown, start_planes: None }
+    }
+
+    /// Where the planes this started with came from.
+    pub fn origin(&self) -> &PlanesOrigin {
+        &self.origin
+    }
+
+    /// The planes at the first frame (`None` before it, and when they were calibrated online).
+    pub fn start_planes(&self) -> Option<&LaserPlaneSet> {
+        self.start_planes.as_ref()
     }
 
     pub fn pattern(&self) -> Pattern {
@@ -218,13 +260,18 @@ impl LaserLineDepth {
     /// Full processing of one frame. `None` if the frame has no IR pair or no rig; an empty cloud
     /// while the planes are still being calibrated.
     pub fn process(&mut self, frame: &SensorFrame) -> Option<LaserFrame> {
-        if self.planes.is_none() && self.planes_file.is_none() {
+        if self.use_cache && self.planes.is_none() && self.planes_file.is_none() {
             // First frame: the planes calibrated earlier for this scanner, if any.
             self.planes_file = frame.ir.as_ref().and_then(|ir| ir.rig.as_ref()).and_then(|rig| planes_cache_file(self.pattern, rig));
             self.planes = self.planes_file.as_ref().and_then(|p| std::fs::read_to_string(p).ok()).and_then(|s| serde_json::from_str(&s).ok());
             if let (Some(set), Some(path)) = (&self.planes, &self.planes_file) {
                 log::info!("laser planes: {} loaded from {}", set.planes.len(), path.display());
+                self.origin = PlanesOrigin::Cache(path.clone());
+                self.start_planes = Some(set.clone());
             }
+        }
+        if self.origin == PlanesOrigin::Unknown {
+            self.origin = PlanesOrigin::Online;
         }
         let FrameLines { left: lc, candidates: cands, mut stats, .. } = self.candidates(frame)?;
         let families: Vec<i8> = cands.iter().map(|c| if lc[c.left].slope > 0.0 { 1 } else { -1 }).collect();

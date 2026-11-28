@@ -451,12 +451,24 @@ pub enum DeviceEvent {
     ConnectFailed(String),
     PreviewStarted(mpsc::Receiver<scancraft_core::PreviewFrame>),
     PreviewFailed(String),
-    ScanStarted(mpsc::Receiver<SensorFrame>, ScanConfig),
+    ScanStarted(mpsc::Receiver<SensorFrame>, ScanConfig, Box<CaptureStart>),
     ScanFailed(String),
     ScanStopped,
     Paused(bool),
     ParameterFailed(String),
     Disconnected,
+}
+
+/// What came with a started scan, for the pass's capture record (`crate::capture`).
+pub struct CaptureStart {
+    /// The driver's description of the stream, the setup sent and the calibration files.
+    pub info: Option<scancraft_driver::RecordingInfo>,
+    /// Where the raw streams are recorded (`None`: not recorded into the project).
+    pub target: Option<scancraft_driver::RecordingTarget>,
+    /// The pass folder the target lies in.
+    pub pass_dir: Option<std::path::PathBuf>,
+    /// Why the raw streams are not recorded, when they are not (said to the user).
+    pub not_recorded: Option<String>,
 }
 
 /// One processed frame from the scan worker.
@@ -554,7 +566,9 @@ pub enum JobResult {
         ok: bool,
     },
     Merged { cloud: PointCloud, passes: Vec<u32>, message: String },
-    Saved { path: std::path::PathBuf, name: String, message: String },
+    /// `store`: the project's new place on disk (it moved to another folder or bundle), `None`
+    /// when it was saved where it already was.
+    Saved { path: std::path::PathBuf, name: String, message: String, store: Option<crate::storage::Store> },
     Opened(Box<OpenedProject>),
     /// A scan file read as a new pass.
     Imported(Box<crate::imports::ImportedScan>),
@@ -564,7 +578,17 @@ pub enum JobResult {
 
 /// A project read from disk with its trackers rebuilt.
 pub struct OpenedProject {
+    /// The project folder, or the bundle file.
     pub path: std::path::PathBuf,
+    /// Its lock, or the bundle's working folder.
+    pub store: crate::storage::Store,
+    /// Recovered from a working folder left by a crash: it holds unsaved changes.
+    pub recovered: bool,
+    /// A read-only copy (the project is open on another computer): the tab gets no place on
+    /// disk, and Save asks for one.
+    pub read_only: bool,
+    /// Said with the "Opened" message (a lock that was taken over).
+    pub notice: Option<String>,
     pub name: String,
     pub next_pass_id: u32,
     pub passes: Vec<crate::project::LoadedPass>,
@@ -572,6 +596,7 @@ pub struct OpenedProject {
     pub cleaned: Option<PointCloud>,
     pub mesh: Option<(Mesh, MeshAnalysis)>,
     pub settings: serde_json::Value,
+    pub notes: String,
 }
 
 /// Restorable geometry for undo: the project as it was before an action. Layers are shared with

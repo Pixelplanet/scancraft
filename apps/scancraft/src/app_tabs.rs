@@ -95,7 +95,12 @@ pub enum ClosePrompt {
 pub struct TabLabel {
     pub name: String,
     pub dirty: bool,
+    /// Its project folder or bundle file.
     pub path: Option<std::path::PathBuf>,
+    /// A bundle's working folder (`None`: not a bundle).
+    pub work_dir: Option<std::path::PathBuf>,
+    /// What a read-only copy was opened from.
+    pub copy_of: Option<std::path::PathBuf>,
     pub active: bool,
 }
 
@@ -153,16 +158,22 @@ impl ScanCraftApp {
         }
     }
 
-    /// Why tabs cannot be switched, opened or closed now.
+    /// Why tabs cannot be switched, opened or closed now (by the user).
     pub fn tabs_blocked(&self) -> Option<&'static str> {
+        self.tabs_held().or_else(|| (!self.pending_imports.is_empty() || !self.pending_open.is_empty()).then_some("Wait for the imports to finish"))
+    }
+
+    /// Why the app itself cannot switch or add a tab now. Queued opens and imports do not hold
+    /// it: an open that finishes while others wait, and Save All, move between tabs themselves.
+    pub fn tabs_held(&self) -> Option<&'static str> {
         if self.busy.is_some() {
             Some("Another operation is running")
         } else if self.capture != super::Capture::Idle {
             Some("Stop the capture first")
         } else if self.picker.is_open() {
             Some("Close the file dialog first")
-        } else if !self.pending_imports.is_empty() || self.pending_open.is_some() {
-            Some("Wait for the imports to finish")
+        } else if self.lock_prompt.is_some() || self.save_conflict.is_some() {
+            Some("Answer the question first")
         } else {
             None
         }
@@ -175,9 +186,11 @@ impl ScanCraftApp {
             .enumerate()
             .map(|(i, t)| {
                 if i == self.active_tab {
-                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), active: true }
+                    let copy_of = self.project.store.read_only_source().map(std::path::Path::to_path_buf);
+                    TabLabel { name: self.project.name.clone(), dirty: self.dirty(), path: self.project.path.clone(), work_dir: self.project.store.work_dir(), copy_of, active: true }
                 } else {
-                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), active: false }
+                    let copy_of = t.project.store.read_only_source().map(std::path::Path::to_path_buf);
+                    TabLabel { name: t.project.name.clone(), dirty: t.dirty, path: t.project.path.clone(), work_dir: t.project.store.work_dir(), copy_of, active: false }
                 }
             })
             .collect()
@@ -185,8 +198,19 @@ impl ScanCraftApp {
 
     /// Switches to tab `i`.
     pub fn switch_tab(&mut self, i: usize) {
-        if i == self.active_tab || i >= self.tabs.len() || self.tabs_blocked().is_some() {
-            return;
+        if self.tabs_blocked().is_none() {
+            self.show_tab(i);
+        }
+    }
+
+    /// Makes tab `i` the active one unless the app is held ([`Self::tabs_held`]); whether it is
+    /// active now.
+    pub(super) fn show_tab(&mut self, i: usize) -> bool {
+        if i == self.active_tab {
+            return true;
+        }
+        if i >= self.tabs.len() || self.tabs_held().is_some() {
+            return false;
         }
         self.park_active();
         self.activate(i);
@@ -194,6 +218,7 @@ impl ScanCraftApp {
         self.pending_close = false;
         self.toast = None;
         self.say(Tone::Normal, format!("Switched to {}", self.project.name));
+        true
     }
 
     /// A name for a new project that no open tab uses: "Untitled project", "Untitled project 2", …
@@ -206,8 +231,16 @@ impl ScanCraftApp {
     /// Opens a new, empty project in a new tab and switches to it (New Project). The open
     /// project stays as it is in its own tab.
     pub fn new_tab(&mut self) {
-        if self.tabs_blocked().is_some() {
-            return;
+        if self.tabs_blocked().is_none() {
+            self.add_empty_tab();
+        }
+    }
+
+    /// Adds an empty project in a new tab and makes it active unless the app is held
+    /// ([`Self::tabs_held`]); whether it did.
+    pub(super) fn add_empty_tab(&mut self) -> bool {
+        if self.tabs_held().is_some() {
+            return false;
         }
         let name = self.untitled_name();
         self.park_active();
@@ -218,6 +251,7 @@ impl ScanCraftApp {
         self.close_prompt = None;
         self.pending_close = false;
         self.say(Tone::Normal, format!("New project: {}", self.project.name));
+        true
     }
 
     /// Closes tab `i`: at once if it has no unsaved changes, otherwise after asking (it becomes
@@ -237,13 +271,18 @@ impl ScanCraftApp {
     }
 
     /// Closes the active tab without asking; the neighbour to its left (or right) becomes active.
-    /// Closing the last tab leaves one empty project.
+    /// Closing the last tab leaves one empty project. The project's lock is released and a
+    /// bundle's working folder removed (unsaved changes in it are lost: the caller asked first).
     pub fn close_active_tab(&mut self) {
         self.close_prompt = None;
         self.pending_close = false;
         let closing = self.project.name.clone();
+        std::mem::take(&mut self.project.store).close();
+        crate::app::remove_staging(self.project.staging.take());
         if self.tabs.len() == 1 {
             let name = ProjectInfo::default().name;
+            // Park the closing project in its slot, then replace it there.
+            self.park_active();
             self.tabs[0] = ProjectTab::empty(name);
             self.activate(0);
             self.say(Tone::Normal, format!("Closed {closing}"));
@@ -315,10 +354,21 @@ impl ScanCraftApp {
         self.tab_labels().into_iter().filter(|t| t.dirty && t.path.is_none()).map(|t| t.name).collect()
     }
 
+    /// Why the quit dialog's Save All cannot start now (it switches between tabs).
+    pub fn save_all_blocked(&self) -> Option<&'static str> {
+        self.tabs_blocked()
+    }
+
     /// The quit dialog's Save All: saves every project with unsaved changes into its folder, one
     /// after another (each in its own tab), then closes the window. Stops at the first failure.
     pub fn save_all_then_quit(&mut self) {
-        if !self.dirty_without_folder().is_empty() || self.tabs_blocked().is_some() {
+        if !self.dirty_without_folder().is_empty() {
+            return;
+        }
+        // (The quit dialog shows Save All disabled with this reason; the window's close button
+        // can open it over the lock or conflict question.)
+        if let Some(why) = self.save_all_blocked() {
+            self.say(Tone::Warning, format!("Save All cannot start: {}", why.to_lowercase()));
             return;
         }
         self.close_prompt = None;
@@ -327,16 +377,30 @@ impl ScanCraftApp {
         self.save_next_for_quit();
     }
 
-    /// Saves the next project of the Save All queue, or quits when none is left.
+    /// Saves the next project of the Save All queue, or quits when none is left. A project that
+    /// was asked to open meanwhile (a double-click, a drop) stops the quit: it opens instead, and
+    /// the user quits again when ready.
     pub(super) fn save_next_for_quit(&mut self) {
         let Some(queue) = self.save_all_queue.as_mut() else { return };
         let Some(i) = queue.pop_front() else {
             self.save_all_queue = None;
+            if !self.pending_open.is_empty() {
+                self.quit_confirmed = false;
+                self.say(Tone::Warning, "Saved everything; not quitting, since a project was opened meanwhile");
+                return;
+            }
             self.quit_confirmed = true;
             self.close_window = true;
             return;
         };
-        self.switch_tab(i);
+        // Never save another tab in its place.
+        if !self.show_tab(i) {
+            let why = self.tabs_held().unwrap_or("the tab is gone");
+            self.save_all_queue = None;
+            self.quit_confirmed = false;
+            self.say(Tone::Error, format!("Save All stopped: could not switch to the next project ({why})"));
+            return;
+        }
         match self.project.path.clone() {
             Some(path) => self.save_project(path),
             None => {

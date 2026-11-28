@@ -170,9 +170,12 @@ fn write_project(out_dir: &Path) -> Result<(), String> {
             start: "moved".to_string(),
             keyframes: keyframes_path(PASS_ID),
             raw_recording: None,
+            other: Default::default(),
         }],
         outputs: Vec::new(),
         settings: serde_json::json!({}),
+        notes: String::new(),
+        other: Default::default(),
     };
 
     save_project(out_dir, &project, &[(PASS_ID, Vec::new())])

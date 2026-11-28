@@ -146,3 +146,461 @@ impl ScannerDevice for ReplayDevice {
         Ok(())
     }
 }
+
+// ------------------------------------------------------------------ replay of a project's pass
+
+use scancraft_io::capture::TrackRow;
+use scancraft_slam::Tracker;
+
+/// Which frames of a recorded pass a replay processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFrames {
+    /// Exactly the frames the live tracker processed (its `tracking.csv`, matched by device time
+    /// stamp): the live run again, to compare poses.
+    Logged,
+    /// Every recorded frame (what a faster computer, or offline re-processing, would see).
+    All,
+}
+
+/// Poses of a replay against the live run's tracking log.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PoseComparison {
+    /// Frames with a pose in both.
+    pub frames: usize,
+    pub max_translation_mm: f32,
+    pub median_translation_mm: f32,
+    pub max_rotation_deg: f32,
+    /// Frames whose state (tracking / slow / lost / no geometry) differs.
+    pub state_differs: usize,
+}
+
+/// What a replay of a pass gives.
+pub struct PassReplay {
+    /// One row per processed frame, as the live tracking log.
+    pub rows: Vec<TrackRow>,
+    pub tracker: Tracker,
+    /// Frames decoded from the recording, and logged frames not found in it.
+    pub decoded: usize,
+    pub missing: usize,
+    /// Against the live tracking log (`None` without one).
+    pub comparison: Option<PoseComparison>,
+}
+
+/// A recording's file, relative to the pass folder or absolute.
+fn raw_file(pass_dir: &std::path::Path, name: &str) -> PathBuf {
+    let p = std::path::Path::new(name);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        pass_dir.join(p)
+    }
+}
+
+/// `len` bytes of `path` from `offset`.
+fn segment_reader(path: &std::path::Path, offset: u64, len: u64) -> Result<Box<dyn std::io::Read>, String> {
+    use std::io::{Read, Seek};
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    f.seek(std::io::SeekFrom::Start(offset)).map_err(|e| e.to_string())?;
+    Ok(Box::new(std::io::BufReader::with_capacity(4 << 20, f).take(len)))
+}
+
+fn read_all(mut r: Box<dyn std::io::Read>) -> Result<Vec<u8>, String> {
+    let mut v = Vec::new();
+    r.read_to_end(&mut v).map_err(|e| e.to_string())?;
+    Ok(v)
+}
+
+/// One capture session's part of a raw recording: file, first byte, end.
+pub(crate) type Span = Option<(PathBuf, u64, u64)>;
+
+/// Where each capture session's data lies in the raw recordings of a pass: (main, colour) per
+/// session, `None` for a stream the session did not record. A session's data starts at its
+/// offset and ends after the bytes it wrote (or, when that is not known, at the next session
+/// recorded into the same file, else at the end of the file). Sessions that recorded nothing
+/// take no part, whatever their offset says.
+pub(crate) fn session_spans(record: &scancraft_io::capture::CaptureRecord, pass_dir: &std::path::Path) -> Vec<(Span, Span)> {
+    use scancraft_io::capture::CaptureSegment;
+    let n = record.captures.len().max(1);
+    let fallback = CaptureSegment::default();
+    let seg = |i: usize| record.captures.get(i).unwrap_or(&fallback);
+    let spans = |rgb: bool| -> Vec<Span> {
+        let base = if rgb { &record.raw_rgb } else { &record.raw_main };
+        // Records of the first version say whether a session recorded only through its counters;
+        // older recordings (SCANCRAFT_RECORD_DIR) not even that: then the whole file is session 0.
+        let explicit = record.captures.iter().any(|c| c.recorded.is_some());
+        let recorded: Vec<bool> = (0..n)
+            .map(|i| {
+                let c = seg(i);
+                match (rgb, explicit) {
+                    (false, true) => c.recorded.unwrap_or(false),
+                    (true, true) => c.rgb_recorded.unwrap_or(false),
+                    (false, false) => !c.recording.is_null(),
+                    (true, false) => !c.rgb_recording.is_null(),
+                }
+            })
+            .collect();
+        let legacy_whole = !recorded.iter().any(|r| *r) && base.is_some();
+        let file = |i: usize| -> Option<PathBuf> {
+            let c = seg(i);
+            let own = if rgb { &c.raw_rgb_file } else { &c.raw_file };
+            own.as_ref().or(base.as_ref()).map(|name| raw_file(pass_dir, name))
+        };
+        (0..n)
+            .map(|i| {
+                if !(recorded[i] || (legacy_whole && i == 0)) {
+                    return None;
+                }
+                let path = file(i).filter(|p| p.is_file())?;
+                let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let c = seg(i);
+                let start = if rgb { c.raw_rgb_offset } else { c.raw_offset };
+                let stats = if rgb { &c.rgb_recording } else { &c.recording };
+                let written = stats.get("bytes_written").and_then(|b| b.as_u64()).filter(|_| stats.get("finished").and_then(|f| f.as_bool()) == Some(true));
+                let next = (i + 1..n).filter(|&j| recorded[j] && file(j).as_ref() == Some(&path)).map(|j| if rgb { seg(j).raw_rgb_offset } else { seg(j).raw_offset }).find(|&o| o > start);
+                let end = match (written, next) {
+                    (Some(w), _) => start + w,
+                    (None, Some(o)) => o,
+                    (None, None) => len,
+                }
+                .min(len);
+                (end > start).then_some((path, start, end))
+            })
+            .collect()
+    };
+    let (main, rgb) = (spans(false), spans(true));
+    main.into_iter().zip(rgb).collect()
+}
+
+/// Where a replayed session's laser planes come from: the ones the live session started with
+/// (kept with the pass's calibration files), else calibrated online like the live run did. Never
+/// the plane cache of the computer replaying, which may hold other planes or none.
+pub(crate) fn laser_choice(segment: Option<&scancraft_io::capture::CaptureSegment>, calibration: &[(String, Vec<u8>)]) -> scancraft_pipeline::LaserPlanesChoice {
+    let file = segment.and_then(|s| s.laser_planes.get("file")).and_then(|f| f.as_str());
+    match file.and_then(|f| calibration.iter().find(|(n, _)| n == f)).and_then(|(_, b)| serde_json::from_slice(b).ok()) {
+        Some(planes) => scancraft_pipeline::LaserPlanesChoice::Given(planes),
+        None => scancraft_pipeline::LaserPlanesChoice::Online,
+    }
+}
+
+/// Replays pass `id` of the project folder `dir` from its raw recording: the recorded frames are
+/// decoded with the pass's calibration files and scan settings (`capture.json`) and run through
+/// the pass's tracker as live: one tracker for the pass, a fresh pipeline per capture session
+/// with that session's settings (a continued pass starts a new one live too). See
+/// `docs/HANDOFF.md` ("Replaying a pass").
+pub fn replay_pass(dir: &std::path::Path, id: u32, which: ReplayFrames) -> Result<PassReplay, String> {
+    let log = crate::capture::read(dir, id).ok_or_else(|| format!("pass {id} has no capture record (pass-{id}/capture.json)"))?;
+    let record = &log.record;
+    let pass_dir = dir.join(scancraft_io::project::pass_dir(id));
+    let spans = session_spans(record, &pass_dir);
+    if spans.iter().all(|(m, _)| m.is_none()) {
+        return Err(match &record.raw_source {
+            Some(source) => format!("pass {id} has no raw recording here: it was added from {source}, replay it there"),
+            None => format!("pass {id} has no raw recording"),
+        });
+    }
+    let device: Option<DeviceInfo> = serde_json::from_value(record.device.clone()).ok();
+    let window = |settings: &serde_json::Value| {
+        let get = |k: &str, d: f64| settings.get(k).and_then(|v| v.as_f64()).unwrap_or(d) as f32;
+        (get("min_mm", 150.0), get("max_mm", 450.0))
+    };
+    let first_config: ScanConfig = serde_json::from_value(record.scan_config.clone()).map_err(|e| format!("the scan settings of pass {id}: {e}"))?;
+    let mut tracker = Tracker::with_config(crate::project::tracker_config(&first_config, device.as_ref()));
+    let mut rows: Vec<TrackRow> = Vec::new();
+    let (mut decoded, mut missing) = (0usize, 0usize);
+    for (seg, (main_span, rgb_span)) in spans.iter().enumerate() {
+        let s = record.captures.get(seg);
+        // The live frames of this session, in order, by device time stamp.
+        let logged: Vec<u64> = log.rows.iter().filter(|r| r.segment as usize == seg).map(|r| r.device_ms).collect();
+        let Some((main, start, end)) = main_span else {
+            // Not recorded: its frames cannot be replayed.
+            if which == ReplayFrames::Logged {
+                missing += logged.len();
+            }
+            continue;
+        };
+        let config: ScanConfig = s.and_then(|s| serde_json::from_value(s.scan_config.clone()).ok()).unwrap_or_else(|| first_config.clone());
+        let (min_mm, max_mm) = window(s.map(|s| &s.settings).filter(|v| !v.is_null()).unwrap_or(&record.settings));
+        let options = scancraft_pipeline::PipelineOptions { laser: laser_choice(s, &log.calibration), ..Default::default() };
+        let mut pipeline = scancraft_pipeline::pipeline_with(&config, min_mm, max_mm, &options)?;
+        let format = s.and_then(|s| s.stream.get("format")).and_then(|f| f.as_str()).unwrap_or(scancraft_driver_revopoint::offline::STREAM_FORMAT).to_string();
+        let mut next = 0usize;
+        let t0 = std::time::Instant::now();
+        let mut each = |frame: SensorFrame| -> bool {
+            decoded += 1;
+            if which == ReplayFrames::Logged {
+                // Logged frames missing from the recording (dropped by a slow disk) are skipped.
+                while next < logged.len() && logged[next] < frame.timestamp_ms {
+                    next += 1;
+                    missing += 1;
+                }
+                if next >= logged.len() {
+                    return false;
+                }
+                if logged[next] != frame.timestamp_ms {
+                    return true;
+                }
+                next += 1;
+            }
+            let started = std::time::Instant::now();
+            let status = pipeline.process(&frame, &mut tracker);
+            let new_points = tracker.take_new_points().len();
+            let pose = status.as_ref().map_or(tracker.current_pose, |s| s.current_pose);
+            rows.push(TrackRow {
+                segment: seg as u32,
+                frame: frame.frame_index,
+                device_ms: frame.timestamp_ms,
+                host_ms: t0.elapsed().as_millis() as u64,
+                state: status.as_ref().map_or("no_geometry", |s| crate::capture::state_name(s.state)).to_string(),
+                relocalized: status.as_ref().is_some_and(|s| s.relocalized),
+                inliers: status.as_ref().map_or(0, |s| s.inliers as u64),
+                rmse_mm: status.as_ref().map_or(0.0, |s| s.rmse_mm),
+                conflict: status.as_ref().map_or(0.0, |s| s.visibility_conflict),
+                keyframe: status.as_ref().and_then(|s| s.keyframe),
+                new_points: new_points as u64,
+                total_points: status.as_ref().map_or(0, |s| s.total_points_fused as u64),
+                rotation: pose.rotation.to_array(),
+                translation: pose.translation.to_array(),
+                imu: frame.imu.map(|i| i.orientation.to_array()),
+                proc_ms: started.elapsed().as_secs_f32() * 1000.0,
+            });
+            true
+        };
+        let main_reader = segment_reader(main, *start, end - start)?;
+        let rgb_reader = match rgb_span {
+            Some((p, a, b)) => Some(segment_reader(p, *a, b - a)?),
+            None => None,
+        };
+        match format.as_str() {
+            scancraft_driver::mock::MOCK_STREAM_FORMAT => {
+                let cal = log.calibration.iter().find(|(n, _)| n == scancraft_driver::mock::MOCK_CALIBRATION_FILE).map(|(_, b)| b.clone()).ok_or("the simulator's calibration file is missing")?;
+                let main_bytes = read_all(main_reader)?;
+                let rgb_bytes = rgb_reader.map(read_all).transpose()?;
+                scancraft_driver::mock::decode_recording(&cal, &main_bytes, rgb_bytes.as_deref(), &mut each)?;
+            }
+            scancraft_driver_revopoint::offline::STREAM_FORMAT => {
+                let calibration = Arc::new(scancraft_driver_revopoint::offline::calibration_from_files(&log.calibration)?);
+                scancraft_driver_revopoint::offline::decode_recording(&config, calibration, main_reader, rgb_reader, &mut each)?;
+            }
+            other => return Err(format!("pass {id}: recorded stream format {other} is not known to this version")),
+        }
+        if which == ReplayFrames::Logged {
+            missing += logged.len().saturating_sub(next);
+        }
+    }
+    let comparison = (!log.rows.is_empty()).then(|| compare(&log.rows, &rows));
+    Ok(PassReplay { rows, tracker, decoded, missing, comparison })
+}
+
+/// The replayed poses against the live ones, frame by frame (by session and device time stamp).
+pub fn compare(live: &[TrackRow], replayed: &[TrackRow]) -> PoseComparison {
+    let by_key: std::collections::HashMap<(u32, u64), &TrackRow> = live.iter().map(|r| ((r.segment, r.device_ms), r)).collect();
+    let mut c = PoseComparison::default();
+    let mut dists = Vec::new();
+    for r in replayed {
+        let Some(l) = by_key.get(&(r.segment, r.device_ms)) else { continue };
+        if l.state != r.state {
+            c.state_differs += 1;
+        }
+        if !l.has_pose() || !r.has_pose() {
+            continue;
+        }
+        let d = (glam::Vec3::from(l.translation) - glam::Vec3::from(r.translation)).length();
+        let a = glam::Quat::from_array(l.rotation).normalize().angle_between(glam::Quat::from_array(r.rotation).normalize()).to_degrees();
+        c.frames += 1;
+        c.max_translation_mm = c.max_translation_mm.max(d);
+        c.max_rotation_deg = c.max_rotation_deg.max(a);
+        dists.push(d);
+    }
+    if !dists.is_empty() {
+        dists.sort_by(f32::total_cmp);
+        c.median_translation_mm = dists[dists.len() / 2];
+    }
+    c
+}
+
+/// `scancraft --replay-pass <project> <pass id> [--all-frames] [--out <folder>]`: replays the pass
+/// headless and prints how its poses compare with the live run; with `--out`, writes the replay's
+/// tracking log and fused points there. Returns the process exit code.
+pub fn replay_pass_cli(project: &std::path::Path, id: u32, all: bool, out: Option<&std::path::Path>) -> i32 {
+    // A bundle is read through an unpacked copy (removed afterwards).
+    let mut _copy = None;
+    let dir = if scancraft_io::project::is_bundle(project) {
+        let root = std::env::temp_dir().join("scancraft-replay");
+        match scancraft_io::workdir::UnpackedCopy::unpack(project, &root) {
+            Ok(c) => {
+                let d = c.dir().to_path_buf();
+                _copy = Some(c);
+                d
+            }
+            Err(e) => {
+                eprintln!("{}: {e}", project.display());
+                return 2;
+            }
+        }
+    } else if project.join(scancraft_io::capture::capture_path(id)).is_file() {
+        // Any folder with the pass's capture record: also a staging folder a crash left, which
+        // has no project file.
+        project.to_path_buf()
+    } else {
+        match scancraft_io::project::locate(project) {
+            Ok(l) => l.root,
+            Err(e) => {
+                eprintln!("{}: {e}", project.display());
+                return 2;
+            }
+        }
+    };
+    let which = if all { ReplayFrames::All } else { ReplayFrames::Logged };
+    let t0 = std::time::Instant::now();
+    let r = match replay_pass(&dir, id, which) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("replay of pass {id}: {e}");
+            return 1;
+        }
+    };
+    let count = |s: &str| r.rows.iter().filter(|row| row.state == s).count();
+    println!(
+        "pass {id}: {} frames decoded, {} processed ({} tracking, {} slow, {} lost, {} without geometry), {} keyframes, {} points, {:.1} s",
+        r.decoded,
+        r.rows.len(),
+        count("tracking"),
+        count("slow"),
+        count("lost"),
+        count("no_geometry"),
+        r.tracker.keyframes().len(),
+        r.tracker.fused_points().len(),
+        t0.elapsed().as_secs_f32()
+    );
+    if r.missing > 0 {
+        println!("  {} frames of the live run are not in the recording (dropped while recording)", r.missing);
+    }
+    if let Some(c) = r.comparison {
+        println!(
+            "  against the live run: {} frames compared, translation max {:.3} mm (median {:.3}), rotation max {:.3} deg, {} frames in another state",
+            c.frames, c.max_translation_mm, c.median_translation_mm, c.max_rotation_deg, c.state_differs
+        );
+    }
+    if let Some(out) = out {
+        let csv = out.join(format!("replay-pass-{id}.csv"));
+        let ply = out.join(format!("replay-pass-{id}.ply"));
+        let written = std::fs::create_dir_all(out)
+            .map_err(|e| e.to_string())
+            .and_then(|_| scancraft_io::capture::write_tracking_log(&csv, &r.rows).map_err(|e| e.to_string()))
+            .and_then(|_| scancraft_io::save_ply_binary(&scancraft_core::PointCloud::from_points(r.tracker.fused_points()), &ply).map_err(|e| e.to_string()));
+        match written {
+            Ok(()) => println!("  wrote {} and {}", csv.display(), ply.display()),
+            Err(e) => {
+                eprintln!("writing the replay: {e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sessions_that_recorded_nothing_take_no_bytes_of_the_recording() {
+        use scancraft_io::capture::{CaptureRecord, CaptureSegment};
+        let dir = std::env::temp_dir().join(format!("scancraft-spans-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("raw.bin"), vec![0u8; 1000]).unwrap();
+        std::fs::write(dir.join("raw_rgb.bin"), vec![0u8; 300]).unwrap();
+        std::fs::write(dir.join("raw-2.bin"), vec![0u8; 500]).unwrap();
+        let rec = |main: bool, rgb: bool, offset: u64, rgb_offset: u64| CaptureSegment { recorded: Some(main), rgb_recorded: Some(rgb), raw_offset: offset, raw_rgb_offset: rgb_offset, ..Default::default() };
+        // Session 0 recorded both streams; session 1 nothing (offsets 0); session 2 the main
+        // stream only, into a file of its own.
+        let mut record = CaptureRecord { raw_main: Some("raw.bin".into()), raw_rgb: Some("raw_rgb.bin".into()), ..Default::default() };
+        record.captures = vec![rec(true, true, 0, 0), rec(false, false, 0, 0), CaptureSegment { raw_file: Some("raw-2.bin".into()), ..rec(true, false, 0, 0) }];
+        let spans = session_spans(&record, &dir);
+        assert_eq!(spans[0], (Some((dir.join("raw.bin"), 0, 1000)), Some((dir.join("raw_rgb.bin"), 0, 300))));
+        assert_eq!(spans[1], (None, None));
+        assert_eq!(spans[2], (Some((dir.join("raw-2.bin"), 0, 500)), None));
+        // Colour on, then off, main stream appended: each session gets only its own bytes.
+        record.captures = vec![rec(true, true, 0, 0), rec(true, false, 600, 0)];
+        let spans = session_spans(&record, &dir);
+        assert_eq!(spans[0], (Some((dir.join("raw.bin"), 0, 600)), Some((dir.join("raw_rgb.bin"), 0, 300))));
+        assert_eq!(spans[1], (Some((dir.join("raw.bin"), 600, 1000)), None));
+        // A finished session ends after the bytes it wrote.
+        record.captures[0].recording = serde_json::json!({ "bytes_written": 550, "finished": true });
+        assert_eq!(session_spans(&record, &dir)[0].0, Some((dir.join("raw.bin"), 0, 550)));
+        // A record of the first version (no `recorded`): its counters say it.
+        let mut old = CaptureRecord { raw_main: Some("raw.bin".into()), ..Default::default() };
+        old.captures = vec![CaptureSegment { recording: serde_json::json!({ "bytes_written": 1000 }), ..Default::default() }, CaptureSegment::default()];
+        assert_eq!(session_spans(&old, &dir)[0].0, Some((dir.join("raw.bin"), 0, 1000)));
+        assert_eq!(session_spans(&old, &dir)[1].0, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_laser_session_replays_with_the_planes_it_started_with_never_the_local_cache() {
+        use scancraft_pipeline::LaserPlanesChoice;
+        let planes = scancraft_laser::planes::LaserPlaneSet::default();
+        let mut log = crate::capture::CaptureLog::default();
+        log.record.captures.push(Default::default());
+        log.record.captures.push(Default::default());
+        log.set_laser_planes(0, &scancraft_laser::PlanesOrigin::Cache("C:/x/laser_planes_cross_1.json".into()), Some(&planes));
+        log.set_laser_planes(1, &scancraft_laser::PlanesOrigin::Online, None);
+        assert!(log.record.calibration.contains(&"laser_planes-0.json".to_string()), "the planes go with the calibration files");
+        assert_eq!(log.record.captures[0].laser_planes["origin"], "cache");
+        assert!(!log.record.captures[0].laser_planes.to_string().contains("C:/x"), "no local path in the record");
+        assert!(matches!(laser_choice(log.record.captures.first(), &log.calibration), LaserPlanesChoice::Given(p) if p == planes));
+        assert!(matches!(laser_choice(log.record.captures.get(1), &log.calibration), LaserPlanesChoice::Online));
+        // A record without the information (older captures): calibrated online, not the cache.
+        assert!(matches!(laser_choice(None, &[]), LaserPlanesChoice::Online));
+    }
+
+    /// A real POP 4 recording (made with `SCANCRAFT_RECORD_DIR` before capture records existed)
+    /// replayed through the pass replay: wrapped as a pass with a capture record that names the
+    /// recording and the calibration, decoded with the driver's offline decoder, tracked twice
+    /// with the same result. `SCANCRAFT_POP4_RECORDING=<pop4_*.bin>`,
+    /// `SCANCRAFT_POP4_CAMPARAM=<camparam.yaml of that scanner>` (Full-field HD, Feature).
+    #[test]
+    #[ignore = "needs a POP 4 recording: SCANCRAFT_POP4_RECORDING, SCANCRAFT_POP4_CAMPARAM"]
+    fn a_pop4_recording_replays_as_a_pass_and_twice_the_same() {
+        let rec = PathBuf::from(std::env::var("SCANCRAFT_POP4_RECORDING").expect("SCANCRAFT_POP4_RECORDING"));
+        let cam = std::fs::read(std::env::var("SCANCRAFT_POP4_CAMPARAM").expect("SCANCRAFT_POP4_CAMPARAM")).unwrap();
+        let dir = std::env::temp_dir().join(format!("scancraft-pop4-replay-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut log = crate::capture::CaptureLog::default();
+        let config = ScanConfig::default();
+        log.record.scan_config = serde_json::to_value(&config).unwrap();
+        log.record.settings = serde_json::json!({ "min_mm": 250.0, "max_mm": 500.0 });
+        log.record.raw_main = Some(std::path::absolute(&rec).unwrap().display().to_string());
+        log.record.calibration = vec!["camparam.yaml".into()];
+        log.calibration = vec![("camparam.yaml".into(), scancraft_driver_revopoint::calibration::redact_serial(&cam, ""))];
+        log.record.captures.push(scancraft_io::capture::CaptureSegment {
+            stream: serde_json::json!({ "format": scancraft_driver_revopoint::offline::STREAM_FORMAT }),
+            scan_config: log.record.scan_config.clone(),
+            ..Default::default()
+        });
+        crate::capture::write(&dir, 1, &mut log).unwrap();
+        let a = replay_pass(&dir, 1, ReplayFrames::All).unwrap();
+        let count = |s: &str| a.rows.iter().filter(|r| r.state == s).count();
+        let span_s = (a.rows.last().unwrap().device_ms - a.rows[0].device_ms) as f64 / 1000.0;
+        let bytes = std::fs::metadata(&rec).unwrap().len() as f64;
+        println!(
+            "POP 4 recording: {} frames decoded over {span_s:.1} s ({:.1} MB/s), {} tracking, {} slow, {} lost, {} points",
+            a.decoded,
+            bytes / 1e6 / span_s.max(1e-3),
+            count("tracking"),
+            count("slow"),
+            count("lost"),
+            a.tracker.fused_points().len()
+        );
+        assert!(a.decoded > 20 && count("tracking") * 2 > a.decoded, "{} of {} tracked", count("tracking"), a.decoded);
+        // The first replay as the "live" log: a second one gives the same poses.
+        log.rows = a.rows.clone();
+        crate::capture::write(&dir, 1, &mut log).unwrap();
+        let b = replay_pass(&dir, 1, ReplayFrames::Logged).unwrap();
+        let c = b.comparison.unwrap();
+        println!("second replay against the first: {c:?}");
+        assert!(b.missing == 0 && c.frames + 2 >= a.rows.len() && c.max_translation_mm < 0.05 && c.state_differs == 0, "{c:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

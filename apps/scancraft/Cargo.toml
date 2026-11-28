@@ -14,6 +14,7 @@ scancraft-render.workspace = true
 scancraft-ui.workspace = true
 scancraft-slam.workspace = true
 scancraft-pipeline.workspace = true
+scancraft-laser.workspace = true
 async-trait.workspace = true
 scancraft-fusion.workspace = true
 scancraft-mesh.workspace = true

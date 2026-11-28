@@ -21,10 +21,33 @@ use crate::alignment::{self, AlignAllOutcome, PassInput, RefineOutcome};
 use crate::isolation::{self, MaskCache};
 use crate::model::*;
 use crate::project::{self, AlignMethod, AlignState, LoadedPass, PassMarker, PassSource, ProjectInfo, StoredPass, StoredProject};
+use crate::storage::{same_path, OpenRequest, OpenTarget, Store};
+use scancraft_io::bundle::Item;
+use scancraft_io::lock::LockFile;
+use scancraft_io::workdir::{self, WorkFolder};
 
 /// What a background job needs of one pass: (id, project <- pass, placed, reference, surface,
 /// isolation cache).
 type JobPass = (u32, Transform, bool, bool, PassSource, MaskCache);
+
+/// Said when a save into the project's own place is refused because someone else holds it.
+const SAVE_ELSEWHERE: &str = "To keep your changes, save under another name in Save Project";
+
+/// The name a project is shown by in the status and the history, from the path it was picked as:
+/// a bundle or project file without its extension, an older `project.json` or a project folder
+/// by the folder's name.
+pub(crate) fn project_label(path: &std::path::Path) -> String {
+    use scancraft_io::project::{has_extension, BUNDLE_EXTENSION, PROJECT_EXTENSION};
+    let name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let label = if has_extension(path, BUNDLE_EXTENSION) || (has_extension(path, PROJECT_EXTENSION) && !path.is_dir()) {
+        path.file_stem().map(|n| n.to_string_lossy().into_owned())
+    } else if path.is_file() {
+        path.parent().and_then(name)
+    } else {
+        name(path)
+    };
+    label.filter(|l| !l.is_empty()).unwrap_or_else(|| "project".into())
+}
 
 /// Passes with fewer points take no part in Align All.
 const ALIGN_ALL_MIN_POINTS: usize = 200;
@@ -174,6 +197,151 @@ pub fn solid_points(input: SolidInput) -> Result<(Vec<scancraft_mesh::SolidPoint
     }
 }
 
+/// One pass as Save Project collects it: (id, name, frames, shown, meta, tracker, imported
+/// surface, cleaned surface, colour keyframes, object mask, marker map).
+type SavePass = (u32, String, u64, bool, project::PassMeta, SharedTracker, Option<Arc<PointCloud>>, Option<Arc<PointCloud>>, Vec<scancraft_color::RgbKeyframe>, Option<Arc<isolation::ObjectMask>>, Vec<PassMarker>);
+
+/// What Save Project writes, collected from the app (see `ScanCraftApp::save_input`).
+struct SaveInput {
+    passes: Vec<SavePass>,
+    reference: Option<u32>,
+    next_pass_id: u32,
+    merged: Option<(PointCloud, Vec<u32>)>,
+    mesh: Option<scancraft_core::Mesh>,
+    settings: serde_json::Value,
+    notes: String,
+}
+
+impl SaveInput {
+    /// Waits (at most `limit`) until the raw recordings of the passes have been written out: a
+    /// capture that just stopped may still be flushing them. `false` when one is still writing.
+    fn wait_for_recordings(&self, limit: std::time::Duration) -> bool {
+        let stats: Vec<_> = self.passes.iter().filter_map(|p| p.4.capture.as_ref()).filter_map(|c| c.lock().ok().map(|l| l.recording_stats())).flatten().collect();
+        scancraft_driver::recording::wait_finished(&stats, limit)
+    }
+
+    /// The project to write, named `name` (runs in the job: it locks the passes' trackers).
+    fn into_project(self, name: String) -> Result<StoredProject, String> {
+        let mut stored = Vec::with_capacity(self.passes.len());
+        for (id, pass_name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask, markers) in self.passes {
+            let Ok(t) = tracker.lock() else { return Err("A pass's tracker is unavailable".into()) };
+            stored.push(StoredPass { id, name: pass_name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
+        }
+        Ok(StoredProject { name, reference: self.reference, next_pass_id: self.next_pass_id, passes: stored, merged: self.merged, cleaned: None, mesh: self.mesh, settings: self.settings, notes: self.notes })
+    }
+}
+
+/// How long a save waits for raw recordings that are still being written out.
+const RECORDING_FLUSH: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Moves the raw recordings of a staging folder (`ProjectInfo::staging`) into the project folder
+/// `to`: renamed when on the same drive, else copied (to a temporary name, renamed when complete,
+/// so a failed copy never leaves a partial file under the real name) and then removed. A file
+/// the project already has with the same size was moved before (the source is removed); one
+/// with other content is never replaced: that is an error and the staged file stays. Every
+/// file is tried; the first error is returned after all of them.
+pub(crate) fn move_raw_files(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<usize> {
+    let mut moved = 0;
+    let mut failed: Option<std::io::Error> = None;
+    for (src, size) in crate::app::raw_files_in(from) {
+        let (Some(pass), Some(fname)) = (src.parent().and_then(|p| p.file_name()), src.file_name()) else { continue };
+        let dest = to.join(pass).join(fname);
+        let result = (|| -> std::io::Result<()> {
+            if let Ok(m) = std::fs::metadata(&dest) {
+                if m.len() == size {
+                    // Moved before (its removal from staging failed then).
+                    return std::fs::remove_file(&src);
+                }
+                if m.len() > 0 {
+                    return Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} exists with other content", dest.display())));
+                }
+                std::fs::remove_file(&dest)?;
+            }
+            std::fs::create_dir_all(dest.parent().unwrap_or(to))?;
+            if std::fs::rename(&src, &dest).is_ok() {
+                return Ok(());
+            }
+            let partial = dest.with_extension("bin.partial.tmp");
+            if let Err(e) = std::fs::copy(&src, &partial).and_then(|_| std::fs::rename(&partial, &dest)) {
+                let _ = std::fs::remove_file(&partial);
+                return Err(e);
+            }
+            let _ = std::fs::remove_file(&src);
+            Ok(())
+        })();
+        match result {
+            Ok(()) => moved += 1,
+            Err(e) => {
+                log::warn!("raw recording {} not moved to {}: {e}", src.display(), dest.display());
+                failed.get_or_insert(e);
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(moved),
+    }
+}
+
+/// What a save says about moving the staged raw recordings: nothing when they moved, else why
+/// they stayed where they were (nothing is lost: they are moved on the next save).
+fn staging_note(staging: &std::path::Path, moved: std::io::Result<usize>) -> Option<String> {
+    match moved {
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("raw recordings in {} were not moved into the project: {e}", staging.display());
+            Some(format!(" · the raw recordings stay in {} ({e}); the next save tries again", staging.display()))
+        }
+    }
+}
+
+/// The status message of a bundle save.
+fn bundle_message(passes: &str, report: &scancraft_io::bundle::BundleReport) -> String {
+    let mut message = format!("Saved {passes} to {} ({})", report.path.display(), scancraft_io::fsutil::format_bytes(report.bytes));
+    if !report.left_out.is_empty() {
+        let items: Vec<&str> = report.left_out.iter().map(|l| l.item.label()).collect();
+        message.push_str(&format!(" · left out: {}", items.join(", ")));
+    }
+    message
+}
+
+/// Reads the project in `dir` and rebuilds its passes (runs in a job). The caller fills in the
+/// path shown and the store.
+fn read_opened(dir: &std::path::Path) -> Result<OpenedProject, String> {
+    let stored = project::load(dir)?;
+    let passes: Vec<LoadedPass> = {
+        use rayon::prelude::*;
+        stored.passes.into_par_iter().map(project::rebuild).collect()
+    };
+    let mesh = stored.mesh.map(|m| {
+        let a = Mesher::analyze(&m);
+        (m, a)
+    });
+    Ok(OpenedProject {
+        path: dir.to_path_buf(),
+        store: Store::None,
+        recovered: false,
+        read_only: false,
+        notice: None,
+        name: stored.name,
+        next_pass_id: stored.next_pass_id,
+        passes,
+        merged: stored.merged,
+        cleaned: stored.cleaned,
+        mesh,
+        settings: stored.settings,
+        notes: stored.notes,
+    })
+}
+
+/// Removes a leftover working folder that holds nothing to recover.
+fn discard_quietly(dir: &std::path::Path) {
+    match workdir::discard(dir) {
+        Ok(()) => log::info!("removed the working folder {} (nothing unsaved in it)", dir.display()),
+        Err(e) => log::warn!("could not remove the working folder {}: {e}", dir.display()),
+    }
+}
+
 /// A pass's surface as Make Solid and Reconstruct's marker removal take it: its object only unless
 /// `whole_scene`.
 fn solid_surfels(source: &PassSource, mask: &MaskCache, whole_scene: bool) -> Result<Vec<(Vec3, Vec3, u32)>, String> {
@@ -266,9 +434,11 @@ impl ScanCraftApp {
         PASS_COLOURS[1 + k % (PASS_COLOURS.len() - 1)]
     }
 
-    /// Unsaved changes since the project was last saved or opened.
+    /// Unsaved changes since the project was last saved or opened. Raw recordings in a staging
+    /// folder (a project never saved, or a save that could not move them) count too: closing
+    /// the tab would delete them.
     pub fn dirty(&self) -> bool {
-        self.has_geometry() && self.next_generation != self.project.saved_generation
+        ((self.has_geometry() || !self.passes.is_empty()) && self.next_generation != self.project.saved_generation) || self.project.staging.is_some()
     }
 
     pub fn reference_pass(&self) -> Option<u32> {
@@ -951,78 +1121,660 @@ impl ScanCraftApp {
 
     // ------------------------------------------------------------------ project files
 
-    pub fn save_project(&mut self, dir: PathBuf) {
-        if self.tool_blocked(Tool::SaveProject).is_some() || dir.as_os_str().is_empty() {
-            self.say(Tone::Error, "Enter a folder for the project");
+    /// What a save writes, collected on the UI thread (the job reads the trackers).
+    fn save_input(&self) -> SaveInput {
+        SaveInput {
+            passes: self
+                .passes
+                .iter()
+                .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask), p.markers.clone()))
+                .collect(),
+            reference: self.reference_pass(),
+            next_pass_id: self.next_pass_id,
+            merged: self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone())),
+            mesh: self.mesh.as_ref().map(|m| (*m.mesh).clone()),
+            settings: serde_json::json!({
+                "min_mm": self.settings.min_mm,
+                "max_mm": self.settings.max_mm,
+                "merge_outliers": self.settings.merge_outliers,
+                "merge_sigma": self.settings.merge_sigma,
+                "whole_scene": self.settings.whole_scene,
+                // The processing parameters of the later steps (informative: what the outputs
+                // were last made with) and the app that saved them.
+                "processing": self.processing_settings(),
+                "saved_by": crate::capture::app_build(),
+            }),
+            notes: self.project.notes.clone(),
+        }
+    }
+
+    /// The project's processing history: what was saved with it before, then this session's
+    /// done steps (oldest first; at most `MAX_HISTORY` of a session).
+    pub(crate) fn history_log(&self) -> Vec<serde_json::Value> {
+        let mut log = self.project.history_before.clone();
+        let utc = |t: std::time::SystemTime| scancraft_io::fsutil::format_utc(t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0));
+        log.extend(self.history.timeline().into_iter().filter(|s| s.done).map(|s| serde_json::json!({ "utc": utc(s.at), "step": s.label, "app": crate::capture::version_label() })));
+        log
+    }
+
+    /// Clean / Reconstruct / Make Solid / Fill Holes settings as saved with the project.
+    pub(crate) fn processing_settings(&self) -> serde_json::Value {
+        let s = &self.settings;
+        serde_json::json!({
+            "point_budget": s.point_budget,
+            "plane_tolerance_mm": s.plane_tolerance_mm,
+            "sor_neighbors": s.sor_neighbors,
+            "sor_std_dev": s.sor_std_dev,
+            "voxel_mm": s.voxel_mm,
+            "mc_cell_mm": s.mc_cell_mm,
+            "mesh_smoothness": s.mesh_smoothness,
+            "mesh_auto_smooth": s.mesh_auto_smooth,
+            "mesh_suppress_artefacts": s.mesh_suppress_artefacts,
+            "mesh_remove_markers": s.mesh_remove_markers,
+            "smooth_iterations": s.smooth_iterations,
+            "smooth_keep_edges": s.smooth_keep_edges,
+            "fill_max_mm": s.fill_max_mm,
+            "fill_keep_largest": s.fill_keep_largest,
+            "solid_cell_mm": s.solid_cell_mm,
+            "solid_remove_markers": s.solid_remove_markers,
+            "solid_sharp_top": s.solid_sharp_top,
+            "decimate_ratio": s.decimate_ratio,
+            "history": self.history_log(),
+        })
+    }
+
+    /// Save Project into `target`: a project folder, or a bundle when `target` ends in
+    /// `.scancraftz`. Saving where the project already is writes it there (a bundle tab: into its
+    /// working folder, then back into the bundle). Saving anywhere else moves the tab there
+    /// (Save As Project Folder, Save as Bundle…): the new place is locked, the old one unlocked,
+    /// and a bundle's old working folder removed. The project is named after the folder or file.
+    ///
+    /// When the project file or bundle was changed by someone else since it was opened or last
+    /// saved here, nothing is saved: the conflict question (`save_conflict`) asks first.
+    pub fn save_project(&mut self, target: PathBuf) {
+        self.save_project_with(target, false);
+    }
+
+    /// The conflict question's Save Anyway: saves over the version someone else saved.
+    pub fn save_anyway(&mut self) {
+        let Some(conflict) = self.save_conflict.take() else { return };
+        if !self.project.path.as_deref().is_some_and(|p| same_path(p, &conflict.target)) {
+            self.pending_close = false;
+            self.say(Tone::Error, "Not saved: the project shown is no longer the one asked about");
             return;
         }
-        let name = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
-        let passes: Vec<_> = self
-            .passes
-            .iter()
-            .map(|p| (p.id, p.name.clone(), p.frames, p.layer.visible, p.meta.clone(), p.tracker.clone(), p.surface.clone(), p.edit.clone(), p.rgb_keyframes.clone(), isolation::cached(&p.mask), p.markers.clone()))
-            .collect();
-        let reference = self.reference_pass();
-        let next_pass_id = self.next_pass_id;
-        let merged = self.merged.as_ref().map(|m| ((*m.layer.cloud).clone(), m.passes.clone()));
-        let mesh = self.mesh.as_ref().map(|m| (*m.mesh).clone());
-        let settings = serde_json::json!({
-            "min_mm": self.settings.min_mm,
-            "max_mm": self.settings.max_mm,
-            "merge_outliers": self.settings.merge_outliers,
-            "merge_sigma": self.settings.merge_sigma,
-            "whole_scene": self.settings.whole_scene,
-        });
-        self.spawn_job("Saving the project", move || {
-            let mut stored = Vec::new();
-            for (id, name, frames, visible, meta, tracker, surface, edit, rgb_keyframes, mask, markers) in passes {
-                let Ok(t) = tracker.lock() else { return JobResult::Failed("A pass's tracker is unavailable".into()) };
-                stored.push(StoredPass { id, name, frames, visible, meta, keyframes: t.keyframes().iter().map(scancraft_slam::Keyframe::to_data).collect(), surface, edit, rgb_keyframes, mask, markers });
+        self.save_project_with(conflict.target, true);
+    }
+
+    /// The conflict question's Save As…: the Save Project card, proposing a free name beside the
+    /// changed project (both versions are kept).
+    pub fn save_conflict_as(&mut self) {
+        let Some(conflict) = self.save_conflict.take() else { return };
+        self.open_tool(Tool::SaveProject);
+        self.propose_beside(&conflict.target);
+        self.say(Tone::Normal, "Choose where to save this version, then Save");
+    }
+
+    /// Fills the Save card with a free name beside `path` (`X (2)`, `X (2).scancraftz`, …) and
+    /// remembers it as proposed ([`ProjectInfo::proposed`]).
+    fn propose_beside(&mut self, path: &std::path::Path) {
+        let free = crate::storage::free_sibling(path);
+        self.settings.project_path = free.display().to_string();
+        self.project.proposed = Some((path.to_path_buf(), free));
+    }
+
+    /// The conflict question's Cancel: nothing is saved (a close or quit waiting for the save
+    /// stops too).
+    pub fn cancel_save_conflict(&mut self) {
+        if self.save_conflict.take().is_some() {
+            self.pending_close = false;
+            self.say(Tone::Normal, "Not saved");
+        }
+    }
+
+    /// A save that did not start: as a failed one, it neither closes the tab it was for nor
+    /// quits.
+    fn save_refused(&mut self, message: String) {
+        self.pending_close = false;
+        if self.save_all_queue.take().is_some() {
+            self.quit_confirmed = false;
+        }
+        self.say(Tone::Error, message);
+    }
+
+    /// Asks about a save that would replace someone else's version (stops a Save All on quit:
+    /// the question is about one tab).
+    fn ask_save_conflict(&mut self, target: PathBuf, why: String) {
+        if self.save_all_queue.take().is_some() {
+            self.quit_confirmed = false;
+        }
+        self.save_conflict = Some(crate::storage::SaveConflict { target, message: why });
+    }
+
+    /// [`Self::save_project`]; `overwrite`: save even over a version someone else saved (the
+    /// conflict question's Save Anyway).
+    fn save_project_with(&mut self, target: PathBuf, overwrite: bool) {
+        if self.tool_blocked(Tool::SaveProject).is_some() || target.as_os_str().is_empty() {
+            self.save_refused("Enter a folder or bundle file for the project".into());
+            return;
+        }
+        let target = std::path::absolute(&target).unwrap_or(target);
+        // A free name proposed earlier that is taken by now (another tab, app or computer saved
+        // there meanwhile): what is there now is never replaced; the next free name is proposed.
+        if let Some((beside, proposal)) = self.project.proposed.clone() {
+            if same_path(&proposal, &target) && target.exists() {
+                self.propose_beside(&beside);
+                self.save_refused(format!("Not saved: {} was created meanwhile by another save. The Save card now proposes {}", target.display(), self.settings.project_path));
+                return;
             }
-            let n = stored.len();
-            let project = StoredProject { name: name.clone(), reference, next_pass_id, passes: stored, merged, cleaned: None, mesh, settings };
-            match project::save(&dir, &project) {
-                Ok(()) => JobResult::Saved { message: format!("Saved {n} pass{} to {}", if n == 1 { "" } else { "es" }, dir.display()), path: dir, name },
+        }
+        let as_bundle = scancraft_io::project::has_extension(&target, scancraft_io::project::BUNDLE_EXTENSION);
+        if !as_bundle && target.is_file() {
+            self.save_refused(format!("{} is a file: enter a folder, or a .scancraftz file to save a bundle", target.display()));
+            return;
+        }
+        let name = if as_bundle { target.file_stem() } else { target.file_name() }.map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| self.project.name.clone());
+        let input = self.save_input();
+        let contents = self.prefs.bundle_contents;
+        let old_dir = self.project.store.data_dir();
+        // Raw streams recorded before the project had a folder of its own (`ProjectInfo::staging`).
+        let staging = self.project.staging.clone().filter(|d| d.is_dir());
+        let n = input.passes.len();
+        let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
+        if as_bundle {
+            if let Store::Bundle { work, dir } = &self.project.store {
+                // A bundle tab: into its working folder, then back into this or another bundle.
+                let (work, dir) = (work.clone(), dir.clone());
+                // Still this tab's to write: a lock another computer took over and has let go
+                // since is taken again (as a project folder's); one someone else holds now
+                // refuses the save, naming them.
+                let relocked = match work.lock() {
+                    Ok(mut w) if same_path(w.bundle(), &target) => w.relock().map_err(|e| e.to_string()),
+                    Ok(_) => Ok(()),
+                    Err(_) => Err("the working folder is unavailable".to_string()),
+                };
+                if let Err(e) = relocked {
+                    self.save_refused(format!("Could not save the bundle: {e}. {SAVE_ELSEWHERE}"));
+                    return;
+                }
+                if !overwrite {
+                    let changed = work.lock().ok().filter(|w| same_path(w.bundle(), &target) && w.bundle().exists() && w.bundle_changed()).map(|w| w.bundle().to_path_buf());
+                    if let Some(bundle) = changed {
+                        self.ask_save_conflict(target, format!("{} was changed by someone else since it was opened here.", bundle.display()));
+                        return;
+                    }
+                }
+                self.spawn_job("Saving the bundle", move || {
+                    let saved = (|| {
+                        let flushed = input.wait_for_recordings(RECORDING_FLUSH);
+                        project::save(&dir, &input.into_project(name.clone())?)?;
+                        if !flushed {
+                            log::warn!("a raw recording was still being written while saving");
+                        }
+                        let mut work = work.lock().map_err(|_| "the working folder is unavailable".to_string())?;
+                        // Save keeps everything the bundle holds (the working folder, its only
+                        // other copy, goes when the tab closes) and adds what the settings ask
+                        // for; Save as Bundle… writes what the settings ask for.
+                        let report = if same_path(work.bundle(), &target) {
+                            let keep = work.held_contents().union(&contents);
+                            if overwrite {
+                                work.save_overwriting(&keep)
+                            } else {
+                                work.save(&keep)
+                            }
+                        } else {
+                            work.save_as(&target, &contents)
+                        };
+                        report.map_err(|e| e.to_string())
+                    })();
+                    match saved {
+                        Ok(report) => JobResult::Saved { message: bundle_message(&passes, &report), path: target, name, store: None },
+                        Err(e) => JobResult::Failed(format!("Could not save the bundle: {e}")),
+                    }
+                });
+            } else {
+                // Save as Bundle… of a project folder or a new project: a new working folder.
+                let root = self.prefs.work_root();
+                self.spawn_job("Saving the bundle", move || {
+                    let mut work = match WorkFolder::create(&target, &root) {
+                        Ok(w) => w,
+                        Err(e) => return JobResult::Failed(format!("Could not save the bundle: {e}")),
+                    };
+                    let saved = (|| {
+                        input.wait_for_recordings(RECORDING_FLUSH);
+                        project::save_carrying(work.dir(), &input.into_project(name.clone())?, old_dir.as_deref())?;
+                        // From now on the folder holds the project (for a new one, its only copy
+                        // on disk): a crash while the bundle is written leaves it recoverable.
+                        work.project_written().map_err(|e| e.to_string())?;
+                        // The raw recordings the app does not hold, only when the bundle takes them.
+                        if let (Some(old), true) = (&old_dir, contents.includes(Item::RawRecordings)) {
+                            workdir::copy_item_files(old, work.dir(), Item::RawRecordings).map_err(|e| e.to_string())?;
+                        }
+                        // Recorded before the project had a place: into the working folder (the
+                        // tab's data from now on), whatever the bundle takes.
+                        let note = staging.as_deref().and_then(|st| staging_note(st, move_raw_files(st, work.dir())));
+                        work.save(&contents).map(|r| (r, note)).map_err(|e| e.to_string())
+                    })();
+                    match saved {
+                        Ok((report, note)) => JobResult::Saved { message: format!("{}{}", bundle_message(&passes, &report), note.unwrap_or_default()), path: target, name, store: Some(Store::bundle(work)) },
+                        Err(e) => {
+                            let _ = work.close();
+                            JobResult::Failed(format!("Could not save the bundle: {e}"))
+                        }
+                    }
+                });
+            }
+            return;
+        }
+        // Never into the working folders (closing a bundle tab removes its working folder), also
+        // those under an earlier root.
+        if let Some(root) = self.prefs.work_roots().into_iter().find(|root| target.starts_with(root) || std::path::absolute(root).is_ok_and(|r| target.starts_with(r))) {
+            self.save_refused(format!("{} is where opened bundles are unpacked: choose another folder", root.display()));
+            return;
+        }
+        // A project folder: locked first unless it is this tab's folder already.
+        let (lock, seen) = if self.project.store.is_folder(&target) {
+            // This tab's folder: still locked by this tab (a lock broken by another computer that
+            // has since let go is taken again; one held by someone else refuses the save), and
+            // not saved by someone else meanwhile.
+            let Store::Folder { lock, seen } = &mut self.project.store else { unreachable!("is_folder") };
+            if !lock.is_held() {
+                match LockFile::lock_project(&target) {
+                    Ok(again) => *lock = again,
+                    Err(e) => {
+                        self.save_refused(format!("Could not save the project: {e}. {SAVE_ELSEWHERE}"));
+                        return;
+                    }
+                }
+            }
+            let seen = seen.clone();
+            let recorded = seen.lock().ok().and_then(|s| *s);
+            if !overwrite {
+                if let Err(scancraft_io::IoError::Conflict(why)) = scancraft_io::project::check_unchanged(&target, recorded) {
+                    self.ask_save_conflict(target, why);
+                    return;
+                }
+            }
+            (None, Some(seen))
+        } else {
+            let locked = std::fs::create_dir_all(&target).map_err(scancraft_io::IoError::from).and_then(|_| LockFile::lock_project(&target));
+            match locked {
+                Ok(lock) => (Some(lock), None),
+                Err(e) => {
+                    self.save_refused(format!("Could not save the project: {e}"));
+                    return;
+                }
+            }
+        };
+        self.spawn_job("Saving the project", move || {
+            let saved = (|| {
+                let flushed = input.wait_for_recordings(RECORDING_FLUSH);
+                project::save_carrying(&target, &input.into_project(name.clone())?, old_dir.as_deref())?;
+                // From a bundle (or another folder): bring the files the app does not hold.
+                if let (Some(_), Some(old)) = (&lock, &old_dir) {
+                    workdir::copy_item_files(old, &target, Item::RawRecordings).map_err(|e| e.to_string())?;
+                }
+                // Recorded before the project had a folder: moved in.
+                let mut note = staging.as_deref().and_then(|st| staging_note(st, move_raw_files(st, &target)));
+                if !flushed {
+                    log::warn!("a raw recording was still being written while saving; save again once the capture has stopped");
+                    note.get_or_insert_with(|| " · a raw recording was still being written: save again".into());
+                }
+                Ok::<_, String>(note)
+            })();
+            match saved {
+                Ok(note) => {
+                    // What the project file is now: the next save checks nobody else saved since.
+                    let stamp = scancraft_io::project::project_file_stamp(&target);
+                    if let Some(Ok(mut s)) = seen.as_ref().map(|s| s.lock()) {
+                        *s = stamp;
+                    }
+                    JobResult::Saved { message: format!("Saved {passes} to {}{}", target.display(), note.unwrap_or_default()), path: target, name, store: lock.map(|l| Store::folder(l, stamp)) }
+                }
                 Err(e) => JobResult::Failed(format!("Could not save the project: {e}")),
             }
         });
     }
 
-    pub fn open_project(&mut self, dir: PathBuf) {
+    /// The tab that has `path` open (its project folder or bundle).
+    pub fn tab_with_path(&self, path: &std::path::Path) -> Option<usize> {
+        self.tab_labels().iter().position(|t| t.path.as_deref().is_some_and(|p| same_path(p, path)))
+    }
+
+    /// Opens a project folder, project file or bundle in a new tab (or in the current one when it
+    /// is empty). A project that is open in a tab already is switched to. The project is locked
+    /// while open. One open in another app on this computer is refused; one open on another
+    /// computer is asked about (`lock_prompt`: Take Over, Open Read-Only or Cancel). A lock left
+    /// by a ScanCraft that has ended is taken over, and the status says so. A bundle is unpacked
+    /// into a working folder (under the working-folder root) and the tab works there.
+    pub fn open_project(&mut self, path: PathBuf) {
         if !self.can_edit() {
             return;
         }
-        self.spawn_job("Opening the project", move || {
-            let stored = match project::load(&dir) {
-                Ok(s) => s,
-                Err(e) => return JobResult::Failed(format!("Could not open the project: {e}")),
+        let Some(target) = OpenTarget::of(&path) else {
+            let why = scancraft_io::project::locate(&path).err().map(|e| e.to_string()).unwrap_or_else(|| format!("{} is not a ScanCraft project", path.display()));
+            self.say(Tone::Error, format!("Could not open the project: {why}"));
+            return;
+        };
+        if let Some(i) = self.tab_with_path(target.path()) {
+            // (Also when more opens wait in the queue.)
+            if self.show_tab(i) {
+                self.say(Tone::Normal, format!("{} is already open", self.project.name));
+            }
+            return;
+        }
+        match LockFile::lock_project(target.path()) {
+            Ok(lock) => self.open_locked(target, lock),
+            Err(scancraft_io::IoError::Locked { owner: Some(owner), .. }) if owner.may_be_taken_over() => {
+                self.lock_prompt = Some(crate::storage::LockPrompt { target, owner: *owner });
+            }
+            Err(e) => self.say(Tone::Error, format!("Could not open the project: {e}")),
+        }
+    }
+
+    /// Opens `target` with its lock taken.
+    fn open_locked(&mut self, target: OpenTarget, lock: LockFile) {
+        // Never silently: a lock taken from an ended ScanCraft (or, after the question, from
+        // another computer) is named in the status.
+        let notice = lock.replaced().map(|o| format!("its lock was taken over from {}", o.describe()));
+        match target {
+            OpenTarget::Bundle(bundle) => {
+                let root = self.prefs.work_root();
+                self.spawn_job("Opening the bundle", move || {
+                    let work = match WorkFolder::open_with_lock(&bundle, &root, lock) {
+                        Ok(w) => w,
+                        Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    };
+                    match read_opened(work.dir()) {
+                        Ok(mut opened) => {
+                            opened.path = bundle;
+                            opened.store = Store::bundle(work);
+                            opened.notice = notice;
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => {
+                            let _ = work.close();
+                            JobResult::Failed(format!("Could not open the bundle: {e}"))
+                        }
+                    }
+                });
+            }
+            OpenTarget::Folder(dir) => {
+                self.spawn_job("Opening the project", move || {
+                    // Taken before reading: a save by someone else after this is a conflict.
+                    let seen = scancraft_io::project::project_file_stamp(&dir);
+                    match read_opened(&dir) {
+                        Ok(mut opened) => {
+                            opened.store = Store::folder(lock, seen);
+                            opened.notice = notice;
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => JobResult::Failed(format!("Could not open the project: {e}")),
+                    }
+                });
+            }
+        }
+    }
+
+    /// The lock question's message: who has the project, and what each answer does.
+    pub fn lock_prompt_message(&self) -> String {
+        let Some(p) = &self.lock_prompt else { return String::new() };
+        format!(
+            "{} is in use by {}.\nTake Over only if that ScanCraft is no longer running or has the project open by mistake: if both save, one loses its changes. Open Read-Only opens a copy here; Save then asks for a new place.",
+            p.target.path().display(),
+            p.owner.describe()
+        )
+    }
+
+    /// The lock question's Take Over: takes the lock from the holder shown (refused when someone
+    /// else holds it by now) and opens the project.
+    pub fn take_over_and_open(&mut self) {
+        let Some(p) = self.lock_prompt.take() else { return };
+        if !self.can_edit() {
+            return;
+        }
+        match LockFile::take_over_from(&LockFile::path_for(p.target.path()), &p.owner) {
+            Ok(lock) => self.open_locked(p.target, lock),
+            Err(e) => self.say(Tone::Error, format!("Could not take over the project: {e}")),
+        }
+    }
+
+    /// The lock question's Open Read-Only: reads the project without its lock into a tab with
+    /// no place on disk (a bundle through an unpacked copy under the working-folder root, kept
+    /// until the tab closes or is saved elsewhere). Nothing is written where it is; Save asks for
+    /// a new place and brings the raw recordings and the fields of later versions along.
+    pub fn open_read_only(&mut self) {
+        let Some(p) = self.lock_prompt.take() else { return };
+        if !self.can_edit() {
+            return;
+        }
+        match p.target {
+            OpenTarget::Bundle(bundle) => {
+                let root = self.prefs.work_root();
+                self.spawn_job("Opening a read-only copy", move || {
+                    let copy = match workdir::UnpackedCopy::unpack(&bundle, &root) {
+                        Ok(c) => c,
+                        Err(e) => return JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    };
+                    // The copy stays while the tab is open: a save to a new place takes the raw
+                    // recordings and the fields of later versions from it.
+                    match read_opened(copy.dir()) {
+                        Ok(mut opened) => {
+                            opened.path = bundle.clone();
+                            opened.store = Store::read_only_bundle(bundle, copy);
+                            opened.read_only = true;
+                            JobResult::Opened(Box::new(opened))
+                        }
+                        Err(e) => JobResult::Failed(format!("Could not open the bundle: {e}")),
+                    }
+                });
+            }
+            OpenTarget::Folder(dir) => {
+                self.spawn_job("Opening a read-only copy", move || match read_opened(&dir) {
+                    Ok(mut opened) => {
+                        opened.store = Store::read_only_folder(dir);
+                        opened.read_only = true;
+                        JobResult::Opened(Box::new(opened))
+                    }
+                    Err(e) => JobResult::Failed(format!("Could not open the project: {e}")),
+                });
+            }
+        }
+    }
+
+    /// Opens a working folder left behind by a crash as a tab with its unsaved changes (Save
+    /// writes them into its bundle).
+    pub fn recover_project(&mut self, dir: PathBuf) {
+        if !self.can_edit() {
+            return;
+        }
+        self.spawn_job("Recovering unsaved work", move || {
+            let work = match WorkFolder::recover(&dir) {
+                Ok(w) => w,
+                Err(e) => return JobResult::Failed(format!("Could not recover {}: {e}", dir.display())),
             };
-            let passes: Vec<LoadedPass> = {
-                use rayon::prelude::*;
-                stored.passes.into_par_iter().map(project::rebuild).collect()
-            };
-            let mesh = stored.mesh.map(|m| {
-                let a = Mesher::analyze(&m);
-                (m, a)
-            });
-            JobResult::Opened(Box::new(OpenedProject {
-                path: dir,
-                name: stored.name,
-                next_pass_id: stored.next_pass_id,
-                passes,
-                merged: stored.merged,
-                cleaned: stored.cleaned,
-                mesh,
-                settings: stored.settings,
-            }))
+            match read_opened(work.dir()) {
+                Ok(mut opened) => {
+                    opened.path = work.bundle().to_path_buf();
+                    opened.store = Store::bundle(work);
+                    opened.recovered = true;
+                    JobResult::Opened(Box::new(opened))
+                }
+                // The folder stays (listed again at the next start).
+                Err(e) => JobResult::Failed(format!("Could not recover {}: {e}", dir.display())),
+            }
         });
     }
 
-    pub(super) fn install_project(&mut self, opened: OpenedProject) {
-        // Opens into a new tab unless the current one is empty: nothing is replaced.
-        if self.has_geometry() {
-            self.new_tab();
+    /// A request of a later start ([`crate::single_instance`]): open its project, or say why it
+    /// was refused or which of its options were not used. With a project those options are
+    /// named with the messages of its open ([`ScanCraftApp::carried_note`]), which would
+    /// otherwise replace them at once.
+    pub fn take_handover(&mut self, handover: crate::single_instance::Handover) {
+        use crate::single_instance::{ignored_message, Handover};
+        match handover {
+            Handover::Open(p) => self.request_open(OpenRequest::Path(p)),
+            Handover::Refused { path, why } => self.say(Tone::Error, format!("Could not open {path}: {why}")),
+            Handover::Ignored { options, project: true } => self.carried_note = Some(ignored_message(&options, true)),
+            Handover::Ignored { options, project: false } => self.say(Tone::Warning, ignored_message(&options, false)),
+            Handover::Focus => {}
         }
+    }
+
+    /// The lock question's Cancel: nothing is opened.
+    pub fn cancel_lock_prompt(&mut self) {
+        if self.lock_prompt.take().is_some() {
+            self.say(Tone::Normal, "Not opened");
+        }
+    }
+
+    /// Opens (or recovers) a project now, or once the running operation has finished.
+    pub fn request_open(&mut self, request: OpenRequest) {
+        if self.can_edit() && self.tabs_held().is_none() && self.pending_open.is_empty() {
+            match request {
+                OpenRequest::Path(p) => self.open_project(p),
+                OpenRequest::Recover(d) => self.recover_project(d),
+            }
+        } else {
+            let name = match &request {
+                OpenRequest::Path(p) | OpenRequest::Recover(p) => p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
+            };
+            self.pending_open.push_back(request);
+            self.say(Tone::Normal, format!("{name} opens when the running operation has finished"));
+        }
+    }
+
+    /// At start: the working folders that a crashed ScanCraft left behind, under the
+    /// working-folder root and the earlier ones (an earlier root with nothing left in it is
+    /// forgotten). Those with nothing to recover (no change since the last save, bundle
+    /// unchanged) and stopped removals are removed at once; the others are put to the user in one
+    /// question (`recovery`). Folders of a running ScanCraft and folders that are not working
+    /// folders are left alone.
+    pub fn check_leftovers(&mut self) {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        let mut ask = Vec::new();
+        let mut emptied = Vec::new();
+        for root in self.prefs.work_roots() {
+            for l in workdir::leftovers(&root) {
+                match &l.status {
+                    S::InUse(_) => {}
+                    S::Orphaned { changed, bundle_changed: false } if changed.is_empty() => discard_quietly(&l.dir),
+                    S::Closing => discard_quietly(&l.dir),
+                    // Not a working folder (no state file): never touched.
+                    S::Damaged(_) if !l.dir.join(workdir::STATE_FILE).is_file() => {}
+                    _ => ask.push(l),
+                }
+            }
+            if workdir::leftovers(&root).is_empty() {
+                emptied.push(root);
+            }
+        }
+        let before = self.prefs.past_work_roots.len();
+        self.prefs.past_work_roots.retain(|p| !emptied.iter().any(|e| same_path(e, p)));
+        if self.prefs.past_work_roots.len() != before {
+            self.save_prefs();
+        }
+        self.recovery = (!ask.is_empty()).then_some(ask);
+        // Raw recordings of never-saved projects: not working folders, so listed on their own.
+        self.orphan_captures = crate::app::orphaned_captures(&self.prefs.work_roots());
+    }
+
+    /// The question about recordings of never-saved projects a crash left (see
+    /// `check_leftovers`).
+    pub fn orphan_captures_message(&self) -> String {
+        let mut lines = vec!["ScanCraft stopped while scanning a project that was never saved. Its raw recordings are still on disk:".to_string()];
+        for (dir, bytes) in &self.orphan_captures {
+            lines.push(format!("• {} ({})", dir.display(), scancraft_io::fsutil::format_bytes(*bytes)));
+        }
+        lines.push("Each pass-<n> folder can be replayed with scancraft --replay-pass <folder> <n>. Keep leaves them for later (asked again at the next start); Delete removes them.".to_string());
+        lines.join("
+")
+    }
+
+    /// Deletes the recordings of never-saved projects that a crash left.
+    pub fn delete_orphan_captures(&mut self) {
+        let list = std::mem::take(&mut self.orphan_captures);
+        let failed: Vec<String> = list.iter().filter_map(|(d, _)| std::fs::remove_dir_all(d).err().map(|e| format!("{} ({e})", d.display()))).collect();
+        if failed.is_empty() {
+            self.say(Tone::Normal, format!("Deleted {} unsaved recording folder{}", list.len(), if list.len() == 1 { "" } else { "s" }));
+        } else {
+            self.say(Tone::Error, format!("Could not delete {}", failed.join(", ")));
+        }
+    }
+
+    /// The recovery question's message.
+    pub fn recovery_message(&self) -> String {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        let Some(list) = &self.recovery else { return String::new() };
+        let mut lines = vec!["ScanCraft did not close normally. These opened bundles have changes that were not saved:".to_string()];
+        for l in list {
+            let bundle = l.state.as_ref().and_then(|s| s.bundle.file_name()).map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| l.dir.display().to_string());
+            let what = match &l.status {
+                S::Orphaned { changed, bundle_changed } => {
+                    let n = changed.len();
+                    let mut w = format!("{n} changed file{}", if n == 1 { "" } else { "s" });
+                    if *bundle_changed {
+                        w.push_str("; the bundle was changed or moved since, so save it under a new name");
+                    }
+                    w
+                }
+                S::Incomplete => "unpacking stopped part-way: nothing to recover".to_string(),
+                S::Closing => "its removal stopped part-way: nothing to recover".to_string(),
+                S::Damaged(why) => format!("cannot be read ({why}): nothing to recover"),
+                S::InUse(_) => "in use".to_string(),
+            };
+            lines.push(format!("• {bundle}: {what}"));
+        }
+        lines.push("Open them as tabs to save them, discard them, or decide at the next start.".into());
+        lines.join("\n")
+    }
+
+    /// The recovery question's Open: the recoverable folders open as tabs, one after another.
+    pub fn recover_leftovers(&mut self) {
+        use scancraft_io::workdir::LeftoverStatus as S;
+        for l in self.recovery.take().unwrap_or_default() {
+            if matches!(l.status, S::Orphaned { .. }) {
+                self.request_open(OpenRequest::Recover(l.dir));
+            }
+        }
+    }
+
+    /// The recovery question's Discard: removes every listed working folder.
+    pub fn discard_leftovers(&mut self) {
+        let mut failed = Vec::new();
+        let list = self.recovery.take().unwrap_or_default();
+        for l in &list {
+            if let Err(e) = workdir::discard(&l.dir) {
+                failed.push(format!("{} ({e})", l.dir.display()));
+            }
+        }
+        if failed.is_empty() {
+            self.say(Tone::Normal, format!("Discarded {} working folder{}", list.len(), if list.len() == 1 { "" } else { "s" }));
+        } else {
+            self.say(Tone::Error, format!("Could not remove {}", failed.join(", ")));
+        }
+    }
+
+    pub(super) fn install_project(&mut self, mut opened: OpenedProject) {
+        // Opens into a new tab unless the current one is empty: nothing is replaced. When no tab
+        // can be added now, the open goes back to the front of the queue.
+        if self.has_geometry() && !self.add_empty_tab() {
+            let request = match std::mem::take(&mut opened.store) {
+                // A recovered working folder is kept as it is (its lock let go meanwhile).
+                Store::Bundle { dir, .. } if opened.recovered => OpenRequest::Recover(dir),
+                // A freshly unpacked one holds nothing yet: removed, and unpacked again.
+                store => {
+                    store.close();
+                    OpenRequest::Path(opened.path.clone())
+                }
+            };
+            self.pending_open.push_front(request);
+            let why = self.tabs_held().unwrap_or("the app is free");
+            self.say(Tone::Warning, format!("{} opens when possible: {why}", opened.path.display()));
+            return;
+        }
+        // An empty tab's own folder or bundle (nothing unsaved in it) is let go.
+        std::mem::take(&mut self.project.store).close();
         self.clear_previews();
         self.picking = None;
         self.object_picking = None;
@@ -1086,13 +1838,48 @@ impl ScanCraftApp {
             self.settings.merge_outliers = v;
         }
         self.settings.whole_scene = opened.settings.get("whole_scene").and_then(|v| v.as_bool()).unwrap_or(false);
-        self.settings.project_path = opened.path.display().to_string();
-        self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation: self.next_generation };
+        let history_before: Vec<serde_json::Value> = opened.settings.get("processing").and_then(|p| p.get("history")).and_then(|h| h.as_array()).cloned().unwrap_or_default();
+        // A recovered project holds changes its bundle does not have yet.
+        let saved_generation = if opened.recovered { 0 } else { self.next_generation };
+        if opened.read_only {
+            // A copy with no place on disk: Save proposes a new one beside the original.
+            self.project = ProjectInfo { name: format!("{} (read-only)", opened.name), path: None, saved_generation, store: opened.store, proposed: None, notes: opened.notes.clone(), staging: None, history_before: history_before.clone() };
+            self.propose_beside(&opened.path);
+        } else {
+            self.settings.project_path = opened.path.display().to_string();
+            self.project = ProjectInfo { name: opened.name, path: Some(opened.path), saved_generation, store: opened.store, proposed: None, notes: opened.notes.clone(), staging: None, history_before: history_before.clone() };
+        }
         self.selection = None;
         self.tool = None;
         self.framed_radius = 0.0;
         self.fit_view();
-        self.say(Tone::Success, format!("Opened {} · {n} pass{}", self.project.name, if n == 1 { "" } else { "es" }));
+        let passes = format!("{n} pass{}", if n == 1 { "" } else { "es" });
+        // Pass folders on disk that the project file does not name: recorded, never saved (the app
+        // stopped first). Their ids are not used again, and the user is told where they are.
+        let unsaved = self.unsaved_pass_folders();
+        if let (Some(dir), false) = (self.project.store.data_dir(), unsaved.is_empty()) {
+            let names: Vec<String> = unsaved.iter().map(|id| scancraft_io::project::pass_dir(*id)).collect();
+            let notice = format!(
+                "{} in {} hold{} a recording that is not in the project (scanned, never saved); it is kept, replay it with --replay-pass",
+                names.join(", "),
+                dir.display(),
+                if names.len() == 1 { "s" } else { "" }
+            );
+            log::warn!("{notice}");
+            opened.notice = Some(match opened.notice.take() {
+                Some(n) => format!("{n} · {notice}"),
+                None => notice,
+            });
+        }
+        if opened.recovered {
+            self.say(Tone::Success, format!("Recovered {} · {passes} · Save writes the changes into the bundle", self.project.name));
+        } else if opened.read_only {
+            self.say(Tone::Warning, format!("Opened {} · {passes} · nothing is written where it is: Save asks for a new place", self.project.name));
+        } else if let Some(notice) = opened.notice {
+            self.say(Tone::Warning, format!("Opened {} · {passes} · {notice}", self.project.name));
+        } else {
+            self.say(Tone::Success, format!("Opened {} · {passes}", self.project.name));
+        }
     }
 
     // ------------------------------------------------------------------ imports
@@ -1124,16 +1911,36 @@ impl ScanCraftApp {
         });
     }
 
-    /// Appends the passes of the project in `dir`, unaligned and with fresh ids (undoable).
+    /// Appends the passes of the project in `dir` (a project folder, its project file or a
+    /// bundle), unaligned and with fresh ids (undoable). A bundle is unpacked into a temporary
+    /// folder under the working-folder root, read, and the folder removed again; it is not
+    /// locked, so a bundle open in another tab or app can be added too.
     pub fn add_project(&mut self, dir: PathBuf) {
         if self.import_blocked().is_some() {
             return;
         }
-        if !scancraft_io::project::is_project(&dir) {
-            self.say(Tone::Error, format!("{} holds no {}", dir.display(), scancraft_io::project::PROJECT_FILE));
+        let label = project_label(&dir);
+        if scancraft_io::project::is_bundle(&dir) {
+            let root = self.prefs.work_root();
+            self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || {
+                let copy = match workdir::UnpackedCopy::unpack(&dir, &root) {
+                    Ok(c) => c,
+                    Err(e) => return JobResult::Failed(format!("Could not add the bundle: {e}")),
+                };
+                let read = crate::imports::read_project(copy.dir());
+                drop(copy);
+                match read {
+                    Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
+                    Ok((name, passes)) => JobResult::AddedProject { name, passes },
+                    Err(e) => JobResult::Failed(e),
+                }
+            });
             return;
         }
-        let label = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| "project".into());
+        if let Err(e) = scancraft_io::project::locate(&dir) {
+            self.say(Tone::Error, e.to_string());
+            return;
+        }
         self.spawn_undoable(&format!("Adding {label}"), &format!("Add Project {label}"), move || match crate::imports::read_project(&dir) {
             Ok((name, passes)) if passes.is_empty() => JobResult::Failed(format!("{name} holds no passes")),
             Ok((name, passes)) => JobResult::AddedProject { name, passes },

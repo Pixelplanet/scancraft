@@ -8,6 +8,7 @@ pub mod framing;
 pub mod imu;
 pub mod media;
 pub mod modes;
+pub mod offline;
 pub mod protocol;
 pub mod quicklz;
 pub mod scanner_lock;
