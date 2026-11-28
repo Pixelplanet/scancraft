@@ -1,5 +1,6 @@
 //! The surface a marker site is filled with: a ring fit that follows the curvature round the cut,
-//! continued into the cut with value and slope matched at its edge (a thin-plate continuation).
+//! continued into the cut, where a curvature band runs through the site, with value and slope
+//! matched at its edge (a thin-plate continuation).
 //!
 //! A sticker hides the surface under it, and a fill that does not continue the surface round it
 //! shows under a grazing light: a flat disc on a dome reads as a dent (its sagitta r²/2R is
@@ -8,32 +9,41 @@
 //! [`fit_site`] builds the fill surface from samples of the sheet round the cut (scan points for
 //! the infill, mesh vertices for the fairing) in the site's tangent frame (u, v, height h):
 //!
-//! 1. **Ring fit** q(u, v): a robust quadric height field (cubic where the quadric leaves a rough
-//!    ring all round the site) on the ring `rc .. rc + fit_width`. The ring keeps only samples
-//!    that face like the fit (normal within [`RING_NORMAL_MAX_DEG`]) and lie within 3 σ of it,
-//!    σ = 1.4826 × the MAD of the residuals: a rim's roll-off, a side face or a rib foot in the ring
-//!    fails one or the other, while a curvature band the fit cannot follow is not trimmed away as
-//!    noise (the earlier trim at 2× the RMS of the kept points shrank onto the plain part of the
-//!    ring and dropped exactly the samples the quadric could not follow).
+//! 1. **Ring fit** q(u, v): a robust conic quadric height field ([`Quadric::fit_conic`]: exact on
+//!    a sphere or a cylinder of any radius, where a plain quadric misses the centre by r⁴/8R³,
+//!    +0.11 mm on a ball of R 15 mm; cubic where the quadric leaves a rough ring all round the
+//!    site) on the ring `rc .. rc + fit_width`. The ring keeps only samples that face like the fit
+//!    (normal within [`RING_NORMAL_MAX_DEG`]) and lie within 3 σ of the model, σ = 1.4826 × the
+//!    MAD of the residuals: a rim's roll-off, a side face or a rib foot in the ring fails one or
+//!    the other. Two fits are made: one trimmed against q plus the band's low orders (step 2), so a
+//!    curvature band the quadric cannot follow is not trimmed away as noise, and the plain one
+//!    trimmed against q alone, which drops a feature beside the cut.
 //! 2. **Curvature bands** (only where the band `rc .. rc + 4.5 mm` next to the cut is plain sheet
 //!    all round, >= 90 % of its samples on the fit, and the step below explains >= 0.01 mm RMS of
-//!    it): what q misses (a curvature band, a gentle ridge) is fitted in that band as
-//!    Σ_m (a + b t + c t²)·{cos, sin}(m θ), m ≤ 3, t = r − rc. Each order is continued into the cut
-//!    by the biharmonic solution of the disc for that order, A r^m + B r^(m+2), matching the value
-//!    a and the radial slope b at r = rc: C1 at the cut, and Δ²R = 0 inside like a thin plate. The
-//!    slope beyond the harmonic one, (r/rc)^m, is weighted by t²/(t² + 2²), t its distance from 0
-//!    in standard errors of the scan noise, so noise does not tilt the fill. Elsewhere the fill is
-//!    q alone: on the Revo scans the band next to a cut holds the ragged rim of the gap round the
-//!    sticker, and its slopes or its mean carried in made dents and bumps of 0.1-0.2 mm at rim
-//!    sites, partial rings and plain sites alike. The quadric is biharmonic too, so a plain site
-//!    stays on its ring fit (a leave-out test on the Revo scans found the quadric best on plain
-//!    sites, a thin-plate continuation best near curvature bands).
+//!    it and clearly more than it would explain of plain noise, σ sqrt(k / n)): what q misses (a
+//!    curvature band, a gentle ridge) is fitted in that band as Σ_m (a + b t + c t²)·{cos, sin}(m θ),
+//!    m ≤ 3, t = r − rc. Each order is continued into the cut by the biharmonic solution of the
+//!    disc for that order, A r^m + B r^(m+2), matching the value a and the radial slope b at
+//!    r = rc: C1 at the cut, and Δ²R = 0 inside like a thin plate. The slope beyond the harmonic
+//!    one, (r/rc)^m, is weighted by t²/(t² + 2²), t its distance from 0 in standard errors of the
+//!    scan noise, and then capped so that inside the cut the fill stays within the range it has
+//!    on the cut against the plain fit ([`Component::cap_excess`]): a band running through the
+//!    site passes, while the slope of a narrow feature beside the cut (a rib foot, a bead),
+//!    continued over 6.5 mm, would dig a dent of 0.1-0.2 mm at the centre; where more than half of
+//!    the slope has to go, the band is not continued. Elsewhere the fill is the plain fit alone: on
+//!    the Revo scans the band next to a cut holds the ragged rim of the gap round the sticker, and
+//!    its slopes or its mean carried in made dents and bumps of 0.1-0.2 mm at rim sites, partial
+//!    rings and plain sites alike. The quadric is biharmonic too, so a plain site stays on its
+//!    ring fit (a leave-out test on the Revo scans found the quadric best on plain sites, a
+//!    thin-plate continuation best near curvature bands).
 //! 3. **Meeting the mesh** ([`SiteSurface::met_by`], the fairing): what the mesh round the cut
 //!    leaves against the fill surface in the band (the solve's offset and smoothing, texture) is
-//!    carried in, its low orders C1 where the fill is the ring fit alone, the rest per 0.35 mm
-//!    pixel by local linear moving least squares (unbiased at the edge of the data, where a
-//!    per-pixel mean or a one-sided smoothing would tilt it) continued harmonically: no step at the
-//!    cut, bounded by the band's own values inside.
+//!    carried in, from the band samples within 3 σ of its median only (at a rim the band also holds
+//!    the start of the rolled edge, which carried in sank the patch), its low orders C1 (capped as
+//!    in step 2) where the fill is the ring fit alone, the rest per 0.35 mm pixel by local linear
+//!    moving least squares (unbiased at the edge of the data, where a per-pixel mean or a one-sided
+//!    smoothing would tilt it) continued harmonically: no step at the cut, bounded by the band's
+//!    own values inside.
 
 use super::markers::Quadric;
 use glam::DVec3;
@@ -42,6 +52,9 @@ use glam::DVec3;
 pub(crate) const RING_NORMAL_MAX_DEG: f64 = 20.0;
 /// Pixel size of the remainder field (mm).
 const PX: f64 = 0.35;
+/// Decay length of the part of the mesh's remainder round a cut that is not the sheet (a rim's
+/// rolled edge) when it is carried into the cut ([`SiteSurface::met_by`], mm).
+const ROLLED_EDGE_REACH_MM: f64 = 1.0;
 /// Highest angular order of the continued ring residual (all round / partial ring).
 const MODES_ALL_ROUND: usize = 3;
 const MODES_PARTIAL: usize = 1;
@@ -52,6 +65,13 @@ const SLOPE_MIN_PLAIN: f64 = 0.9;
 /// RMS of the band the low orders must explain beyond the ring fit for their slopes to be
 /// continued (mm).
 const SLOPE_MIN_EXPLAINED_MM: f64 = 0.01;
+
+/// The orders explain at least this many times the variance they take out of plain noise
+/// ([`fit_site`]).
+const SLOPE_NOISE_FACTOR: f64 = 4.0;
+/// The continuation inside the cut may leave the range of its values round the cut by this much
+/// (mm), plus the ring's noise ([`Component::cap_excess`]).
+const CAP_TOLERANCE_MM: f64 = 0.005;
 
 /// The radial slope of an order beyond its harmonic one is continued with the weight
 /// t² / (t² + T0²), t its distance from 0 in standard errors: in full when it is clearly there,
@@ -123,6 +143,54 @@ struct Component {
 }
 
 impl Component {
+    /// Scales the part of the continuation beyond the harmonic one (b r^m (r² − rc²) per order,
+    /// zero at the cut) so that inside the cut `base` (the ring fit against the plain ring fit) plus
+    /// the continuation stays within the range of its values on the cut, plus `tol`, as a harmonic
+    /// continuation of a plain sheet does: a curvature band or a ridge running through the site
+    /// keeps its continuation, while the slope of a narrow feature beside the cut (a rib foot, a
+    /// bead), continued over the cut, would dig a dent at the centre (its m = 0 order alone lowers
+    /// it by slope × rc / 2). Returns the factor (0 when even the harmonic part leaves the range).
+    fn cap_excess(&mut self, rc: f64, tol: f64, base: &dyn Fn(f64, f64) -> f64) -> f64 {
+        let trig = |md: &Mode, th: f64| if md.sin { (md.m as f64 * th).sin() } else { (md.m as f64 * th).cos() };
+        let (mut lo, mut hi) = (f64::INFINITY, f64::NEG_INFINITY);
+        for k in 0..360 {
+            let th = k as f64 / 360.0 * std::f64::consts::TAU;
+            let z = base(rc * th.cos(), rc * th.sin()) + self.modes.iter().map(|md| trig(md, th) * (md.a + md.b * rc * rc) * rc.powi(md.m as i32)).sum::<f64>();
+            lo = lo.min(z);
+            hi = hi.max(z);
+        }
+        let mut lambda = 1f64;
+        for i in 0..24 {
+            let r = rc * i as f64 / 24.0;
+            for k in 0..72 {
+                let th = k as f64 / 72.0 * std::f64::consts::TAU;
+                let (mut h, mut e) = (base(r * th.cos(), r * th.sin()), 0.0);
+                for md in &self.modes {
+                    let (t, rm) = (trig(md, th), r.powi(md.m as i32));
+                    // a r^m + b r^(m+2) = (a + b rc²) r^m + b r^m (r² − rc²).
+                    h += t * (md.a + md.b * rc * rc) * rm;
+                    e += t * md.b * rm * (r * r - rc * rc);
+                }
+                if h > hi + tol || h < lo - tol {
+                    return 0.0;
+                }
+                if e > 1e-12 {
+                    lambda = lambda.min(((hi + tol - h) / e).max(0.0));
+                } else if e < -1e-12 {
+                    lambda = lambda.min(((lo - tol - h) / e).max(0.0));
+                }
+            }
+        }
+        if lambda < 1.0 {
+            for md in &mut self.modes {
+                let a_h = md.a + md.b * rc * rc;
+                md.b *= lambda;
+                md.a = a_h - md.b * rc * rc;
+            }
+        }
+        lambda
+    }
+
     #[inline]
     fn at(&self, u: f64, v: f64, r: f64) -> f64 {
         if r >= self.band.rc {
@@ -215,6 +283,21 @@ impl SiteSurface {
         if kept < 20 || 2 * kept < in_band {
             return None;
         }
+        // Of those, the ones on the mesh's sheet round the cut, within 3 σ (MAD) of the band's
+        // median remainder, are carried in harmonically: at a rim the band also holds the start of
+        // the rolled edge (0.2-0.7 mm below the sheet at the Revo part's S1-M1), and carried over
+        // the whole cut it sank the patch by 0.1 mm. What the others leave (the rolled edge) is
+        // carried in only locally, decaying over [`ROLLED_EDGE_REACH_MM`] from the cut, so the patch
+        // meets the mesh there without a step and keeps its shape further in.
+        let near = keep;
+        let keep = {
+            let mut r: Vec<f64> = s.iter().zip(&near).filter(|e| *e.1).map(|(x, _)| x.h - self.eval(x.u, x.v)).collect();
+            let med = median(&mut r);
+            let mut dev: Vec<f64> = r.iter().map(|v| (v - med).abs()).collect();
+            let lim = (3.0 * 1.4826 * median(&mut dev)).max(0.03);
+            let keep: Vec<bool> = s.iter().zip(&near).map(|(x, &k)| k && (x.h - self.eval(x.u, x.v) - med).abs() <= lim).collect();
+            keep
+        };
         let mut sectors = [0u32; 8];
         for (x, _) in s.iter().zip(&keep).filter(|e| *e.1) {
             sectors[(((x.v.atan2(x.u) + std::f64::consts::PI) / (std::f64::consts::TAU / 8.0)) as usize).min(7)] += 1;
@@ -227,14 +310,27 @@ impl SiteSurface {
         // matched by value only (continued C1 it would bring back the solve's smoothing round the
         // site); where the fill is the ring fit alone, the remainder's low orders are continued C1,
         // so the patch meets the mesh round the cut without a kink.
+        // The continuation keeps within the range of the remainder round the cut, as the fill's
+        // own does ([`Component::cap_excess`]): the slope of a feature beside the cut is not carried
+        // over it (its values still are, harmonically).
         let comp = if self.comps.is_empty() && all_round {
-            fit_modes(s, &keep, &resid, rc, band.min(3.0), MODES_ALL_ROUND, 1, true).map(|f| f.0)
+            fit_modes(s, &keep, &resid, rc, band.min(3.0), MODES_ALL_ROUND, 1, true).map(|mut f| {
+                f.0.cap_excess(rc, CAP_TOLERANCE_MM, &|_, _| 0.0);
+                f.0
+            })
         } else {
             None
         };
-        let rest = RemainderField::build(s, &keep, |x: &RingSample| resid(x) - comp.as_ref().map_or(0.0, |c| c.band.eval(x.u, x.v)), &p);
+        let rest = RemainderField::build(s, &keep, |x: &RingSample| resid(x) - comp.as_ref().map_or(0.0, |c| c.band.eval(x.u, x.v)), &p, None);
+        let carried = |x: &RingSample| comp.as_ref().map_or(0.0, |c| c.band.eval(x.u, x.v)) + rest.as_ref().map_or(0.0, |f| f.at(x.u, x.v));
+        let local = if near.iter().zip(&keep).any(|(a, b)| a != b) {
+            RemainderField::build(s, &near, |x: &RingSample| resid(x) - carried(x), &p, Some(ROLLED_EDGE_REACH_MM))
+        } else {
+            None
+        };
         out.comps.extend(comp);
         out.rest.extend(rest);
+        out.rest.extend(local);
         Some(out)
     }
 }
@@ -268,10 +364,6 @@ fn median(v: &mut [f64]) -> f64 {
 /// samples for a fit.
 pub(crate) fn fit_site(s: &[RingSample], p: &SiteFitParams) -> Option<SiteFit> {
     let pts: Vec<(f64, f64, f64)> = s.iter().map(|x| (x.u, x.v, x.h)).collect();
-    let (mut q, _, _) = Quadric::fit_annulus(&pts, p.rough_mm, p.all_round)?;
-    let cos_max = RING_NORMAL_MAX_DEG.to_radians().cos();
-    let mut keep = vec![true; s.len()];
-    let mut sigma = 0.0;
     let m_max = if p.all_round { MODES_ALL_ROUND } else { MODES_PARTIAL };
     let (width, deg) = (MODAL_BAND_MM, 2);
     let modes_of = |q: &Quadric, keep: &[bool], slopes: bool| fit_modes(s, keep, &|x: &RingSample| x.h - q.eval(x.u, x.v), p.rc, width, m_max, deg, slopes);
@@ -279,47 +371,16 @@ pub(crate) fn fit_site(s: &[RingSample], p: &SiteFitParams) -> Option<SiteFit> {
         Some((c, _)) if x.u.hypot(x.v) < p.rc + width => c.band.eval(x.u, x.v),
         _ => 0.0,
     };
-    let mut fitted = modes_of(&q, &keep, false);
-    for _ in 0..3 {
-        // Trimmed against the whole model (ring fit and, in the band, its low orders), so a
-        // curvature band the quadric cannot follow is not taken for noise.
-        let res: Vec<f64> = s.iter().map(|x| x.h - q.eval(x.u, x.v) - model_at(&fitted, x)).collect();
-        let facing: Vec<bool> = s
-            .iter()
-            .map(|x| {
-                let (gu, gv) = q.grad(x.u, x.v);
-                x.n.dot(DVec3::new(-gu, -gv, 1.0).normalize()) >= cos_max
-            })
-            .collect();
-        let mut a: Vec<f64> = res.iter().zip(&facing).filter(|(_, &f)| f).map(|(r, _)| *r).collect();
-        if a.len() < 24 {
-            return None;
-        }
-        let med = median(&mut a);
-        let mut dev: Vec<f64> = a.iter().map(|r| (r - med).abs()).collect();
-        sigma = 1.4826 * median(&mut dev);
-        let lim = (3.0 * sigma).max(0.02);
-        for i in 0..s.len() {
-            keep[i] = facing[i] && (res[i] - med).abs() <= lim;
-        }
-        let quad = Quadric::fit_once_n::<6>(&pts, &keep)?;
-        q = quad;
-        if p.all_round {
-            let rq = rms_kept(&pts, &keep, &quad);
-            if rq > p.rough_mm {
-                if let Some(c) = Quadric::fit_once_n::<10>(&pts, &keep) {
-                    if rms_kept(&pts, &keep, &c) < 0.8 * rq {
-                        q = c;
-                    }
-                }
-            }
-        }
-        fitted = modes_of(&q, &keep, false);
-    }
+    // The ring fit trimmed against the whole model (ring fit and, in the band, its low orders), so
+    // a curvature band the quadric cannot follow is not taken for noise ...
+    let (q, keep, sigma, fitted) = trimmed_ring_fit(s, &pts, p, &|q, keep| modes_of(q, keep, false), &model_at)?;
+    // ... and against the ring fit alone, which drops a feature beside the cut (a rib foot, a bead,
+    // the start of a rim's roll-off) as not the sheet: the fill wherever the band is not continued.
+    let plain = trimmed_ring_fit(s, &pts, p, &|_, _| None, &model_at).map(|f| f.0);
     // The slopes of the band are continued only where the band is plain sheet all round the cut:
     // at a rim, an edge or a seam in the band (a partial ring, or more than a tenth of the band's
     // samples not on the fit) the band's slope belongs to that, and continued into the cut it
-    // stands out as a dent or a bump; there the orders are carried in by value only.
+    // stands out as a dent or a bump.
     let (in_band, kept_band) = s.iter().zip(&keep).fold((0usize, 0usize), |(a, b), (x, &k)| {
         let r = x.u.hypot(x.v);
         let inb = r >= p.rc && r < p.rc + width;
@@ -341,12 +402,20 @@ pub(crate) fn fit_site(s: &[RingSample], p: &SiteFitParams) -> Option<SiteFit> {
         }
         ((a - b).max(0.0) / n.max(1) as f64).sqrt()
     };
-    let slopes = p.slopes && p.all_round && kept_band as f64 >= SLOPE_MIN_PLAIN * in_band as f64 && explained >= SLOPE_MIN_EXPLAINED_MM;
-    // Without the slopes the orders are not used at all: next to the cut the scan's band holds the
-    // ragged rim of the gap round the sticker (flared points, the dark border's returns), and its
-    // mean carried in by value lifted or sank whole fills by 0.1-0.2 mm on the Revo scans. The
-    // ring fit, which averages the whole ring, is the fill there (the fairing matches the mesh
-    // round the cut).
+    // ... and only where that share stands clearly above what the orders take out of plain noise:
+    // fitted to noise alone, the band model explains about σ sqrt(k / n) (k coefficients, n
+    // samples, σ the noise with its correlation), which passes a fixed 0.01 mm once σ is about
+    // 0.1 mm; the slopes it then carries in tilt and lift the fill.
+    let noise_floor = {
+        let band_keep: Vec<bool> = s.iter().zip(&keep).map(|(x, &k)| k && (p.rc..p.rc + width).contains(&x.u.hypot(x.v))).collect();
+        let (noise2, density) = local_noise(s, &band_keep, &|x: &RingSample| x.h - q.eval(x.u, x.v));
+        let k = ((deg + 1) * (2 * m_max + 1)) as f64;
+        noise2.map_or(f64::INFINITY, |v| (SLOPE_NOISE_FACTOR * k * v * (density * NOISE_CORRELATION_MM2).max(1.0) / kept_band.max(1) as f64).sqrt())
+    };
+    let slopes = p.slopes
+        && p.all_round
+        && kept_band as f64 >= SLOPE_MIN_PLAIN * in_band as f64
+        && explained >= SLOPE_MIN_EXPLAINED_MM.max(noise_floor);
     let rms_q_only = rms_kept(&pts, &keep, &q);
     let rms_model = {
         let (mut acc, mut n) = (0.0, 0usize);
@@ -358,15 +427,88 @@ pub(crate) fn fit_site(s: &[RingSample], p: &SiteFitParams) -> Option<SiteFit> {
         }
         (acc / n.max(1) as f64).sqrt()
     };
-    fitted = if slopes { modes_of(&q, &keep, true) } else { None };
-    let rms = rms_q_only;
+    // The continuation must not leave, inside the cut, the range the band shows against the plain
+    // ring fit ([`Component::cap_excess`]); where it needs more than half of its slope taken away
+    // for that, the band holds a feature beside the cut, not one running through it.
+    let mut continued = if slopes { modes_of(&q, &keep, true) } else { None };
+    if let Some((c, _)) = continued.as_mut() {
+        let lambda = match plain.as_ref() {
+            Some(qp) => c.cap_excess(p.rc, CAP_TOLERANCE_MM + 0.2 * sigma, &|u: f64, v: f64| q.eval(u, v) - qp.eval(u, v)),
+            None => 0.0,
+        };
+        if lambda < 0.5 {
+            continued = None;
+        }
+    }
     let kept = keep.iter().filter(|k| **k).count();
-    let c1_modes = fitted.as_ref().map_or(0, |f| f.1);
-    // No remainder of the scan points: what the orders leave in the band is texture, noise and the
-    // ragged edge of the scan round the sticker (a gap's flared rim carried in showed as a blob);
-    // the solve and the fairing (which matches the mesh round the cut) see to the continuity.
-    let surf = SiteSurface { q, rc: p.rc, comps: fitted.map(|f| f.0).into_iter().collect(), rest: Vec::new() };
-    Some(SiteFit { surf, rms, rms_model, keep, kept, sigma, c1_modes })
+    let c1_modes = continued.as_ref().map_or(0, |f| f.1);
+    // Without the slopes the orders are not used at all: next to the cut the scan's band holds the
+    // ragged rim of the gap round the sticker (flared points, the dark border's returns), and its
+    // mean carried in by value lifted or sank whole fills by 0.1-0.2 mm on the Revo scans. The
+    // plain ring fit, which averages the whole ring, is the fill there (the fairing matches the
+    // mesh round the cut). No remainder of the scan points either: what the orders leave in the
+    // band is texture, noise and the ragged edge of the scan round the sticker (a gap's flared rim
+    // carried in showed as a blob).
+    let surf = match continued {
+        Some((c, _)) => SiteSurface { q, rc: p.rc, comps: vec![c], rest: Vec::new() },
+        None => SiteSurface { q: plain.unwrap_or(q), rc: p.rc, comps: Vec::new(), rest: Vec::new() },
+    };
+    Some(SiteFit { surf, rms: rms_q_only, rms_model, keep, kept, sigma, c1_modes })
+}
+
+/// The ring fit of [`fit_site`]: three rounds of keeping the samples that face like the fit
+/// (within [`RING_NORMAL_MAX_DEG`]) and lie within 3 σ of the model (σ from the MAD), the model
+/// being the ring fit plus, in the band, the orders `modes` fits to its residual (none: the ring
+/// fit alone), then refitting (the conic quadric, or the cubic where the quadric leaves a rough
+/// ring all round the site). Returns the fit, the kept samples, σ and the last orders.
+#[allow(clippy::type_complexity)]
+fn trimmed_ring_fit(
+    s: &[RingSample],
+    pts: &[(f64, f64, f64)],
+    p: &SiteFitParams,
+    modes: &dyn Fn(&Quadric, &[bool]) -> Option<(Component, usize)>,
+    model_at: &dyn Fn(&Option<(Component, usize)>, &RingSample) -> f64,
+) -> Option<(Quadric, Vec<bool>, f64, Option<(Component, usize)>)> {
+    let (mut q, _, _) = Quadric::fit_annulus(pts, p.rough_mm, p.all_round)?;
+    let cos_max = RING_NORMAL_MAX_DEG.to_radians().cos();
+    let mut keep = vec![true; s.len()];
+    let mut sigma = 0.0;
+    let mut fitted = modes(&q, &keep);
+    for _ in 0..3 {
+        let res: Vec<f64> = s.iter().map(|x| x.h - q.eval(x.u, x.v) - model_at(&fitted, x)).collect();
+        let facing: Vec<bool> = s
+            .iter()
+            .map(|x| {
+                let (gu, gv) = q.grad(x.u, x.v);
+                x.n.dot(DVec3::new(-gu, -gv, 1.0).normalize()) >= cos_max
+            })
+            .collect();
+        let mut a: Vec<f64> = res.iter().zip(&facing).filter(|(_, &f)| f).map(|(r, _)| *r).collect();
+        if a.len() < 24 {
+            return None;
+        }
+        let med = median(&mut a);
+        let mut dev: Vec<f64> = a.iter().map(|r| (r - med).abs()).collect();
+        sigma = 1.4826 * median(&mut dev);
+        let lim = (3.0 * sigma).max(0.02);
+        for i in 0..s.len() {
+            keep[i] = facing[i] && (res[i] - med).abs() <= lim;
+        }
+        let quad = Quadric::fit_conic(pts, &keep)?;
+        q = quad;
+        if p.all_round {
+            let rq = rms_kept(pts, &keep, &quad);
+            if rq > p.rough_mm {
+                if let Some(c) = Quadric::fit_once_n::<10>(pts, &keep) {
+                    if rms_kept(pts, &keep, &c) < 0.8 * rq {
+                        q = c;
+                    }
+                }
+            }
+        }
+        fitted = modes(&q, &keep);
+    }
+    Some((q, keep, sigma, fitted))
 }
 
 fn rms_kept(s: &[(f64, f64, f64)], keep: &[bool], q: &Quadric) -> f64 {
@@ -588,7 +730,9 @@ struct RemainderField {
 }
 
 impl RemainderField {
-    fn build(s: &[RingSample], keep: &[bool], residual: impl Fn(&RingSample) -> f64, p: &SiteFitParams) -> Option<RemainderField> {
+    /// `decay`: continued inside the cut with this decay length (a screened harmonic field)
+    /// instead of harmonically.
+    fn build(s: &[RingSample], keep: &[bool], residual: impl Fn(&RingSample) -> f64, p: &SiteFitParams, decay: Option<f64>) -> Option<RemainderField> {
         let (rc, band) = (p.rc, p.band);
         let half = ((rc + band) / PX).ceil() as i32 + 1;
         let side = (2 * half + 1) as usize;
@@ -670,7 +814,7 @@ impl RemainderField {
         if vmax < 1e-7 {
             return None;
         }
-        let solved = harmonic(side, &domain, &known, &value);
+        let solved = harmonic(side, &domain, &known, &value, decay.map_or(0.0, |l| PX * PX / (l * l)));
         // Outside the domain one pixel ring copies its neighbours, so the bilinear lookup near the
         // band's outer edge stays continuous (the field is read inside the cut only).
         let mut out: Vec<f64> = (0..n).map(|k| if domain[k] { solved[k].clamp(-vmax, vmax) } else { 0.0 }).collect();
@@ -707,15 +851,17 @@ impl RemainderField {
 
 /// Harmonic continuation of the `known` pixel values over the other `domain` pixels of a square
 /// grid (Laplace equation, Neumann at the domain's edge): successive over-relaxation from the
-/// mean of the known values. Pixels outside the domain keep 0.
-fn harmonic(side: usize, domain: &[bool], known: &[bool], fixed: &[f64]) -> Vec<f64> {
+/// mean of the known values (from 0 with `screen` > 0: the screened equation ΔR = R / ℓ², `screen`
+/// = (pixel / ℓ)², whose solution decays over ℓ from the known pixels). Pixels outside the domain
+/// keep 0.
+fn harmonic(side: usize, domain: &[bool], known: &[bool], fixed: &[f64], screen: f64) -> Vec<f64> {
     let n = domain.len();
     let mut value: Vec<f64> = (0..n).map(|k| if known[k] { fixed[k] } else { 0.0 }).collect();
     let (fs, fc) = (0..n).filter(|&k| known[k]).fold((0.0, 0usize), |(s, c), k| (s + fixed[k], c + 1));
     if fc == 0 {
         return value;
     }
-    let start = fs / fc as f64;
+    let start = if screen > 0.0 { 0.0 } else { fs / fc as f64 };
     let unknown: Vec<usize> = (0..n).filter(|&k| domain[k] && !known[k]).collect();
     for &k in &unknown {
         value[k] = start;
@@ -737,7 +883,7 @@ fn harmonic(side: usize, domain: &[bool], known: &[bool], fixed: &[f64]) -> Vec<
                 }
             }
             if c > 0 {
-                let new = value[k] + 1.9 * (s / c as f64 - value[k]);
+                let new = value[k] + 1.9 * (s / (c as f64 + screen) - value[k]);
                 change = change.max((new - value[k]).abs());
                 value[k] = new;
             }
@@ -873,6 +1019,71 @@ mod tests {
         let fit = fit_site(&s, &SiteFitParams { all_round: false, ..params(6.5) }).unwrap();
         let w = worst_inside(&fit.surf, dome, 6.0);
         assert!(w < 0.01, "fill {w} mm off the dome");
+    }
+
+    /// Gaussian-like noise of unit variance (sum of four hashed uniforms) at grid spot (i, j).
+    fn gauss(i: i32, j: i32, seed: i32) -> f64 {
+        let u = |k: i32| ((((i as f64) * 12.9898 + (j as f64) * 78.233 + (k as f64) * 37.719).sin() * 43_758.545_3).fract()).abs();
+        ((0..4).map(|m| u(seed * 4 + m)).sum::<f64>() - 2.0) * 3f64.sqrt()
+    }
+
+    /// [`ring`] with Gaussian height noise `sigma` (normals exact).
+    fn noisy_ring(f: impl Fn(f64, f64) -> f64, rc: f64, w: f64, s: f64, sigma: f64, seed: i32) -> Vec<RingSample> {
+        let mut out = ring(&f, rc, w, s, 0.0);
+        for x in &mut out {
+            x.h += sigma * gauss((x.u / s).round() as i32, (x.v / s).round() as i32, seed);
+        }
+        out
+    }
+
+    /// Make Solid's settings of [`fit_site`] (markers.rs `site_fit`).
+    fn solid_params(rc: f64) -> SiteFitParams {
+        SiteFitParams { rc, band: 2.0, mls_mm: 1.2, all_round: true, rough_mm: 0.05, slopes: true }
+    }
+
+    #[test]
+    fn narrow_ridge_beside_the_cut_digs_no_dent() {
+        // A dome with a narrow ridge (a rib foot, a bead) running past the cut 1.5-3 mm outside it:
+        // its rising flank in the band, continued over the cut with its slope, dug a dent of
+        // 0.1-0.23 mm at the centre, where the surface is the plain dome.
+        let dome = |u: f64, v: f64| -(u * u + v * v) / 200.0;
+        let mut failed = Vec::new();
+        // (Height, sigma, distance from the site, largest centre offset.) The 1 mm rib covers half
+        // of the ring on its side; the ring's cubic follows it and still lowers the centre a little.
+        for (h, sig, x0, lim) in [(0.3, 1.5, 8.0, 0.05), (0.6, 1.5, 8.0, 0.05), (0.3, 1.0, 8.0, 0.05), (1.0, 2.0, 9.5, 0.1)] {
+            let f = move |u: f64, v: f64| dome(u, v) + h * (-(u - x0) * (u - x0) / (2.0 * sig * sig)).exp();
+            let fit = fit_site(&ring(f, 6.5, 6.0, 0.3, 0.0), &solid_params(6.5)).unwrap();
+            let centre = fit.surf.eval(0.0, 0.0) - dome(0.0, 0.0);
+            eprintln!("ridge h {h} sigma {sig} at {x0}: centre {centre:+.4} mm ({} orders C1)", fit.c1_modes);
+            if centre.abs() > lim {
+                failed.push(format!("ridge h {h} sigma {sig} at {x0}: fill centre {centre:+.3} mm off the dome"));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
+    }
+
+    #[test]
+    fn scanner_noise_does_not_switch_the_band_slopes_on() {
+        // A plain sphere seen by a noisier scanner (0.12-0.2 mm): the band orders fitted to noise
+        // explained more than a fixed 0.01 mm, their slopes switched on and the fill came out 3-6
+        // times worse than the ring fit alone.
+        let f = |u: f64, v: f64| 100.0 - (100.0f64 * 100.0 - u * u - v * v).sqrt();
+        let mut failed = Vec::new();
+        for sigma in [0.12, 0.15, 0.2] {
+            let (mut sum, mut worst, mut on) = (0.0, 0f64, 0);
+            for seed in 0..8 {
+                let fit = fit_site(&noisy_ring(f, 6.5, 6.0, 0.3, sigma, seed), &solid_params(6.5)).unwrap();
+                let w = worst_inside(&fit.surf, f, 6.0);
+                sum += w;
+                worst = worst.max(w);
+                on += (!fit.surf.comps.is_empty()) as usize;
+            }
+            eprintln!("noise {sigma}: fill worst mean {:.4}, largest {worst:.4} mm, slopes on in {on} of 8", sum / 8.0);
+            if sum / 8.0 > 0.4 * sigma / 3.0 || worst > 0.03 || on > 1 {
+                failed.push(format!("noise {sigma}: fill worst mean {:.3}, largest {worst:.3} mm, slopes on in {on} of 8", sum / 8.0));
+            }
+        }
+        assert!(failed.is_empty(), "{failed:#?}");
     }
 
     #[test]

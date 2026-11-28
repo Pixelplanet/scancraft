@@ -203,7 +203,8 @@ a noisy plane, 0.5 mm pitch; test `implicit_surface_keeps_small_relief_without_p
    weights or the stray filter alone the pits stay, with a refit radius of 3.3 spacings they go).
    Fix: `point_spacing` measures the pitch from the point density. Pits 0.06 mm, spikes 0.10 mm,
    rib tops at 101 % of their height (76 % after the app's 4 smoothing passes; old mesher 87 %
-   with a plain area 1.4× as rough).
+   with a plain area 1.4× as rough). Since 2026-11-27 it takes every point and the mean of the
+   middle fifth of their values, not the median of a sample (see 2.4).
 3. **Flaps and torn patches on the real scan: a second, sparse layer.** At the pen marks the
    merge has scatters of points 0.7–1.6 mm *behind* the continuous surface, facing either way
    (in a 50 mm window: 7 907 surface points, 540 behind it facing the same way, 1 343 facing
@@ -342,16 +343,18 @@ five markers, the inside lattice, two marker close-ups) and `compare_bracket_hol
 - The raised sticker rings are gone in Reconstruct, and the 1 mm pits of the lattice are gone.
 - The disc outlines are gone in Make Solid; the screw hole is open again.
 
+**Update 2026-11-27, from the user:** the round "depressions" are flat fills. Every spot where a
+sticker was is a hole in the scan, and the fill is a flat spot. This shows in both of our solids
+and also in Revo Scan's own result. On the curved dome a flat spot looks like a dent under light.
+The 0.06–0.20 mm offsets the harness found at seven outer sites match this: a flat 11 mm disc on a
+surface of radius R sinks by r²/2R, 0.15 mm at R = 100 mm. The fills now continue the curvature
+round them. What changed, the per-site numbers and what remains are in 2.4.
+
 **Still open:**
 
-- **Marker sites still off the ring fit.** The harness still finds seven outer sites more than
-  0.03 mm off a quadric fitted to their own 7–11 mm ring: S1-M1, M4, M6, M20, M21, M36 and M43,
-  up to +0.20 mm. The grazing-light renders show S1-M21, M20 and M3 flush, so on curving areas the
-  harness's quadric is the wrong reference. Three sites are really not right:
-  - S1-M6 is a sticker on the flange step near the lower rim. The patch shows its outline and two
-    slits.
-  - S1-M4 and S1-M36 are stickers at a rim edge. Their annulus RMS is 0.12–0.16 mm, so they are
-    not faired.
+- **Marker sites:** see 2.4. (Before 2026-11-27: seven outer sites more than 0.03 mm off a quadric
+  of their own 7–11 mm ring, S1-M1, M4, M6, M20, M21, M36 and M43, up to +0.20 mm. On curving areas
+  and at rims that quadric is the wrong reference.)
 - **Faint dots of the S3 lattice in the solid** are still visible under grazing light (relief
   p99 0.020 mm).
 - **Make Solid narrows the screw hole** with a small tongue (free radius 1.44 of 3.1 mm): the
@@ -365,8 +368,9 @@ five markers, the inside lattice, two marker close-ups) and `compare_bracket_hol
 - **Isolate Object cut a sticker out of S2.** It dropped all S2 points within 12 mm of S2-M13, so
   Reconstruct has a 20 mm opening there and the solid a ring of beads round its hole fill. This
   is a data gap from the isolation mask, not from the marker cut.
-- **Not asked of the user yet:** is the 0.1 mm "rounded-rectangle" line on the outer dome real?
-  It is in Revo's own fused cloud and was left alone.
+- **The 0.1 mm "rounded-rectangle" line on the outer dome is real** (user, 2026-11-27). The part
+  is painted in two colours, and a white stripe covers the boundary between them. It is a real
+  feature and must be kept, not smoothed away.
 
 **Trade-off** (test `prepare_keeps_small_relief`): the preparation keeps relief on a plain sheet,
 such as the mesher test's synthetic ribs, with "Suppress scan artefacts" on or off. It does drop
@@ -374,7 +378,7 @@ narrow relief that stands 0.6–2.5 mm in front of or behind a thin wall when it
 disagrees with the wall map. Turn the setting off for parts with fine engraving.
 `implicit_surface_keeps_small_relief_without_pits` is unchanged.
 
-### 2.4 Marker-site fills that continue the curvature (2026-11-27)
+### 2.4 Marker-site fills that continue the curvature (2026-11-27, with the review fixes)
 
 **What the user saw:** round depressions at the marker sites, in our solids and in Revo Scan's own
 mesh: the sticker hides the surface, the hole is filled with a flat spot, and on a dome a flat
@@ -387,72 +391,123 @@ flat fills (flatness ratio 0.54–0.76 at the clean sites). Ours did not at the 
 rim sites (M1, M4, M36, M43, S2-M4), the curvature-band and flange sites (M6, M16, M20, M21, the
 rc-12 site S2-M12/S3-M22), and every fill was smoother than the scanned surface round it.
 
-**What changed** (`crates/scancraft-mesh/src/solid/sitefit.rs`, `markers.rs`):
-- **Ring selection:** samples must face like the fit (normal within 20°) and lie within 3 σ of it,
-  σ from the MAD. The old trim at 2× the RMS of the kept points shrank onto the plain part of the
-  ring.
-- **Curvature bands:** where the 4.5 mm band next to the cut is plain sheet all round (≥ 90 % on
-  the fit) and the ring quadric clearly misses it (≥ 0.01 mm RMS explained), the band's low angular
-  orders (m ≤ 3) are continued into the cut C1 by the disc's biharmonic solution
-  (A r^m + B r^(m+2)). The slope beyond the harmonic one is weighted by its significance against
-  the scan noise. Elsewhere the fill is the ring quadric, which already continues the curvature to
-  second order and was best on plain spots in the leave-out test.
-  - Tried and dropped on the real data: continuing the orders at every site, carrying the band's
-    value in at partial rings, a 6 mm band with t² terms, and a remainder of the scan points. The
-    band next to a cut holds the ragged rim of the gap round the sticker. Carried in, it gave dents
-    and bumps of 0.1–0.25 mm (S2-M61 +0.18, M1 dent, M3 blob).
-- **Fairing:** the mesh inside the cut goes onto the site's fill surface from the scan points
-  (`MarkerOutcome::surface`), met by the mesh round the cut (`SiteSurface::met_by`). The low orders
-  of the mesh's remainder are continued C1 where the fill is the quadric; the rest is carried in
-  harmonically. Re-fitting the solve's mesh ring was the weak link before: its smoothing, carried in
-  C1, put a synthetic ridge 0.04 mm off, against 0.013 mm now. All 22 cut sites are faired now; M4
-  and M36 used to be refused.
-- **Partial sites:** a patch stays within 0.4 mm of the convex hull of the sheet round the site,
-  and never behind surface going down in the cut (a rim's side face under a sticker hanging over
-  the rim).
-- **Reconstruct:** `PrepareConfig` turns the band slopes off (`continue_band_slopes: false`). The
-  merged model has no pass ids, so S2/S3 seams 0.15 mm apart cannot be equalised. With the band
-  slopes on, every site where they switched on (M16, M20, M21, M43, S2-M20, S2-M44, S2-M12)
-  scored worse. The app calls `fair_marker_sites_on_fills`.
+**What changed** (`crates/scancraft-mesh/src/solid/sitefit.rs`, `markers.rs`; first pass 41e7b72,
+review fixes after it):
+- **Ring fit:** samples must face like the fit (normal within 20°) and lie within 3 σ of it, σ from
+  the MAD. The quadric is a conic: its quadratic part enters as the sag 2Q / (1 + sqrt(1 − 2κ|Q|)),
+  κ its largest principal curvature. That is exact on a sphere or a cylinder of any radius. A plain
+  quadric missed the centre of a small ball by r⁴/8R³: +0.11 mm at R 15 mm, +0.06 at R 20.
+- **Two ring fits:** one trimmed against the quadric plus the band's low orders (a curvature band is
+  not taken for noise), and a plain one trimmed against the quadric alone. The plain fit drops a
+  feature beside the cut and is the fill wherever the band is not continued.
+- **Curvature bands:** where the 4.5 mm band next to the cut is plain sheet all round, the band's
+  low angular orders (m ≤ 3) are continued into the cut with value and slope (A r^m + B r^(m+2)).
+  Two extra tests since the review:
+  - the orders must explain clearly more than they would explain of plain noise (σ sqrt(k / n)).
+    A fixed 0.01 mm let noise of 0.1–0.2 mm switch them on, and the fill got 3–6 × worse;
+  - inside the cut the continuation must stay within the range it has on the cut against the plain
+    fit. The slope of a narrow ridge beside the cut, carried over 6.5 mm, dug a dent of 0.1–0.2 mm at
+    the centre. Where more than half of the slope has to go, the band is not continued.
+- **Partial sites (rims):**
+  - The patch stays within 0.4 mm of the convex hull of the sheet. Cut points count as sheet only in
+    the outer 0.4 mm of the cut. Further in they may be the sticker's edge ramp or a thin sticker,
+    which over a rim widened the hull out to the sticker's edge (422 fill points past the rim).
+  - The patch keeps behind surface going down in the cut (a rim's side face) only where at least six
+    such points lie in directions without annulus surface. One stray below the sheet used to leave a
+    wedge of the sheet empty.
+- **Fairing** (`fair_sites`):
+  - The mesh inside the cut goes onto the site's fill surface from the scan points, met by the mesh
+    round the cut (`SiteSurface::met_by`). A site that was kept or left to the solve (no fill surface)
+    is faired onto a fit of the mesh ring, as before 41e7b72. A kept sticker stayed 0.33 mm proud.
+  - Quality check again for every site: the mesh ring's RMS against a robust quadric must be
+    ≤ 0.1 mm with 60 % kept. M4 (0.120) and M36 (0.166) are left as meshed again. Their folded rim
+    edges are gone. `FairOutcome::ring_rms_mm` reports that RMS (it was always 0).
+  - `met_by` carries in, over the whole cut, only the band samples within 3 σ of the band's median.
+    The rest (a rim's rolled edge) is carried in only near the cut, decaying over 1 mm. Carried over
+    the whole cut it sank M1 by 0.1 mm.
+  - Weights fade smoothly (offset 0.6–0.8 mm, normal 18–25°). Vertices toward directions where the
+    mesh round the cut is not on the target (a rolled edge) are left alone near the cut. A vertex
+    more than 0.3 mm below the target at a rim site fades out by 0.5 mm. Hard limits had moved one
+    vertex of a rolled edge fully and left its neighbour.
+- **Reconstruct:** band slopes stay off (`PrepareConfig`); the merged model has no pass ids.
+- **Reconstruct's spacing:** `implicit::point_spacing` takes every point (up to 400 000) and the mean
+  of the middle fifth of their values. The per-point value is a count within a radius, so it comes in
+  steps of about 1 %. The median of a step sample jumped by one step when 64 fill points went
+  (0.65 → 0.64 mm, support radius 2.0 → 1.9 mm), and that flipped the laser-lattice suppression.
 
-**Results** (final e2e `E:\Claude\eval\mesh-curv\e2e`; self = patch minus the C1 continuation of
-the output's own band, centre mm / flatness ratio; tables `after_self.txt`, `after.txt`,
-`fill_sites_after.txt`; images `sites_after*.png`, `compare_sites.png`):
-- **Make Solid vs v7.**
-  - Clean sites unchanged: |self| ≤ 0.024 mm, ratio 0.88–1.34.
-  - Better: M43 (−0.135 → −0.087, the disc outline gone in the renders), M6 (+0.115 → +0.067),
-    M36 (−0.455 → −0.372), M20 (+0.027 → +0.013), S2-M4 (−0.088 → −0.047) and S2-M61
-    (−0.059 → +0.009).
-  - Worse: M1 (−0.029 → −0.240 against its own band. In the renders it has a smoother edge than
-    v7's bump and a faint darker disc).
-  - Steps across the cut ≤ 0.01 mm everywhere a sheet surrounds the site.
-- **Reconstruct vs v7:** clean sites the same. M43 (+0.10) and S2-M44 (+0.12) are faint domes,
-  M36 has its rim notch as before.
-- **Real features, Make Solid:** relief windows, screw hole (1.44 mm free radius), the four bosses
-  and the bottom crease are identical to v7.
-- **Synthetic tests** (`solid/tests.rs`, `tests.rs`, `solid/sitefit.rs`): spheres R 60–150 and
-  cylinders R 40/80 within 0.002 mm, flatness ratio 1.00 ± 0.01. A ridge and a bump through the
-  site within 0.009/0.016 mm in the infill, 0.013/0.017 mm through Make Solid and 0.019 mm through
-  Reconstruct's path. A flat disc faired back without a kink (≤ 3 mrad). A rim roll-off in the
-  annulus: 0.016 mm, was 0.057. A sticker over a rim: no patch past it, was 422 points. All six new
-  tests fail on the old code.
+**Per site, final** (`E:\Claude\eval\mesh-curv\e2e-final`). Two references, because each fails
+somewhere:
+- *self*: patch centre minus the biharmonic fill of the output's own band (mm), then the flatness
+  ratio (1 = continues the curvature). Biased where the band holds a rolled rim (M1, M4, M36).
+- *raw*: median height within 1.5 mm of the axis above a robust quadric of the raw scan's ring
+  7.5–14 mm, normal within 37° (mm). Biased on curvature bands (M16, M20, M21: about +0.1–0.24 in
+  every output) and at rims with little ring (M36).
+
+| site | self, solid v7 → final | self, Reconstruct v7 → final | raw, solid v7 / 41e7b72 / final | raw, Reconstruct v7 / 41e7b72 / final |
+| --- | --- | --- | --- | --- |
+| M1 (rim) | −0.029 → −0.148 | +0.048 → +0.006 | −0.006 / −0.134 / **−0.007** | −0.020 / −0.070 / **−0.009** |
+| M2 | +0.019 → +0.021 | +0.009 → +0.009 | −0.005 / −0.008 / −0.010 | +0.031 / +0.036 / +0.036 |
+| M3 | +0.008 → +0.016 | +0.016 → +0.025 | +0.015 / +0.029 / +0.020 | +0.006 / +0.017 / +0.014 |
+| M4 (rim) | −0.195 → −0.083 | −0.025 → +0.045 | −0.327 / −0.175 / **−0.035** | −0.184 / −0.087 / **+0.013** |
+| M5 | +0.013 → +0.005 | +0.004 → −0.000 | −0.008 / −0.011 / −0.012 | −0.001 / −0.006 / −0.007 |
+| M6 (flange) | +0.115 → +0.070 | +0.008 → −0.030 | +0.146 / +0.075 / +0.075 | +0.234 / +0.199 / +0.196 |
+| M7 | +0.006 → −0.001 | −0.009 → −0.013 | +0.004 / −0.009 / −0.006 | −0.002 / −0.006 / −0.006 |
+| M14 | −0.000 → −0.008 | −0.023 → −0.025 | −0.007 / −0.012 / −0.012 | −0.012 / −0.015 / −0.013 |
+| M16 (band) | −0.013 → −0.014 | +0.014 → +0.017 | (+0.10 all) | (+0.10 all) |
+| M20 (band) | +0.027 → +0.016 | +0.036 → +0.016 | (+0.22 all) | (+0.20–0.22 all) |
+| M21 (band) | −0.001 → +0.003 | +0.049 → +0.039 | (+0.17–0.24 all) | (+0.19–0.24 all) |
+| M22 | +0.014 → +0.020 | −0.012 → −0.007 | −0.004 / −0.015 / −0.000 | −0.006 / −0.001 / +0.000 |
+| M36 (rim) | −0.455 → −0.339 | −0.375 → −0.405 | (−1.0 all) | (−0.8 to −1.0 all) |
+| M43 | −0.135 → −0.088 | −0.002 → −0.015 | +0.128 / +0.091 / +0.091 | +0.241 / +0.348 / +0.219 |
+| S2-M4 | −0.088 → −0.054 | −0.007 → +0.034 | −0.304 / −0.219 / −0.220 | −0.055 / −0.006 / −0.013 |
+| S2-M7 | +0.007 → +0.008 | −0.033 → −0.028 | −0.006 / +0.012 / +0.011 | +0.151 / +0.149 / +0.151 |
+| S2-M12 (rc 12) | +0.077 → +0.091 | +0.328 → +0.262 | −0.350 / −0.359 / −0.360 | −0.295 / −0.284 / −0.313 |
+| S2-M20 | −0.008 → −0.007 | −0.004 → −0.019 | +0.009 / +0.003 / +0.003 | +0.185 / +0.165 / +0.166 |
+| S2-M44 | −0.005 → +0.007 | +0.110 → +0.125 | +0.031 / +0.058 / +0.058 | +0.165 / +0.177 / +0.182 |
+| S2-M61 | −0.059 → −0.025 | −0.019 → −0.002 | – | – |
+
+(The raw column of the inner sites and of M43 also carries the offset between the output and the
+raw scan round the cut, e.g. S2-M4 −0.25 mm at 7.5–8.5 mm in the solid, where S3 is equalised.)
+Under grazing light (`compare_sites.png`): M1 and M4 show no disc and no dent any more in either
+output (v7: a bump with an edge line at M1, a dark disc at M4).
+
+**Real features** (harness, v7 / 41e7b72 / final):
+
+| | Make Solid | Reconstruct |
+| --- | --- | --- |
+| Inner lattice window, relief std / p99 (mm) | 0.005 / 0.020, all three | 0.013 / 0.038 · 0.071 / 0.418 · **0.022 / 0.049** |
+| Bracket screw hole, free radius (mm) | 1.44, all three | 2.20 · 2.42 · **2.20** |
+| Boss recess A / B / C / D (mm) | 2.20 / 1.94 / 1.54 / 1.69, all three | C: 0.90 · −0.21 · **0.34**; A 0.25, B 0.79, D −0.08 |
+| Bottom crease, peak to peak (mm) | 0.066, all three | 0.093, all three |
+| Openings (Reconstruct) | – | 119 · 144 · **134** |
+
+The solid stays watertight, one component, genus 11. Make Solid takes 30 s.
+
+**Tests:** 13 new tests, each fails on 41e7b72: a narrow ridge beside the cut (fill and solid);
+noise 0.12–0.2 mm on a sphere; balls R 15–30 and cylinders R 10–15; one stray below the sheet at a
+rim site; a sticker over a rim without a side face (thick and thin); a sticker on a rough ring, kept
+or filled; a site left to the solve; the fairing's ring check and report; a rim's rolled edge carried
+into the cut; a rolled edge inside the cut not folded; Reconstruct on a ball R 20 with its default
+settings; the spacing estimate with a few points fewer. `cargo test --release -p scancraft-mesh -p
+scancraft`: 89 and 88 (3 ignored) pass; the end-to-end test passes.
 
 **Still not right:**
-- **Reconstruct's auto support radius is on a knife edge.** With the final marker code the
-  prepared cloud has 60 fewer points than v7's (310 196 against 310 260). That tips the point
-  spacing estimate from 0.65 to 0.64 mm and the support radius from 2.0 to 1.9 mm. At 1.9 mm the
-  S3 laser-line lattice on the inside, 30 mm from the nearest marker, comes back as pits: relief
-  p99 0.418 against 0.038 mm, 144 against 119 openings, and the bracket hole and boss C numbers
-  move. Runs with other marker variants that landed at 2.0 mm (`e2e_A`, `e2e_E`) match v7
-  exactly. Choosing the spacing sample by position instead of by index did not move it. This
-  needs its own fix in the mesher (a stable spacing estimate or a stronger stray test), not in
-  the marker code.
-- **Rim sites:**
-  - M36 keeps its rim bulge. The real scan has no side face under the overhanging sticker for the
-    shadow rule to use.
-  - M4 has small bright specks along the rim inside the cut.
-- **Fills are smoother than the scanned texture round them.** This was not addressed, as decided:
-  no noise added.
+- **Reconstruct's stray suppression still depends on the support radius.** The spacing is stable
+  now (0.647 mm on the Revo merge, the same with or without the marker fills), but a sweep shows the
+  laser-lattice result changes with it: one pit at the upper hinge (−0.6 mm, 8 samples) at
+  0.645–0.648 mm, −0.3 mm at 0.650–0.660 (as in v7), four pits at 0.640. Boss C's recess flips between −0.27 and +0.90 mm over
+  0.64–0.68 mm. v7's good values sat at 0.652 by chance. The cause is a gap in the inner face with
+  laser strays behind it: `dense_layers` compares counts within 1.5 spacings, where the face has few
+  points. A wider radius (2.5 spacings) removed them in a Python model; not tried in the mesher.
+- **M36:** the rim bulge stays (no side face under the overhanging sticker; the patch now ends at the
+  rim, but the bulge is in the data round it).
+- **M43, S2-M44 in Reconstruct:** faint domes (+0.1 mm against the band), as in v7.
+- **S2-M12 (rc 12):** still a large smooth disc, +0.26 mm in Reconstruct.
+- **The 1 mm rib beside a cut** (synthetic, h 1, sigma 2, 3 mm outside): the ring's cubic follows the
+  rib and lowers the centre by 0.08 mm (old code −0.03, 41e7b72 −0.13).
+- **M16 fold count:** 36 triangles above 60° within 8 mm, v7 20. They are needle triangles of
+  0.0001 mm² from the marching cubes, not visible.
+- **Fills are smoother than the scanned texture round them** (left as decided, no noise added).
 
 ## 3. Found by the user in the app
 

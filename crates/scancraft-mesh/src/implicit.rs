@@ -304,8 +304,14 @@ mod smallvec_like {
 /// itself: that one is the pitch on a regular grid (a merged scan), but well below it on
 /// irregular samples (0.39 for a 0.5 mm grid jittered by ±0.15 mm), and every radius here is a
 /// multiple of the spacing.
+///
+/// Every point counts (up to [`SPACING_SAMPLES`]) and the figure is the mean of the middle fifth
+/// of the per-point values, not one median of a step sample: where passes overlap the cloud has
+/// two densities, the median of a sample sits between their modes, and a few points more or less
+/// moved it by 1-2 % (0.65 to 0.64 mm on the Revo scans with 64 marker-fill points fewer of
+/// 310 000), which flipped the stray suppression of the laser-line lattice (radius 2.0 to 1.9 mm).
 fn point_spacing(grid: &PointGrid) -> f32 {
-    let step = (grid.p.len() / 5000).max(1);
+    let step = grid.p.len().div_ceil(SPACING_SAMPLES).max(1);
     let nearest = nearest_neighbour_distance(grid, step);
     let r = 4.0 * nearest;
     let mut d: Vec<f32> = (0..grid.p.len())
@@ -325,13 +331,24 @@ fn point_spacing(grid: &PointGrid) -> f32 {
     if d.is_empty() {
         return nearest;
     }
-    let mid = d.len() / 2;
-    d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
     // Never above the nearest-neighbour figure by more than the two can differ on real samples.
-    d[mid].clamp(nearest, 2.0 * nearest)
+    central_mean(&mut d).clamp(nearest, 2.0 * nearest)
 }
 
-/// Median nearest-neighbour distance over every `step`-th point of the grid.
+/// Points sampled for the spacing estimate (all of them in a smaller cloud).
+const SPACING_SAMPLES: usize = 400_000;
+
+/// Mean of the middle fifth (40-60 %) of `d`: the median's value, but continuous in the data (a
+/// value or two more or less moves it by a fraction of a value's share, never by the gap between
+/// two modes).
+fn central_mean(d: &mut [f32]) -> f32 {
+    d.sort_unstable_by(|a, b| a.total_cmp(b));
+    let n = d.len();
+    let (lo, hi) = (2 * n / 5, (3 * n / 5).max(2 * n / 5 + 1).min(n));
+    d[lo..hi].iter().map(|&v| v as f64).sum::<f64>() as f32 / (hi - lo) as f32
+}
+
+/// Nearest-neighbour distance over every `step`-th point of the grid ([`central_mean`]).
 fn nearest_neighbour_distance(grid: &PointGrid, step: usize) -> f32 {
     let mut d: Vec<f32> = (0..grid.p.len())
         .into_par_iter()
@@ -353,9 +370,7 @@ fn nearest_neighbour_distance(grid: &PointGrid, step: usize) -> f32 {
     if d.is_empty() {
         return 1.0;
     }
-    let mid = d.len() / 2;
-    d.select_nth_unstable_by(mid, |a, b| a.total_cmp(b));
-    d[mid]
+    central_mean(&mut d)
 }
 
 /// Re-estimates every normal from the positions around it (weighted PCA over `radius`), oriented
@@ -768,4 +783,47 @@ pub fn reconstruct(cloud: &PointCloud, config: &SurfaceConfig) -> (Mesh, Surface
     let mut mesh = Mesh::from_geometry(vertices, triangles);
     mesh.update_bbox();
     (mesh, stats)
+}
+
+#[cfg(test)]
+mod spacing_tests {
+    use super::*;
+
+    /// A plane sampled at two densities, half of the points each (pitch 0.5 mm for x < 0, 0.4 mm
+    /// beyond, jittered by ±0.1 mm), like a merged model where two passes overlap.
+    fn two_density_plane() -> Vec<(Vec3, Vec3, f32)> {
+        let jitter = |i: i32, j: i32, k: i32| ((((i * 7919 + j * 104_729 + k * 15_485_863) as f32).sin() * 43_758.545).fract() - 0.5) * 0.2;
+        let mut pts = Vec::new();
+        for (pitch, cols, rows, x0) in [(0.5f32, 150, 240, -75.0f32), (0.4, 120, 300, 0.0)] {
+            for i in 0..cols {
+                for j in 0..rows {
+                    let (x, y) = (x0 + i as f32 * pitch + jitter(i, j, 1), j as f32 * pitch + jitter(i, j, 2));
+                    pts.push((Vec3::new(x, y, 0.0), Vec3::Z, 1.0));
+                }
+            }
+        }
+        pts
+    }
+
+    #[test]
+    fn spacing_does_not_jump_when_a_few_points_go() {
+        // The Revo scans' merged model gave 0.65 mm, and 0.64 mm with 64 marker-fill points fewer
+        // (of 310 000): the support radius went from 2.0 to 1.9 mm and the laser-line lattice
+        // suppression flipped. A step sample's median sits between the two densities' modes there.
+        let pts = two_density_plane();
+        let spacing = |p: &[(Vec3, Vec3, f32)]| point_spacing(&PointGrid::new(p.to_vec(), 2.0));
+        let all = spacing(&pts);
+        let mut worst = 0f32;
+        for drop in [16usize, 64, 200] {
+            for from in [0usize, pts.len() / 3, pts.len() - drop] {
+                let mut fewer = pts.clone();
+                fewer.drain(from..from + drop);
+                let s = spacing(&fewer);
+                worst = worst.max((s / all - 1.0).abs());
+            }
+        }
+        eprintln!("spacing {all:.4} mm, worst change {:.3} % with a few points fewer", 100.0 * worst);
+        assert!(worst < 0.002, "spacing {all} moves by {:.2} % when a few of {} points go", 100.0 * worst, pts.len());
+        assert!((0.4..0.5).contains(&all), "spacing {all}");
+    }
 }

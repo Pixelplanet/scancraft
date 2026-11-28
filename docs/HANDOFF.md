@@ -10,6 +10,23 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-27 (original PC, branch `agent/mesh-fixes`).**
+
+- **The marker "depressions" are flat fills** (user). Every sticker leaves a hole in the scan.
+  Our solids and Revo Scan's own result fill it with a flat spot, and on the curved dome a flat
+  spot looks like a dent.
+- **Fixed:** the fill continues the curvature round each site. The ring fit is a conic quadric
+  (exact on spheres and cylinders). A curvature band is continued with its slope only where that
+  is safe, and the fairing no longer sinks or folds rim sites. M1 and M4 no longer show a disc or a
+  dent. Reconstruct's point-spacing estimate no longer jumps when a few points change.
+- **The 0.1 mm rounded-rectangle line on the outside is real:** the boundary between two paint
+  colours under a white stripe. Keep it.
+- **Still open:** Reconstruct's laser-lattice suppression still depends on the support radius (one
+  pit left at the upper hinge), the rim bulge at M36, faint domes at M43 and S2-M44 in Reconstruct,
+  fills smoother than the scanned texture.
+
+Numbers and the open list are in [open-issues.md](open-issues.md) §2.4.
+
 **Update 2026-11-26 (original PC, branch `agent/mesh-fixes`).**
 
 - **No lettering.** The user confirmed that the Revo shell part's top is smooth. There is no

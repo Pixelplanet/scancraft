@@ -1063,7 +1063,7 @@ fn flatness_ratio(pts: &[Vec3], f: &dyn Fn(f32, f32) -> f32) -> f64 {
     let keep = vec![true; a.len()];
     let qa = Quadric::fit_once_n::<6>(&a, &keep).unwrap().0;
     let qb = Quadric::fit_once_n::<6>(&b, &keep).unwrap().0;
-    let h = |c: &[f64; 10]| [2.0 * c[3], c[4], c[4], 2.0 * c[5]];
+    let h = |c: &[f64; 11]| [2.0 * c[3], c[4], c[4], 2.0 * c[5]];
     let (ha, hb) = (h(&qa), h(&qb));
     ha.iter().zip(&hb).map(|(x, y)| x * y).sum::<f64>() / hb.iter().map(|y| y * y).sum::<f64>()
 }
@@ -1328,3 +1328,380 @@ fn rim_roll_off_in_the_annulus_does_not_pull_the_fill_down() {
     assert!(worst < 0.02, "fill {worst} mm off the dome");
 }
 
+
+/// Gaussian-like noise of unit variance (sum of four hashed uniforms) at grid spot (i, j).
+fn grid_noise(i: i32, j: i32, seed: i32) -> f32 {
+    let u = |k: i32| ((((i as f64) * 12.9898 + (j as f64) * 78.233 + (k as f64) * 37.719).sin() * 43_758.545_3).fract()).abs() as f32;
+    ((0..4).map(|m| u(seed * 4 + m)).sum::<f32>() - 2.0) * 3f32.sqrt()
+}
+
+/// A sheet z = `f(x, y)` sampled at 0.35 mm within 20 mm of the origin where `keep(x, y)`, facing +z,
+/// with a sticker `lift` proud (r 5.5 mm, a 0.5 mm edge ramp) centred at (`cx`, 0); sticker points
+/// are kept even where the sheet is not (a sticker hanging over a rim).
+fn sheet_where(f: &dyn Fn(f32, f32) -> f32, keep: &dyn Fn(f32, f32) -> bool, lift: f32, cx: f32) -> Vec<SolidPoint> {
+    let s = 0.35;
+    let mut v = Vec::new();
+    for i in -57..=57 {
+        for j in -57..=57 {
+            let (x, y) = (i as f32 * s, j as f32 * s);
+            let l = lift * ((5.5 - (x - cx).hypot(y)) / 0.5).clamp(0.0, 1.0);
+            if x.hypot(y) > 20.0 || (!keep(x, y) && l <= 0.0) {
+                continue;
+            }
+            v.push(SolidPoint { position: Vec3::new(x, y, f(x, y) + l), normal: surface_normal(f, x, y), scan: 1 });
+        }
+    }
+    v
+}
+
+fn fill_of(out: &MarkerRemoval) -> Vec<Vec3> {
+    out.samples.iter().filter(|p| p.kind == PointKind::MarkerFill).map(|p| p.position).collect()
+}
+
+/// Mean height of the fill within 1.5 mm of the site's axis above `f`.
+fn fill_centre(fill: &[Vec3], f: &dyn Fn(f32, f32) -> f32) -> f32 {
+    let c: Vec<f32> = fill.iter().filter(|p| p.x.hypot(p.y) < 1.5).map(|p| p.z - f(p.x, p.y)).collect();
+    c.iter().sum::<f32>() / c.len().max(1) as f32
+}
+
+#[test]
+fn narrow_feature_beside_the_cut_puts_no_dent_into_the_fill() {
+    // A dome with a narrow ridge (a rib foot, a bead) running past the cut 1.5-3 mm outside it,
+    // through Make Solid's marker removal: the band's slope, continued over the cut, dug a dent of
+    // 0.1-0.2 mm at the centre, where the surface is the plain dome.
+    let mut failed = Vec::new();
+    for (h, sig, x0, lim) in [(0.3f32, 1.5f32, 8.0f32, 0.05f32), (0.6, 1.5, 8.0, 0.05), (0.3, 1.0, 8.0, 0.05), (1.0, 2.0, 9.5, 0.1)] {
+        let f = move |x: f32, y: f32| -(x * x + y * y) / 200.0 + h * (-(x - x0).powi(2) / (2.0 * sig * sig)).exp();
+        let out = remove_markers(&sheet_with_sticker(f, (0.0, 0.0)), &[site_at_origin()], &MarkerConfig::default(), None);
+        let fill = fill_of(&out);
+        let dome = |x: f32, y: f32| -(x * x + y * y) / 200.0;
+        let centre = fill_centre(&fill, &dome);
+        // ... and the solid: the fairing meets the mesh round the cut, whose slope beside the
+        // cut is the ridge's too.
+        let mut pts = sheet_with_sticker(f, (0.0, 0.0));
+        pts.extend(back_face_of(&f));
+        let res = build_solid(&pts, &[site_at_origin()], &SolidConfig { cell_mm: 0.4, detect: None, ..Default::default() });
+        let solid: Vec<Vec3> = res.mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).filter(|p| p.z > f(p.x, p.y) - 1.5).collect();
+        let solid_centre = fill_centre(&solid, &dome);
+        let fair = res.report.marker_outcomes[0].fair.as_ref().map(|f| f.status.clone());
+        eprintln!("ridge h {h} sigma {sig} at {x0}: fill centre {centre:+.4} mm, solid {solid_centre:+.4} ({:?}, {fair:?})", out.outcomes[0].fill);
+        if centre.abs() > lim || solid_centre.abs() > lim {
+            failed.push(format!("ridge h {h} sigma {sig} at {x0}: fill centre {centre:+.3} mm, solid {solid_centre:+.3} mm off the dome"));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The back face (scan 2) of a plate whose front face is `f`, 3 mm behind it (see
+/// [`plate_with_sticker`]).
+fn back_face_of(f: &dyn Fn(f32, f32) -> f32) -> Vec<SolidPoint> {
+    let s = 0.35;
+    let mut pts = Vec::new();
+    for i in -57..=57 {
+        for j in -57..=57 {
+            let (x, y) = (i as f32 * s + 0.17, j as f32 * s + 0.11);
+            if x.hypot(y) <= 20.0 {
+                pts.push(SolidPoint { position: Vec3::new(x, y, f(x, y) - WALL), normal: -surface_normal(f, x, y), scan: 2 });
+            }
+        }
+    }
+    pts
+}
+
+#[test]
+fn marker_fill_on_small_balls_and_cylinders_follows_them() {
+    // On a ball of R 15-30 mm a quadric fitted to the ring round the site misses the centre by about
+    // r⁴/8R³ (+0.11 mm at R 15, +0.06 at R 20): a bump of the size of the flat spots on the Revo part.
+    let mut failed = Vec::new();
+    for (name, r, ball) in [("ball", 15.0f32, true), ("ball", 20.0, true), ("ball", 30.0, true), ("cylinder", 10.0, false), ("cylinder", 15.0, false)] {
+        let f = move |x: f32, y: f32| if ball { sphere_r(r, x, y) } else { cylinder_r(r, x) + 0.0 * y };
+        let keep = move |x: f32, y: f32| if ball { x * x + y * y < 0.8 * r * r } else { x.abs() < 0.9 * r };
+        let pts = sheet_where(&f, &keep, 0.4, 0.0);
+        let out = remove_markers(&pts, &[Marker { radius_mm: 3.0, ..site_at_origin() }], &MarkerConfig::default(), None);
+        let fill = fill_of(&out);
+        let worst = fill.iter().filter(|p| p.x.hypot(p.y) < 6.0).map(|p| (p.z - f(p.x, p.y)).abs()).fold(0f32, f32::max);
+        let centre = fill_centre(&fill, &f);
+        eprintln!("{name} R {r}: fill centre {centre:+.4}, worst within 6 mm {worst:.4} ({:?})", out.outcomes[0].fill);
+        if !out.outcomes[0].fill.starts_with("quadric") || worst > 0.02 {
+            failed.push(format!("{name} R {r}: fill {:?}, centre {centre:+.3}, worst {worst:.3} mm", out.outcomes[0].fill));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// A dome (R 100 mm) ending at the straight rim x = 3.5 with a side face going down, a sticker at
+/// the origin (a site covered in 6 of 8 sectors) and, optionally, one stray point 0.5 mm below
+/// the sheet: the spots of the sheet inside the cut (x < 3) left with no sample within 0.5 mm.
+fn empty_spots_round_a_stray(stray: Option<(f32, f32)>) -> (usize, MarkerOutcome) {
+    let s = 0.35;
+    let mut pts = sheet_where(&sphere100, &|x, _| x <= 3.5, 0.4, 0.0);
+    pts.retain(|p| p.position.x <= 3.5);
+    for i in -57..=57 {
+        let y = i as f32 * s;
+        for k in 1..=10 {
+            pts.push(SolidPoint { position: Vec3::new(3.5, y, sphere100(3.5, y) - k as f32 * s), normal: Vec3::X, scan: 1 });
+        }
+    }
+    if let Some((x, y)) = stray {
+        pts.push(SolidPoint { position: Vec3::new(x, y, sphere100(x, y) - 0.5), normal: Vec3::Z, scan: 1 });
+    }
+    let out = remove_markers(&pts, &[site_at_origin()], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    let mut empty = 0;
+    for i in -20..=10 {
+        for j in -20..=20 {
+            let (x, y) = (i as f32 * 0.35, j as f32 * 0.35);
+            if x.hypot(y) > 6.3 || x > 3.0 {
+                continue;
+            }
+            let near = out.samples.iter().any(|p| (p.position.x - x).hypot(p.position.y - y) < 0.5 && (p.position.z - sphere100(x, y)).abs() < 0.3);
+            empty += (!near) as usize;
+        }
+    }
+    (empty, out.outcomes[0].clone())
+}
+
+#[test]
+fn one_stray_below_the_sheet_leaves_no_wedge_unfilled_at_a_rim_site() {
+    // One point below the sheet in the cut of a site at a rim (a laser-line stray): the rule that
+    // keeps the patch from reaching behind a rim's side face cast its shadow from the stray out to
+    // the edge of the cut, a wedge of the sheet with no points and no fill (33 spots).
+    let mut failed = Vec::new();
+    for stray in [None, Some((-1.5f32, 3.0f32)), Some((-4.0, -2.0)), Some((0.0, 4.5))] {
+        let (empty, o) = empty_spots_round_a_stray(stray);
+        eprintln!("stray {stray:?}: {empty} empty spots ({:?}, {} fill points)", o.fill, o.fill_points);
+        if !o.fill.starts_with("quadric, partial") || empty > 2 {
+            failed.push(format!("stray {stray:?}: {empty} empty spots on the sheet in the cut ({:?})", o.fill));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn sticker_over_a_rim_without_a_side_face_gives_no_bulge_past_it() {
+    // As `sticker_hanging_over_the_rim_gives_no_bulge_past_it`, but the scan has no side face
+    // under the overhang (the Revo part's S1-M36), with the sticker's edge ramp, and thin stickers
+    // (0.1-0.15 mm) whose points lie within 0.15 mm of the sheet: those points widened the hull of
+    // the sheet out to the sticker's edge, and 422 fill points went past the rim.
+    let mut failed = Vec::new();
+    for lift in [0.4f32, 0.15, 0.1] {
+        let pts = sheet_where(&sphere100, &|x, _| x <= 0.0, lift, -1.0);
+        let m = Marker { center: Vec3::new(-1.0, 0.0, sphere100(-1.0, 0.0)), ..site_at_origin() };
+        let out = remove_markers(&pts, &[m], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+        let fill = fill_of(&out);
+        let past = fill.iter().filter(|p| p.x > 0.45).count();
+        let worst = fill.iter().map(|p| (p.z - sphere100(p.x, p.y)).abs()).fold(0f32, f32::max);
+        let raised = out.samples.iter().filter(|p| p.kind == PointKind::Measured && p.position.z > sphere100(p.position.x, p.position.y) + 0.5 * lift).count();
+        eprintln!("lift {lift}: {} fill points, {past} past the rim, worst {worst:.4} mm, {raised} sticker points left ({:?})", fill.len(), out.outcomes[0].fill);
+        if past > 0 || fill.len() < 100 || worst > 0.02 || raised > 0 {
+            failed.push(format!("lift {lift}: {past} fill points past the rim ({} in all), worst {worst:.3}, {raised} sticker points left", fill.len()));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The test shell's outer cap (R 30 mm, scan 1, 0.45 mm) with a sticker (r 4.5 mm, 0.4 mm proud)
+/// at `disc` whose ring 6-14 mm round it is disturbed by `ring`, and the inner cap 3 mm in (scan 2).
+fn shell_with_disturbed_ring(disc: Vec3, ring: &dyn Fn(&mut SolidPoint, usize)) -> Vec<SolidPoint> {
+    let mut pts = Vec::new();
+    for (k, mut p) in cap(R_OUT, 0.45, true, 1).into_iter().enumerate() {
+        let d = p.position / R_OUT;
+        let a = d.angle_between(disc) * R_OUT;
+        if a < 4.5 {
+            p.position = d * (R_OUT + 0.4);
+        }
+        if (6.0..14.0).contains(&a) {
+            ring(&mut p, k);
+        }
+        pts.push(p);
+    }
+    pts.extend(cap(R_OUT - WALL, 0.45, false, 2));
+    pts
+}
+
+/// Height of the solid's outer face above the sphere within 4 mm of `disc`: mean and largest.
+fn solid_height_at(mesh: &Mesh, disc: Vec3) -> (f32, f32) {
+    let e: Vec<f32> = mesh
+        .vertices
+        .iter()
+        .map(|v| Vec3::from_array(v.position))
+        .filter(|p| p.length() > R_OUT - WALL / 2.0 && p.normalize().angle_between(disc) * R_OUT < 4.0)
+        .map(|p| p.length() - R_OUT)
+        .collect();
+    (e.iter().sum::<f32>() / e.len().max(1) as f32, e.iter().copied().fold(f32::MIN, f32::max))
+}
+
+#[test]
+fn a_sticker_on_a_rough_ring_ends_flat_in_the_solid() {
+    // A ring too rough for the infill (noise, or normals the facing test rejects) keeps the sticker
+    // in the cloud; the fairing of the mesh then flattens it, as it did before the fairing went onto
+    // the fill surfaces (where a kept site has none, and the sticker stayed 0.33 mm proud). A ring
+    // just smooth enough for the infill (0.3-0.4 mm noise) is cut and filled.
+    let disc = dir(30.0, 200.0);
+    let noise = |amt: f32| {
+        move |p: &mut SolidPoint, k: usize| {
+            let d = p.position / R_OUT;
+            p.position = d * (R_OUT + amt * grid_noise(k as i32, 7, 3));
+        }
+    };
+    let tilt = |p: &mut SolidPoint, k: usize| {
+        let d = p.normal;
+        let t = d.any_orthonormal_vector();
+        let phi = 2.0 * PI * ((k as f32 * 0.618_034).fract());
+        let a = 30f32.to_radians();
+        p.normal = (d * a.cos() + (t * phi.cos() + d.cross(t) * phi.sin()) * a.sin()).normalize();
+    };
+    let mut failed = Vec::new();
+    for (name, pts) in [
+        ("noise 0.3 mm", shell_with_disturbed_ring(disc, &noise(0.3))),
+        ("noise 0.4 mm", shell_with_disturbed_ring(disc, &noise(0.4))),
+        ("noise 0.5 mm", shell_with_disturbed_ring(disc, &noise(0.5))),
+        ("noise 0.6 mm", shell_with_disturbed_ring(disc, &noise(0.6))),
+        ("normals 30 deg", shell_with_disturbed_ring(disc, &tilt)),
+    ] {
+        let m = Marker { id: "K".into(), center: disc * R_OUT, normal: disc, scan: Some(1), source: MarkerSource::List, radius_mm: 0.0, score: 0.0 };
+        let res = build_solid(&pts, &[m], &SolidConfig { cell_mm: 0.5, detect: None, ..Default::default() });
+        let o = &res.report.marker_outcomes[0];
+        let (mean, max) = solid_height_at(&res.mesh, disc);
+        eprintln!("{name}: {:?} / {:?}: solid at the sticker mean {mean:+.3}, largest {max:+.3} mm", o.fill, o.fair.as_ref().map(|f| f.status.as_str()));
+        if mean > 0.15 {
+            failed.push(format!("{name}: {:?} / {:?}: the sticker stands {mean:+.3} mm proud in the solid", o.fill, o.fair.as_ref().map(|f| f.status.as_str())));
+        }
+    }
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+#[test]
+fn a_site_left_to_the_solve_is_faired_in_the_solid() {
+    // `quadric_fill: false` (M1): the site is cut and left to the solve, with no fill surface; the
+    // fairing then puts the mesh onto a fit of the mesh annulus.
+    let pts = plate_with_sticker(sphere60);
+    let cfg = SolidConfig { cell_mm: 0.4, detect: None, markers: MarkerConfig { quadric_fill: false, ..MarkerConfig::default() }, ..Default::default() };
+    let res = build_solid(&pts, &[site_at_origin()], &cfg);
+    let o = &res.report.marker_outcomes[0];
+    let (worst, _) = site_errors(&res.mesh, &sphere60, 0.0, 6.4);
+    eprintln!("M1 site: {:?} / {:?}, worst inside the cut {worst:.4} mm", o.fill, o.fair);
+    assert!(o.fair.as_ref().is_some_and(|f| f.status == "faired"), "{o:?}");
+    assert!(worst < 0.035, "site {worst} mm off the sphere");
+}
+
+/// The triangulated height field of `f` over [-20, 20]² (0.4 mm grid) with smooth noise of
+/// amplitude `rough` (mm) beyond 6.5 mm from the origin.
+fn height_mesh_rough_ring(f: &dyn Fn(f32, f32) -> f32, rough: f32) -> Mesh {
+    let (n, s) = (101usize, 0.4f32);
+    let half = (n / 2) as f32;
+    let mut verts = Vec::new();
+    for j in 0..n {
+        for i in 0..n {
+            let (x, y) = ((i as f32 - half) * s, (j as f32 - half) * s);
+            let z = f(x, y) + if x.hypot(y) > 6.5 { rough * (1.3 * x).sin() * (1.1 * y).cos() } else { 0.0 };
+            verts.push(scancraft_core::Point3D { position: [x, y, z], normal: [0.0, 0.0, 1.0], color: ColorRgba::WHITE, confidence: 1.0 });
+        }
+    }
+    let mut tris = Vec::new();
+    for j in 0..n - 1 {
+        for i in 0..n - 1 {
+            let a = (j * n + i) as u32;
+            tris.push(Triangle::new(a, a + 1, a + n as u32 + 1));
+            tris.push(Triangle::new(a, a + n as u32 + 1, a + n as u32));
+        }
+    }
+    let mut mesh = Mesh::from_geometry(verts, tris);
+    mesh.recompute_normals();
+    mesh
+}
+
+#[test]
+fn fairing_onto_a_fill_surface_checks_the_mesh_ring_and_reports_it() {
+    // The fairing onto the fill surfaces skipped the quality check of the mesh round the cut: rim
+    // sites with a rough mesh ring (Revo S1-M4 0.115 mm, M36 0.161 mm) were faired and their rolled
+    // edges folded, and every site reported a ring RMS of 0.
+    let pts = sheet_with_sticker(sphere60, (0.0, 0.0));
+    let rem = remove_markers(&pts, &[site_at_origin()], &MarkerConfig::default(), None);
+    assert!(rem.outcomes[0].surface.is_some(), "{:?}", rem.outcomes[0]);
+    let mut smooth = height_mesh_rough_ring(&sphere60, 0.0);
+    let ok = fair_marker_sites_on_fills(&mut smooth, &rem.sites, &rem.outcomes, &MarkerConfig::default());
+    eprintln!("smooth ring: {:?}", ok[0]);
+    assert_eq!(ok[0].status, "faired", "{:?}", ok[0]);
+    assert!(ok[0].ring_rms_mm > 0.0 && ok[0].ring_rms_mm < 0.01, "{:?}", ok[0]);
+    let mut rough = height_mesh_rough_ring(&sphere60, 0.25);
+    let before: Vec<[f32; 3]> = rough.vertices.iter().map(|v| v.position).collect();
+    let refused = fair_marker_sites_on_fills(&mut rough, &rem.sites, &rem.outcomes, &MarkerConfig::default());
+    eprintln!("rough ring: {:?}", refused[0]);
+    assert_ne!(refused[0].status, "faired", "{:?}", refused[0]);
+    assert!(refused[0].ring_rms_mm > 0.1, "{:?}", refused[0]);
+    assert!(rough.vertices.iter().zip(&before).all(|(v, b)| v.position == *b), "a refused site moved vertices");
+}
+
+#[test]
+fn fairing_at_a_rim_site_does_not_carry_the_rolled_edge_into_the_cut() {
+    // A dome (R 80 mm) that rolls over a 6 mm radius edge from x = 6.5 (the cut's edge) and ends at
+    // x = 9.5, the mesh inside the cut a flat disc. The band round the cut holds the start of the
+    // rolled edge, up to 0.4 mm below the sheet (the Revo part's S1-M1): carried into the cut by the
+    // fairing it sank the whole patch, a round dent on the dome (0.1 mm at S1-M1).
+    let (x0, re) = (6.5f32, 6.0f32);
+    let dome = |x: f32, y: f32| -(x * x + y * y) / 160.0;
+    let f = move |x: f32, y: f32| dome(x, y) - if x > x0 { re - (re * re - (x - x0).min(re).powi(2)).sqrt() } else { 0.0 };
+    // The fill surface from the scan points (the sheet beyond the roll-off start).
+    let pts: Vec<SolidPoint> = sheet_with_sticker(f, (0.0, 0.0)).into_iter().filter(|p| p.position.x <= x0 + 3.0).collect();
+    let rem = remove_markers(&pts, &[site_at_origin()], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    assert!(rem.outcomes[0].surface.is_some(), "{:?}", rem.outcomes[0]);
+    let mut mesh = height_mesh_with_flat_disc(&f, 6.5);
+    let keep: Vec<bool> = mesh.vertices.iter().map(|v| v.position[0] <= x0 + 3.0).collect();
+    let tris: Vec<Triangle> = mesh.triangles.iter().copied().filter(|t| t.indices.iter().all(|&i| keep[i as usize])).collect();
+    mesh = Mesh::from_geometry(mesh.vertices.clone(), tris);
+    mesh.recompute_normals();
+    let fair = fair_marker_sites_on_fills(&mut mesh, &rem.sites, &rem.outcomes, &MarkerConfig::default());
+    let centre: Vec<f32> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).filter(|p| p.x.hypot(p.y) < 1.5).map(|p| p.z - dome(p.x, p.y)).collect();
+    let centre = centre.iter().sum::<f32>() / centre.len() as f32;
+    eprintln!("rim site: {:?} / {:?}: faired centre {centre:+.4} mm off the dome", rem.outcomes[0].fill, fair[0]);
+    assert_eq!(fair[0].status, "faired", "{:?}", fair[0]);
+    assert!(centre.abs() < 0.01, "the faired patch sits {centre:+.3} mm off the dome");
+}
+
+/// Largest angle (degrees) between the normals of two faces sharing an edge, over the faces whose
+/// centroid lies within `r` of the z axis.
+fn worst_dihedral(mesh: &Mesh, r: f32) -> f32 {
+    let p = |i: u32| Vec3::from_array(mesh.vertices[i as usize].position);
+    let mut by_edge: std::collections::HashMap<(u32, u32), Vec<Vec3>> = std::collections::HashMap::new();
+    for t in &mesh.triangles {
+        let [a, b, c] = t.indices;
+        let g = (p(a) + p(b) + p(c)) / 3.0;
+        if g.x.hypot(g.y) >= r {
+            continue;
+        }
+        let n = (p(b) - p(a)).cross(p(c) - p(a)).normalize();
+        for (x, y) in [(a, b), (b, c), (c, a)] {
+            by_edge.entry((x.min(y), x.max(y))).or_default().push(n);
+        }
+    }
+    by_edge.values().filter(|v| v.len() == 2).map(|v| v[0].angle_between(v[1]).to_degrees()).fold(0f32, f32::max)
+}
+
+#[test]
+fn fairing_at_a_rim_site_does_not_fold_the_rolled_edge_inside_the_cut() {
+    // A dome rolling over a 3 mm radius edge from x = 5, inside the cut (the Revo part's S1-M1 and
+    // M4, where the rim runs through the cut), the mesh inside the cut a flat disc. Vertices on the
+    // start of the rolled edge that passed the hard limits (within 0.8 mm and 25° of the target)
+    // were moved onto the sheet in full while their neighbours further down stayed: the edge
+    // folded (dihedrals of 100° and more on the Revo part).
+    let (x0, re, end) = (5.0f32, 3.0f32, 7.4f32);
+    let dome = |x: f32, y: f32| -(x * x + y * y) / 160.0;
+    let f = move |x: f32, y: f32| dome(x, y) - if x > x0 { re - (re * re - (x - x0).min(re).powi(2)).sqrt() } else { 0.0 };
+    let pts: Vec<SolidPoint> = sheet_with_sticker(f, (0.0, 0.0)).into_iter().filter(|p| p.position.x <= end).collect();
+    let rem = remove_markers(&pts, &[site_at_origin()], &MarkerConfig { widen_max_mm: 0.0, ..MarkerConfig::default() }, None);
+    assert!(rem.outcomes[0].surface.is_some(), "{:?}", rem.outcomes[0]);
+    let cut_off = |mut mesh: Mesh| {
+        let keep: Vec<bool> = mesh.vertices.iter().map(|v| v.position[0] <= end).collect();
+        let tris: Vec<Triangle> = mesh.triangles.iter().copied().filter(|t| t.indices.iter().all(|&i| keep[i as usize])).collect();
+        mesh = Mesh::from_geometry(mesh.vertices.clone(), tris);
+        mesh.recompute_normals();
+        mesh
+    };
+    let truth = worst_dihedral(&cut_off(height_mesh_with_flat_disc(&f, 0.0)), 6.5);
+    let mut mesh = cut_off(height_mesh_with_flat_disc(&f, 6.5));
+    let before = worst_dihedral(&mesh, 6.5);
+    let fair = fair_marker_sites_on_fills(&mut mesh, &rem.sites, &rem.outcomes, &MarkerConfig::default());
+    let after = worst_dihedral(&mesh, 6.5);
+    eprintln!("rolled edge in the cut: {:?} / {:?}: worst dihedral inside the cut {after:.1} deg (before {before:.1}, the surface's own {truth:.1})", rem.outcomes[0].fill, fair[0]);
+    assert!(after < truth + 8.0, "fairing folded the rolled edge: dihedral {after:.1} deg (surface {truth:.1})");
+}

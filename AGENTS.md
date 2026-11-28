@@ -425,3 +425,14 @@ laser model are not built.
     discs +0.40 → +0.01 mm; the bracket screw hole is open in the solid (free radius 0.17 → 1.44 mm).
     Images are `E:\Claude\eval\mesh-fixes\compare_top.png` and `compare_bracket_hole.png`.
   - **Open:** see open-issues 2.3.
+- 2026-11-27 (original PC, branch `agent/mesh-fixes`) — **User:** the round "depressions" at the
+  marker sites are flat fills of the holes the stickers leave (in our solids and in Revo Scan's own
+  result); the 0.1 mm rounded-rectangle line on the outside is the paint boundary under a white
+  stripe, a real feature to keep. Fills now continue the curvature (`solid/sitefit.rs`): conic ring
+  quadric (exact on spheres and cylinders), band slopes only above the noise and capped to the
+  band's range, a plain ring fit elsewhere. Fairing: quality check again (M4, M36 left as meshed),
+  kept and M1 sites faired on the mesh ring, a rim's rolled edge carried in only locally, smooth
+  weights (no folds). Partial sites: the hull ignores the sticker, one stray casts no shadow.
+  Reconstruct's spacing is the mean of the middle fifth over all points (stable). 13 new tests, all
+  fail on 41e7b72. Open: the lattice suppression still depends on the support radius; see
+  open-issues 2.4.

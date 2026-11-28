@@ -10,28 +10,32 @@
 //!    1.3 mm of the marker's sheet along the axis (any normal: the disc edge and the dark ring carry
 //!    wild normals), or within `cut_height` and facing like the sheet (normal within 60°). The
 //!    height limit and the normal test keep the opposite wall, one wall thickness behind, intact.
-//! 2. **Infill:** the fill surface ([`super::sitefit`]: a robust quadric of the sheet in the
-//!    annulus `cut_radius .. cut_radius + fit_width` plus its low angular orders, continued into
-//!    the cut with value and slope matched at its edge, so the fill carries on the curvature of the
-//!    surface round it instead of standing out as a flat spot or a ring) is fitted to the points of
-//!    every scan (so the patch follows the average the solve makes of overlapping passes) and
-//!    sampled inside the cut on a 0.3 mm lattice. A site whose annulus is not covered all round (a rim) or too rough (a rib or
-//!    edge nearby) is not cut at all (`keep_unfillable`), since an unfilled cut can open a hole.
+//! 2. **Infill:** the fill surface ([`super::sitefit`]: a robust conic quadric of the sheet in the
+//!    annulus `cut_radius .. cut_radius + fit_width` and, where a curvature band runs through the
+//!    site, its low angular orders continued into the cut with value and slope matched at its edge,
+//!    so the fill carries on the curvature of the surface round it instead of standing out as a
+//!    flat spot or a ring) is fitted to the points of every scan (so the patch follows the average
+//!    the solve makes of overlapping passes) and sampled inside the cut on a 0.3 mm lattice. A site
+//!    whose annulus is not covered in enough sectors (a rim) or too rough (a rib or edge nearby) is
+//!    not cut at all (`keep_unfillable`), since an unfilled cut can open a hole.
 //!    Points that any site cuts (a neighbouring sticker) count for the coverage of an annulus but
 //!    are not fitted. At a site not covered all round, cut points more than 0.3 mm below or 1 mm
 //!    above its patch are the surface beyond the sheet (a rim's rolled edge, a side face, a rib
 //!    foot): they are not cut and the patch keeps clear of them. Where the cuts of two sites on one
 //!    sheet overlap, each lattice point belongs to the site it lies deepest in and is placed on a
 //!    blend of the covering patches, so the overlap carries one layer without a step. A patch of a
-//!    site not covered all round stays within the convex hull of the sheet round it and never
-//!    reaches behind surface going down in the cut (a rim's side face under a sticker hanging over
-//!    the rim).
-//! 3. **Fairing** ([`fair_sites`], after meshing): the mesh inside the cut goes onto the site's
-//!    fill surface, met by the mesh round the cut, which removes any dent or bump the solve left.
-//!    Overlapping sites share the vertices they both move (weighted mean of their displacements).
+//!    site not covered all round stays within the convex hull of the sheet round it (the annulus
+//!    and the cut's outer 0.4 mm, beyond the sticker) and never reaches behind surface going down
+//!    in the cut (a rim's side face under a sticker hanging over the rim: six cut points or more
+//!    below the patch, in directions without annulus surface).
+//! 3. **Fairing** ([`fair_sites`], after meshing): where the mesh round the cut is smooth sheet,
+//!    the mesh inside the cut goes onto the site's fill surface (a fit of the mesh annulus at a
+//!    site that has none), met by the mesh round the cut, which removes any dent or bump the solve
+//!    left. Overlapping sites share the vertices they both move (weighted mean of their
+//!    displacements).
 
 use super::grid::{FxMap, PointGrid};
-use super::sitefit::{convex_hull, fit_site, outside_hull, RingSample, SiteFitParams, SiteSurface};
+use super::sitefit::{convex_hull, fit_site, outside_hull, RingSample, SiteFitParams, SiteSurface, RING_NORMAL_MAX_DEG};
 use super::{PointKind, WorkPoint};
 use glam::{DVec3, Vec3};
 use rayon::prelude::*;
@@ -87,10 +91,12 @@ pub struct MarkerConfig {
     /// Sites closer than this (centres, same facing) are merged into one site before the cut
     /// (the same sticker listed once per scan).
     pub merge_mm: f32,
-    /// After meshing, re-fit each site on the mesh annulus and blend the mesh inside the cut onto
-    /// that fit ([`fair_sites`]).
+    /// After meshing, put the mesh inside each site's cut onto the site's fill surface (or, for a
+    /// site that was kept or left to the solve, onto a fit of the mesh annulus), met by the mesh
+    /// round the cut ([`fair_sites`]).
     pub fair_mesh: bool,
-    /// Mesh annulus RMS limit for the fairing (the mesh is smoother than the data).
+    /// Mesh annulus RMS limit for the fairing (the mesh is smoother than the data): a site whose
+    /// mesh annulus is rougher (a rim, an edge) is left as meshed.
     pub fair_rms_max_mm: f32,
     /// Width of the band beyond the cut whose residual against the fit is carried into the faired
     /// patch (see [`fair_sites`]).
@@ -165,7 +171,7 @@ pub struct MarkerOutcome {
 pub struct FairOutcome {
     /// "faired", or why the site was left as meshed.
     pub status: String,
-    /// Mesh annulus RMS against its own quadric (mm).
+    /// Mesh annulus RMS against a robust quadric of its own (mm; the fairing's quality check).
     pub ring_rms_mm: f32,
     /// Mean and largest deviation of the mesh inside the cut from the annulus quadric before the
     /// fairing (mm; a dent is negative).
@@ -184,22 +190,102 @@ pub(crate) fn tangent_frame(n: Vec3) -> (Vec3, Vec3) {
 
 /// Least-squares height field z = c0 + c1 u + c2 v + c3 u² + c4 uv + c5 v², optionally with the
 /// cubic terms c6 u³ + c7 u²v + c8 uv² + c9 v³ ([`Quadric::fit_robust_cubic`]; zero otherwise).
+///
+/// With c10 = κ > 0 the quadratic part Q = c3 u² + c4 uv + c5 v² enters as the sag of a conic,
+/// 2Q / (1 + sqrt(1 − 2κ|Q|)), κ the largest principal curvature of Q ([`Quadric::fit_conic`]):
+/// exact on a sphere or a cylinder of any radius, where a quadric fitted to a ring round a site
+/// misses the centre by about r⁴/8R³ (0.11 mm on a ball of R 15 mm), and the same as Q on a gently
+/// curved sheet.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Quadric(pub [f64; 10]);
+pub(crate) struct Quadric(pub [f64; 11]);
 
 impl Quadric {
+    /// The conic factor of the quadratic part: g = 2 / (1 + s) and d(gQ)/dQ, s = sqrt(1 − 2κ|Q|).
+    #[inline]
+    fn conic(&self, q2: f64) -> (f64, f64) {
+        let k = self.0[10];
+        if k == 0.0 {
+            return (1.0, 1.0);
+        }
+        let s = (1.0 - 2.0 * k * q2.abs()).max(0.0025).sqrt();
+        let g = 2.0 / (1.0 + s);
+        (g, g + 2.0 * k * q2.abs() / (s * (1.0 + s) * (1.0 + s)))
+    }
     #[inline]
     pub fn eval(&self, u: f64, v: f64) -> f64 {
         let c = &self.0;
-        c[0] + c[1] * u + c[2] * v + c[3] * u * u + c[4] * u * v + c[5] * v * v + c[6] * u * u * u + c[7] * u * u * v + c[8] * u * v * v + c[9] * v * v * v
+        let q2 = c[3] * u * u + c[4] * u * v + c[5] * v * v;
+        c[0] + c[1] * u + c[2] * v + self.conic(q2).0 * q2 + c[6] * u * u * u + c[7] * u * u * v + c[8] * u * v * v + c[9] * v * v * v
     }
     #[inline]
     pub fn grad(&self, u: f64, v: f64) -> (f64, f64) {
         let c = &self.0;
+        let d = self.conic(c[3] * u * u + c[4] * u * v + c[5] * v * v).1;
         (
-            c[1] + 2.0 * c[3] * u + c[4] * v + 3.0 * c[6] * u * u + 2.0 * c[7] * u * v + c[8] * v * v,
-            c[2] + c[4] * u + 2.0 * c[5] * v + c[7] * u * u + 2.0 * c[8] * u * v + 3.0 * c[9] * v * v,
+            c[1] + d * (2.0 * c[3] * u + c[4] * v) + 3.0 * c[6] * u * u + 2.0 * c[7] * u * v + c[8] * v * v,
+            c[2] + d * (c[4] * u + 2.0 * c[5] * v) + c[7] * u * u + 2.0 * c[8] * u * v + 3.0 * c[9] * v * v,
         )
+    }
+
+    /// Largest principal curvature magnitude of the quadratic part at the apex.
+    fn kappa_max(&self) -> f64 {
+        let (a, b, d) = (self.0[3], 0.5 * self.0[4], self.0[5]);
+        let (m, r) = (0.5 * (a + d), (0.25 * (a - d) * (a - d) + b * b).sqrt());
+        2.0 * (m.abs() + r)
+    }
+
+    /// The quadric over the samples marked in `keep`, refined to a conic (see the type) unless that
+    /// fits them clearly worse: a few fixed-point steps, each a linear fit with the conic factor of
+    /// the previous fit.
+    pub(crate) fn fit_conic(s: &[(f64, f64, f64)], keep: &[bool]) -> Option<Quadric> {
+        let quad = Self::fit_once::<6>(s, keep)?;
+        let rq = rms_of(s, keep, &quad);
+        let mut q = quad;
+        for _ in 0..6 {
+            let k = q.kappa_max();
+            if !(k > 1e-6) {
+                return Some(quad);
+            }
+            let prev = Quadric({
+                let mut c = q.0;
+                c[10] = k;
+                c
+            });
+            let mut a = [[0f64; 6]; 6];
+            let mut b = [0f64; 6];
+            let mut n = 0usize;
+            for (&(u, v, z), &kk) in s.iter().zip(keep) {
+                if !kk {
+                    continue;
+                }
+                let g = prev.conic(prev.0[3] * u * u + prev.0[4] * u * v + prev.0[5] * v * v).0;
+                let f = [1.0, u, v, g * u * u, g * u * v, g * v * v];
+                for i in 0..6 {
+                    b[i] += f[i] * z;
+                    for j in 0..6 {
+                        a[i][j] += f[i] * f[j];
+                    }
+                }
+                n += 1;
+            }
+            if n < 12 {
+                return Some(quad);
+            }
+            for (i, row) in a.iter_mut().enumerate() {
+                row[i] += 1e-9 * (1.0 + row[i]);
+            }
+            let x = solve(a, b)?;
+            let mut c = [0f64; 11];
+            c[..6].copy_from_slice(&x);
+            c[10] = k;
+            q = Quadric(c);
+        }
+        let k = q.kappa_max();
+        q.0[10] = k;
+        // Over a ring the two fit about equally well (the quadric takes up the conic's r⁴ term
+        // with its constant and its curvature): they differ in what they extrapolate into the cut.
+        // The conic is kept unless it clearly fits worse.
+        Some(if rms_of(s, keep, &q) <= 1.05 * rq + 1e-4 { q } else { quad })
     }
 
     /// One least-squares fit over the samples marked in `keep` (N = 6: quadric, 10: cubic).
@@ -233,7 +319,7 @@ impl Quadric {
             row[i] += 1e-9 * (1.0 + row[i]);
         }
         let x = solve(a, b)?;
-        let mut c = [0f64; 10];
+        let mut c = [0f64; 11];
         c[..N].copy_from_slice(&x);
         Some(Quadric(c))
     }
@@ -472,6 +558,9 @@ fn fit_params(rc: f32, all_round: bool, rough_mm: f32, band_mm: f32, mls_mm: f64
     SiteFitParams { rc: rc as f64, band: band_mm.max(1.0) as f64, mls_mm, all_round, rough_mm: rough_mm as f64, slopes }
 }
 
+/// A mesh vertex inside the cut is faired in full when its normal is within about 18° of the
+/// target's (cosine), less up to 25° ([`fair_sites`]).
+const FAIR_FULL_FACING: f32 = 0.95;
 /// Moving-least-squares width of the band remainder for scan points and for mesh vertices (mm).
 const MLS_POINTS_MM: f64 = 1.2;
 const MLS_MESH_MM: f64 = 0.7;
@@ -494,6 +583,13 @@ struct Patch {
 const PARTIAL_CUT_BELOW_MM: f64 = 0.3;
 /// ... and more than this above it (a rib foot or a rim rising; a sticker is ~0.4 mm proud).
 const PARTIAL_CUT_ABOVE_MM: f64 = 1.0;
+/// Fewest cut points below the patch, in directions without annulus surface, that make a side face
+/// the patch keeps behind ([`PartialCover::behind_rim`]).
+const PARTIAL_BELOW_MIN_POINTS: usize = 6;
+/// Cut points on the patch count as the sheet for the hull of a partial site only this close to the
+/// cut's edge (mm inside it): further in they may be the sticker (its edge ramp, or a thin sticker
+/// within 0.15 mm of the sheet), which over a rim is not surface.
+const PARTIAL_SHEET_EDGE_MM: f32 = 0.4;
 
 /// For a site not covered all round: the lattice cells (index pairs at `fill_spacing_mm`) the cut
 /// took points from, grown by one cell; the mask of the [`FINE_SECTORS`] directions in which the
@@ -606,8 +702,9 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
         .into_iter()
         .enumerate()
         .map(|(k, cut)| {
-            let SiteFitOut { out, surf, .. } = &mut fits[k];
+            let SiteFitOut { out, surf, mask, .. } = &mut fits[k];
             let Some(q) = surf.as_ref() else { return cut };
+            let mask = *mask;
             if out.sectors_covered >= 8 {
                 return cut;
             }
@@ -617,14 +714,20 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
                 (-PARTIAL_CUT_BELOW_MM..=PARTIAL_CUT_ABOVE_MM).contains(&r)
             });
             out.cut_points = on.len();
+            // Surface going down beyond the rim lies where the annulus has no sheet: a point below
+            // the patch in a direction the sheet covers is a stray (a laser line, the dark border's
+            // flare), and one point is no side face either.
             below[k] = off
                 .iter()
                 .copied()
                 .filter(|&i| {
                     let (u, v, h) = frames[k].local(pts[i as usize].p);
-                    (h as f64) < q.eval(u as f64, v as f64) - PARTIAL_CUT_BELOW_MM
+                    (h as f64) < q.eval(u as f64, v as f64) - PARTIAL_CUT_BELOW_MM && !direction_covered(mask, u, v)
                 })
                 .collect();
+            if below[k].len() < PARTIAL_BELOW_MIN_POINTS {
+                below[k].clear();
+            }
             beyond[k] = off;
             on
         })
@@ -651,7 +754,8 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
                     }
                     cells
                 };
-                // The sheet: the annulus samples and the cut points on the patch (not the sticker).
+                // The sheet: the annulus samples and the cut points on the patch at the edge of the
+                // cut, beyond the sticker.
                 let mut sheet = std::mem::take(&mut fo.ring_uv);
                 let origin = if sheet.is_empty() {
                     (0.0, 0.0)
@@ -659,9 +763,10 @@ pub(crate) fn cut_and_fill(pts: &mut Vec<WorkPoint>, markers: &[Marker], prm: &M
                     let (a, b) = sheet.iter().fold((0.0, 0.0), |acc, p| (acc.0 + p.0, acc.1 + p.1));
                     (a / sheet.len() as f32, b / sheet.len() as f32)
                 };
+                let edge = frames[k].rc - PARTIAL_SHEET_EDGE_MM;
                 for &i in &cuts[k] {
                     let (u, v, h) = frames[k].local(pts[i as usize].p);
-                    if (h as f64 - q.eval(u as f64, v as f64)).abs() < 0.15 {
+                    if (h as f64 - q.eval(u as f64, v as f64)).abs() < 0.15 && u * u + v * v >= edge * edge {
                         sheet.push((u, v));
                     }
                 }
@@ -1014,16 +1119,19 @@ pub(crate) fn merge_sites(sites: &[Marker], prm: &MarkerConfig) -> Vec<Marker> {
 /// within 60° of the site normal, within 2 mm of the site plane) in the annulus
 /// `cut .. cut + fit_width` are collected; vertices inside the cut of another site on the same
 /// sheet count for the coverage but are not used. The target surface inside the cut is
-/// - with `fills` (the sites' fill surfaces from the scan points, [`cut_and_fill`]): the site's
-///   fill surface met by the mesh round the cut ([`SiteSurface::met_by`]: the mesh's remainder in
-///   the `fair_blend_mm` band carried in harmonically), so the patch keeps the slope and curvature
-///   of the scan points round the cut and meets the mesh there without a step;
-/// - without (a mesh on its own): the fill surface of the mesh annulus ([`fit_site`]), when the
-///   annulus is smooth (RMS ≤ `fair_rms_max_mm` against the fit).
+/// - where `fills` holds the site's fill surface from the scan points ([`cut_and_fill`]): that
+///   surface met by the mesh round the cut ([`SiteSurface::met_by`]: the mesh's remainder in the
+///   `fair_blend_mm` band carried in harmonically), so the patch keeps the slope and curvature of
+///   the scan points round the cut and meets the mesh there without a step;
+/// - elsewhere (a site that was kept or left to the solve, or a mesh on its own): the fill surface
+///   of the mesh annulus ([`fit_site`]), met by the mesh the same way.
+///
+/// Either way only where the mesh annulus is smooth sheet: RMS ≤ `fair_rms_max_mm` against a
+/// robust quadric with 60 % of its vertices kept, which a rim or an edge in the annulus fails.
 ///
 /// With the annulus covered in at least `partial_min_sectors` of 8 sectors, every vertex inside the
-/// cut that lies on the target (within 0.8 mm and facing like it within 25°) is moved along the
-/// site normal onto it; the band itself is not moved. A vertex moved by several sites gets the
+/// cut that lies on the target (within 0.8 mm and facing like it within 25°, in full within 0.6 mm
+/// and 18°) is moved along the site normal onto it; the band itself is not moved. A vertex moved by several sites gets the
 /// mean of their displacements, so overlapping sites neither undo each other nor leave a step.
 /// At a site not covered all round, moves of more than 0.25 mm fade out towards the directions
 /// without mesh surface round the cut (an open rim, whose rolled edge is not the sheet the fit
@@ -1143,53 +1251,81 @@ fn fair_one(
     // points (Make Solid, Reconstruct): that surface, met by the mesh round the cut (the band's
     // remainder carried in harmonically, [`SiteSurface::met_by`]), so the patch keeps the slope and
     // curvature the scan points show round the cut (the solve's smoothing round the site, carried
-    // in C1, would tilt the patch) and meets the mesh round it without a step. Without one (a mesh
-    // on its own), the fill surface of the mesh annulus ([`fit_site`]): the ring fit and its low
-    // orders continued C1 into the cut, plus the band's remainder. The surface beyond the cut stays
-    // where it is.
+    // in C1, would tilt the patch) and meets the mesh round it without a step. Without one (a site
+    // that was kept or left to the solve, or a mesh on its own), the fill surface of the mesh
+    // annulus ([`fit_site`]), met by the mesh the same way. The surface beyond the cut stays where
+    // it is.
     let band = prm.fair_blend_mm.max(1.0) as f64;
+    // The mesh round the cut must be smooth sheet (RMS against a robust ring quadric within
+    // `fair_rms_max_mm`, most vertices on it): at a rim or an edge the ring holds the rolled edge,
+    // and moving the vertices inside the cut onto any surface there folds it (S1-M4, M36).
+    let ring: Vec<(f64, f64, f64)> = ann.iter().map(|x| (x.u, x.v, x.h)).collect();
+    let Some((_, ring_rms, ring_kept)) = Quadric::fit_annulus(&ring, 0.5 * prm.fair_rms_max_mm as f64, sectors == 8) else {
+        return fail("quadric fit failed".into(), nan);
+    };
+    let ring_rms_mm = ring_rms as f32;
+    if ring_rms > prm.fair_rms_max_mm as f64 || (ring_kept as f64) < 0.6 * ann.len() as f64 {
+        return fail(format!("annulus RMS {:.3} mm ({ring_kept}/{} kept)", ring_rms, ann.len()), ring_rms_mm);
+    }
     let params = fit_params(rc, sectors == 8, 0.5 * prm.fair_rms_max_mm, prm.fair_blend_mm, MLS_MESH_MM, prm.continue_band_slopes);
     let owned;
-    let (surf, rms) = match fill {
-        Some(None) => return fail("not filled".into(), nan),
-        Some(Some(data)) => match data.met_by(&ann, band, MLS_MESH_MM, 0.5) {
+    let surf = match fill.flatten() {
+        Some(data) => match data.met_by(&ann, band, MLS_MESH_MM, 0.5) {
             Some(s) => {
                 owned = s;
-                (&owned, 0.0)
+                &owned
             }
-            None => return fail("the mesh round the cut is off the fill surface".into(), nan),
+            None => return fail("the mesh round the cut is off the fill surface".into(), ring_rms_mm),
         },
+        // A site with no fill surface (kept, or left to the solve) or a mesh on its own: the fill
+        // surface of the mesh annulus, met by the mesh round the cut.
         None => {
             let Some(fit) = fit_site(&ann, &params) else {
-                return fail("quadric fit failed".into(), nan);
+                return fail("quadric fit failed".into(), ring_rms_mm);
             };
-            let (rms, kept) = (fit.rms_model, fit.kept);
-            if rms > prm.fair_rms_max_mm as f64 || (kept as f64) < 0.6 * ann.len() as f64 {
-                return fail(format!("annulus RMS {:.3} mm ({kept}/{} kept)", rms, ann.len()), rms as f32);
-            }
-            // Met by the mesh round the cut, so the patch has no step at the cut.
             owned = fit.surf.met_by(&ann, band, MLS_MESH_MM, 0.5).unwrap_or(fit.surf);
-            (&owned, rms)
+            &owned
         }
     };
-    let mut inner: Vec<(u32, f64, f64, f64)> = Vec::new();
+    // Directions in which the mesh round the cut is there but not on the target (fewer than a
+    // quarter of its band vertices within 0.3 mm and facing like it): a rim's rolled edge or a side
+    // face beyond the cut, where the sheet does not go on. Inside the cut the mesh there is the
+    // start of that edge, not the sheet, and is left where it is (up to 1.5 mm in from the cut,
+    // fading out by 3 mm).
+    let rolled = {
+        let cos_max = RING_NORMAL_MAX_DEG.to_radians().cos();
+        let (mut on, mut all) = ([0u32; FINE_SECTORS], [0u32; FINE_SECTORS]);
+        for x in &ann {
+            let r = x.u.hypot(x.v);
+            if r < rc as f64 + band {
+                let k = fine_sector(x.u as f32, x.v as f32);
+                all[k] += 1;
+                on[k] += ((x.h - surf.eval(x.u, x.v)).abs() <= 0.3 && x.n.dot(surf.normal(x.u, x.v)) >= cos_max) as u32;
+            }
+        }
+        (0..FINE_SECTORS).filter(|&k| all[k] >= 4 && 4 * on[k] < all[k]).fold(0u32, |m, k| m | 1 << k)
+    };
+    // Vertices on the target inside the cut (within 0.8 mm, facing like it within 25°), with a
+    // weight that fades to 0 towards both limits: a hard limit moves one vertex of a rolled edge
+    // or a rib's flank fully and leaves its neighbour, which folds the edge.
+    let mut inner: Vec<(u32, f64, f64, f64, f32)> = Vec::new();
     for &i in &cand {
         let (u, v, h) = f.local(pos[i as usize]);
         let (u, v, h) = (u as f64, v as f64, h as f64);
-        if (surf.eval(u, v) - h).abs() > 0.8 {
+        let off = (surf.eval(u, v) - h).abs() as f32;
+        let facing = vnormal[i as usize].dot(f.world_dir(surf.normal(u, v)));
+        if off > 0.8 || facing < 0.9 {
             continue;
         }
-        if vnormal[i as usize].dot(f.world_dir(surf.normal(u, v))) < 0.9 {
-            continue;
-        }
-        inner.push((i, u, v, h));
+        let w = ((0.8 - off) / 0.2).clamp(0.0, 1.0) * ((facing - 0.9) / (FAIR_FULL_FACING - 0.9)).clamp(0.0, 1.0);
+        inner.push((i, u, v, h, w));
     }
     if inner.len() < 20 {
-        return fail(format!("only {} mesh vertices on the sheet inside the cut", inner.len()), rms as f32);
+        return fail(format!("only {} mesh vertices on the sheet inside the cut", inner.len()), ring_rms_mm);
     }
     let (mut sum, mut max_before) = (0f64, 0f64);
     let mut moves = Vec::with_capacity(inner.len());
-    for &(i, u, v, h) in &inner {
+    for &(i, u, v, h, w) in &inner {
         let dz = surf.eval(u, v) - h;
         sum += -dz;
         max_before = max_before.max(dz.abs());
@@ -1197,10 +1333,16 @@ fn fair_one(
         // directions in which the mesh has surface round it: towards an open rim the fit is an
         // extrapolation and the mesh there is the rim's own rolled edge, which falls away from it.
         // Towards a mere gap in the annulus the sheet goes on, and the moves stay small: up to
-        // 0.25 mm they are made in full, fading out by 0.5 mm. Both weights are continuous (the
-        // direction weight fades over two directions), so the patch shows no seam.
-        let weight = if sectors < 8 {
-            direction_weight(mask, u as f32, v as f32).max(((0.5 - dz.abs() as f32) / 0.25).clamp(0.0, 1.0))
+        // 0.25 mm they are made in full, fading out by 0.5 mm. In any direction a vertex more than
+        // 0.3 mm below the target is the start of a rim's rolled edge inside the cut (the infill
+        // leaves such points, [`PARTIAL_CUT_BELOW_MM`]), and its move fades out by 0.5 mm. All
+        // weights are continuous (the direction weight fades over two directions), so the patch
+        // shows no seam.
+        // (Only near the cut's edge: further in, towards the centre, every direction meets.)
+        let away = if rolled == 0 { 1.0 } else { 1.0 - direction_weight(rolled, u as f32, v as f32) * ((u.hypot(v) as f32 - (rc - 3.0)) / 1.5).clamp(0.0, 1.0) };
+        let weight = w * away * if sectors < 8 {
+            let below = ((0.5 - dz as f32) / (0.5 - PARTIAL_CUT_BELOW_MM as f32)).clamp(0.0, 1.0);
+            (direction_weight(mask, u as f32, v as f32) * below).max(((0.5 - dz.abs() as f32) / 0.25).clamp(0.0, 1.0))
         } else {
             1.0
         };
@@ -1210,7 +1352,7 @@ fn fair_one(
     }
     let out = FairOutcome {
         status: "faired".into(),
-        ring_rms_mm: rms as f32,
+        ring_rms_mm,
         mean_before_mm: (sum / inner.len() as f64) as f32,
         max_before_mm: max_before as f32,
         vertices: moves.len(),

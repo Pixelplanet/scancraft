@@ -2520,9 +2520,10 @@ impl ScanCraftApp {
                         sm.smooth(&mut mesh);
                     }
                     // The filled marker sites go onto their fill surfaces (the surface round each cut
-                    // continued into it), flush with the mesh around them.
+                    // continued into it), flush with the mesh around them; a kept sticker onto a fit
+                    // of the mesh round it.
                     let filled: Vec<_> = prep.marker_sites.iter().zip(&prep.marker_outcomes).filter(|(_, o)| o.fill.starts_with("quadric")).map(|(m, _)| m.clone()).collect();
-                    if !filled.is_empty() {
+                    if !prep.marker_sites.is_empty() {
                         scancraft_mesh::solid::fair_marker_sites_on_fills(&mut mesh, &prep.marker_sites, &prep.marker_outcomes, &prepare.markers);
                     }
                     let analysis = Mesher::analyze(&mesh);

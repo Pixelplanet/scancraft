@@ -549,7 +549,8 @@ pub fn fair_marker_sites(mesh: &mut Mesh, sites: &[Marker], cfg: &MarkerConfig) 
 /// Mesh-level marker fairing after a marker removal ([`crate::prepare_points`],
 /// [`remove_markers`]): `outcomes` are the removal's, one per site in `sites`. The mesh inside
 /// each filled cut goes onto the site's fill surface from the scan points, met by the mesh round
-/// the cut; sites that were not filled are left alone.
+/// the cut; at a site that was kept or left to the solve, onto a fit of the mesh annulus. Sites
+/// whose mesh annulus is rough (a rim, an edge) are left as meshed ([`MarkerConfig::fair_rms_max_mm`]).
 pub fn fair_marker_sites_on_fills(mesh: &mut Mesh, sites: &[Marker], outcomes: &[MarkerOutcome], cfg: &MarkerConfig) -> Vec<FairOutcome> {
     let fills: Vec<Option<markers_fill::SiteSurface>> = sites.iter().enumerate().map(|(k, _)| outcomes.get(k).and_then(|o| o.surface.clone())).collect();
     fair_mesh_sites(mesh, sites, Some(&fills), cfg)
