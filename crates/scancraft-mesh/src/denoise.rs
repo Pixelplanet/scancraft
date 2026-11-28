@@ -87,19 +87,33 @@ fn face_geometry(pos: &[Vec3], tris: &[[u32; 3]]) -> (Vec<Vec3>, Vec<Vec3>, Vec<
 
 impl FeatureSmoother {
     pub fn smooth(&self, mesh: &mut Mesh) {
-        let n = mesh.vertices.len();
-        let tris: Vec<[u32; 3]> = mesh.triangles.iter().map(|t| t.indices).filter(|t| t.iter().all(|&i| (i as usize) < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]).collect();
-        if n == 0 || tris.is_empty() {
+        let tris: Vec<[u32; 3]> = mesh.triangles.iter().map(|t| t.indices).collect();
+        let mut pos: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).collect();
+        if !self.smooth_positions(&mut pos, &tris) {
             return;
         }
+        for (v, p) in mesh.vertices.iter_mut().zip(&pos) {
+            v.position = p.to_array();
+        }
+        mesh.update_bbox();
+        mesh.recompute_normals();
+    }
+
+    /// [`smooth`](Self::smooth) on bare positions and triangles (topology unchanged). Returns
+    /// `false` when there was nothing to smooth.
+    pub(crate) fn smooth_positions(&self, pos: &mut Vec<Vec3>, tris: &[[u32; 3]]) -> bool {
+        let n = pos.len();
+        let tris: Vec<[u32; 3]> = tris.iter().copied().filter(|t| t.iter().all(|&i| (i as usize) < n) && t[0] != t[1] && t[1] != t[2] && t[0] != t[2]).collect();
+        if n == 0 || tris.is_empty() {
+            return false;
+        }
         let vf = VertexFaces::build(n, &tris);
-        let mut pos: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).collect();
         // Vertex neighbours (through faces) for the fold repair.
         if self.repair_folds {
-            repair_folds(&mut pos, &tris, &vf);
+            repair_folds(pos, &tris, &vf);
         }
         if self.iterations > 0 {
-            let (centroids, _, _) = face_geometry(&pos, &tris);
+            let (centroids, _, _) = face_geometry(pos, &tris);
             // Spatial scale: mean distance between the centroids of faces sharing a vertex.
             let sigma_c = {
                 let step = (n / 20_000).max(1);
@@ -123,7 +137,7 @@ impl FeatureSmoother {
             let inv_2c2 = 1.0 / (2.0 * sigma_c * sigma_c);
             let inv_2s2 = 1.0 / (2.0 * self.sigma_normal * self.sigma_normal);
             for _ in 0..self.iterations {
-                let (centroids, normals, areas) = face_geometry(&pos, &tris);
+                let (centroids, normals, areas) = face_geometry(pos, &tris);
                 // Filter each face normal over the faces sharing a vertex with it.
                 let filtered: Vec<Vec3> = (0..tris.len())
                     .into_par_iter()
@@ -144,7 +158,7 @@ impl FeatureSmoother {
                     .collect();
                 // Move vertices so their faces follow the filtered normals.
                 for _ in 0..self.vertex_steps {
-                    let (centroids, _, _) = face_geometry(&pos, &tris);
+                    let (centroids, _, _) = face_geometry(pos, &tris);
                     let next: Vec<Vec3> = (0..n)
                         .into_par_iter()
                         .map(|v| {
@@ -161,15 +175,11 @@ impl FeatureSmoother {
                             x + d / f.len() as f32
                         })
                         .collect();
-                    pos = next;
+                    *pos = next;
                 }
             }
         }
-        for (v, p) in mesh.vertices.iter_mut().zip(&pos) {
-            v.position = p.to_array();
-        }
-        mesh.update_bbox();
-        mesh.recompute_normals();
+        true
     }
 }
 

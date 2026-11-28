@@ -10,6 +10,23 @@ The public repository starts from one squashed commit; the commit-by-commit hist
 
 ## 1. Where things stand
 
+**Update 2026-11-27 (original PC, branch `agent/mesh-fixes`).**
+
+- **The marker "depressions" are flat fills** (user). Every sticker leaves a hole in the scan.
+  Our solids and Revo Scan's own result fill it with a flat spot, and on the curved dome a flat
+  spot looks like a dent.
+- **Fixed:** the fill continues the curvature round each site. The ring fit is a conic quadric
+  (exact on spheres and cylinders). A curvature band is continued with its slope only where that
+  is safe, and the fairing no longer sinks or folds rim sites. M1 and M4 no longer show a disc or a
+  dent. Reconstruct's point-spacing estimate no longer jumps when a few points change.
+- **The 0.1 mm rounded-rectangle line on the outside is real:** the boundary between two paint
+  colours under a white stripe. Keep it.
+- **Still open:** Reconstruct's laser-lattice suppression still depends on the support radius (one
+  pit left at the upper hinge), the rim bulge at M36, faint domes at M43 and S2-M44 in Reconstruct,
+  fills smoother than the scanned texture.
+
+Numbers and the open list are in [open-issues.md](open-issues.md) §2.4.
+
 **Update 2026-11-26 (branch `agent/project-file`, not merged): projects open with a
 double-click.** A project is a folder with `<name>.scancraft` (older `project.json` folders still
 open) or one `.scancraftz` bundle, which the app unpacks into a working folder while its tab is
@@ -22,6 +39,22 @@ Read-Only, a save over someone else's version asks Save Anyway / Save As…, Add
 bundles, Open / Add Project Folder… are on the app bar buttons' right-click, unknown project-file
 fields are kept. Details, decisions and what is left: [open-issues.md](open-issues.md)
 4.1; layout: [architecture/scan-sessions.md](architecture/scan-sessions.md) section 8.
+
+**Update 2026-11-26 (original PC, branch `agent/mesh-fixes`).**
+
+- **No lettering.** The user confirmed that the Revo shell part's top is smooth. There is no
+  moulded lettering or pad: every feature on its smooth surfaces is a marker sticker site or a
+  cross-line laser artefact.
+- **Fixed:**
+  - Reconstruct now prepares the points: it drops strays and cuts and refills the listed
+    stickers.
+  - Make Solid drops laser strays per scan and equalises a scan's offset.
+  - Marker sites are faired flush in both tools.
+  - The bracket's screw hole stays open.
+- **Still open:** some sites at rim edges, faint lattice dots in the solid, the new mesher
+  filling screw-boss recesses, a sticker cut out of S2 by Isolate Object.
+
+Numbers and the open list are in [open-issues.md](open-issues.md) §2.3.
 
 **Update 2026-11-24 late (original PC): start with [open-issues.md](open-issues.md).** The branch
 below is merged into `main`. A review found bugs in it, and the new mesher was compared with the

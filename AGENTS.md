@@ -421,6 +421,27 @@ laser model are not built.
   `packaging/windows/install.ps1` / `uninstall.ps1` (not run). Not tested with a real window or
   double-click. Status in `docs/open-issues.md` 4.1. The user's report about marker depressions
   and cross-line laser artifacts on the top surface of the part was not addressed in this track.
+- 2026-11-26 (original PC, branch `agent/mesh-fixes`) — **User ground truth:** the Revo shell
+  part's top is perfectly smooth. Every feature on it in our meshes is either a marker sticker site
+  or a cross-line laser artefact. The "moulded lettering" of open-issues 2.2 (and the line about it
+  in the 2026-11-25 entry above) is a lattice of laser strays about 0.8 mm behind S3's inner
+  surface; the two-pass scan's "moulded pad" is very probably a sticker.
+  - **Reconstruct** prepares the merged points: `scancraft_mesh::prepare_points`, with the
+    settings "Suppress scan artefacts" and "Remove marker stickers".
+  - **Make Solid** gets `prep::drop_behind_strays` per scan, `equalise_scan_offsets` (no chained
+    shifts) and `drop_rough_layers`, plus feature smoothing.
+  - **Marker sites** (both tools):
+    - the cut grows over Revo's empty ring;
+    - partly covered sites are patched only where the scan has surface;
+    - the ring fit falls back to a cubic where a quadric leaves a rough annulus;
+    - fairing puts the patch on the fit plus the interpolated ring residual (no blend ring);
+    - Revo entries with r < 2 mm are ignored.
+  - **Screw holes:** a detected "hole" that opens into a bore wall is no marker, and the hole
+    filler keeps through-holes.
+  - **Results:** lattice relief 0.31 → 0.004 mm (Reconstruct) and 0.015 → 0.005 mm (solid); sticker
+    discs +0.40 → +0.01 mm; the bracket screw hole is open in the solid (free radius 0.17 → 1.44 mm).
+    Images are `E:\Claude\eval\mesh-fixes\compare_top.png` and `compare_bracket_hole.png`.
+  - **Open:** see open-issues 2.3.
 - 2026-11-27 (branch `agent/project-file`) — Shared-folder project files: save-conflict question
   (Save Anyway / Save As…), lock question for another PC (Take Over / Open Read-Only), Add Project
   with bundles, folder entries in the dialogs, second-start options named, unknown project-file
@@ -429,3 +450,14 @@ laser model are not built.
   taken back on save, project paths outside the project folder (absolute, `..`, UNC) are refused
   on open. Unit tests only, nothing tried in a window or Explorer. Status in
   `docs/open-issues.md` 4.1.
+- 2026-11-27 (original PC, branch `agent/mesh-fixes`) — **User:** the round "depressions" at the
+  marker sites are flat fills of the holes the stickers leave (in our solids and in Revo Scan's own
+  result); the 0.1 mm rounded-rectangle line on the outside is the paint boundary under a white
+  stripe, a real feature to keep. Fills now continue the curvature (`solid/sitefit.rs`): conic ring
+  quadric (exact on spheres and cylinders), band slopes only above the noise and capped to the
+  band's range, a plain ring fit elsewhere. Fairing: quality check again (M4, M36 left as meshed),
+  kept and M1 sites faired on the mesh ring, a rim's rolled edge carried in only locally, smooth
+  weights (no folds). Partial sites: the hull ignores the sticker, one stray casts no shadow.
+  Reconstruct's spacing is the mean of the middle fifth over all points (stable). 13 new tests, all
+  fail on 41e7b72. Open: the lattice suppression still depends on the support radius; see
+  open-issues 2.4.

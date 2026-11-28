@@ -510,3 +510,315 @@ fn implicit_surface_has_round_open_edges() {
     let rms = (d.iter().map(|y| (y - mean).powi(2)).sum::<f32>() / d.len() as f32).sqrt();
     assert!(rms < 0.1, "the rim wanders {rms} mm around its line (stairs of a 0.7 mm cell: 0.2 mm)");
 }
+
+
+// ---------------------------------------------------------------- preparation (prepare.rs)
+
+/// The back face of a 3 mm wall under the xy rectangle [0, w] x [0, h]: z = -3, facing -z.
+fn back_face(c: &mut PointCloud, w: f32, h: f32) {
+    let (ni, nj) = ((w / 0.5) as usize, (h / 0.5) as usize);
+    for i in 0..=ni {
+        for j in 0..=nj {
+            let idx = 50_000 + i * (nj + 1) + j;
+            c.push(pt(Vec3::new(i as f32 * 0.5 + jitter(idx, 41, 0.1), j as f32 * 0.5 + jitter(idx, 42, 0.1), -3.0 + jitter(idx, 43, 0.04)), -Vec3::Z));
+        }
+    }
+}
+
+/// A 3 mm wall (front face z = 0, 0.5 mm pitch) and, as the cross-line laser leaves them behind an
+/// inside surface, two families of curved stray lines 0.8 mm behind the front face, 2 mm wide,
+/// 9 and 10 mm apart, as dense as the surface along a line, five in six facing the other way.
+/// Returns the cloud and the number of strays (the last points).
+fn wall_with_laser_strays() -> (PointCloud, usize) {
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            c.push(pt(Vec3::new(i as f32 * 0.5 + jitter(idx, 44, 0.1), j as f32 * 0.5 + jitter(idx, 45, 0.1), jitter(idx, 46, 0.04)), Vec3::Z));
+        }
+    }
+    back_face(&mut c, 40.0, 30.0);
+    let wall = c.len();
+    let mut idx = 90_000;
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let (x, y) = (i as f32 * 0.5, j as f32 * 0.5);
+            // Line families along y (bent) and along 60 degrees.
+            let a = (x + 0.02 * (y - 15.0).powi(2)).rem_euclid(9.0);
+            let b = (0.866 * x - 0.5 * y + 40.0).rem_euclid(10.0);
+            if a < 2.0 || b < 2.0 {
+                idx += 1;
+                let n = if idx % 6 == 0 { Vec3::Z } else { Vec3::new(jitter(idx, 47, 0.3), jitter(idx, 48, 0.3), -1.0) };
+                c.push(pt(Vec3::new(x + 0.21 + jitter(idx, 49, 0.1), y + 0.17 + jitter(idx, 50, 0.1), -0.8 + jitter(idx, 51, 0.12)), n));
+            }
+        }
+    }
+    let strays = c.len() - wall;
+    (noisy(c, 0.0, 8.0), strays)
+}
+
+/// Worst |z| of the front-face vertices inside (3..37, 3..27).
+fn front_face_worst(mesh: &Mesh) -> f32 {
+    mesh.vertices
+        .iter()
+        .filter(|v| v.position[0] > 3.0 && v.position[0] < 37.0 && v.position[1] > 3.0 && v.position[1] < 27.0 && v.position[2] > -1.5)
+        .map(|v| v.position[2].abs())
+        .fold(0.0f32, f32::max)
+}
+
+#[test]
+fn prepare_drops_laser_line_strays_behind_a_thin_wall() {
+    let (cloud, strays) = wall_with_laser_strays();
+    let cfg = crate::SurfaceConfig::default();
+    // Without the preparation the mesher's own sparse-layer test keeps most of the lines (they
+    // are as dense as the surface) and the front face is pitted.
+    let (before, _) = crate::implicit::reconstruct(&cloud, &cfg);
+    let pitted = front_face_worst(&before);
+    assert!(pitted > 0.25, "the strays used to pit the surface: {pitted}");
+    let (prepared, rep) = crate::prepare_points(&cloud, &[], &crate::PrepareConfig::default());
+    let wall = cloud.len() - strays;
+    let left = prepared.points.iter().filter(|p| p.position[2] < -0.4 && p.position[2] > -1.4).count();
+    let dropped_wall = wall - prepared.points.iter().filter(|p| p.position[2] > -0.4 || p.position[2] < -2.0).count();
+    eprintln!("prepare: {rep:?}; {left} of {strays} strays left, {dropped_wall} of {wall} wall points dropped; pitted {pitted:.3}");
+    assert!(left * 20 <= strays, "{left} of {strays} stray points left");
+    assert!(dropped_wall * 100 <= wall, "{dropped_wall} of {wall} wall points dropped");
+    let (mesh, _) = crate::implicit::reconstruct(&prepared, &cfg);
+    let worst = front_face_worst(&mesh);
+    assert!(worst < 0.1, "the front face is {worst} mm off the plane after the preparation");
+    assert_eq!(inner_open_edges(&mesh), 0, "holes where the strays were");
+}
+
+/// The triangles of `mesh` above z = -1.5 (the front face of a [`back_face`] wall), compacted.
+fn front_face(mesh: &Mesh) -> Mesh {
+    let mut map = vec![u32::MAX; mesh.vertices.len()];
+    let mut out = Mesh::new();
+    for t in &mesh.triangles {
+        if t.indices.iter().all(|&i| mesh.vertices[i as usize].position[2] > -1.5) {
+            let [a, b, c] = t.indices.map(|i| {
+                if map[i as usize] == u32::MAX {
+                    map[i as usize] = out.add_vertex(mesh.vertices[i as usize]);
+                }
+                map[i as usize]
+            });
+            out.add_triangle(a, b, c);
+        }
+    }
+    out
+}
+
+/// The trade-off of the preparation, measured on the relief of
+/// `implicit_surface_keeps_small_relief_without_pits` as the inside of a 3 mm wall: with
+/// artefact suppression on (the default for scanner data) the ribs and the ring must still come
+/// out as they do without it; with it off the result is the mesher's own.
+#[test]
+fn prepare_keeps_small_relief() {
+    let mut cloud = relief_cloud();
+    back_face(&mut cloud, 42.0, 30.0);
+    for suppress in [true, false] {
+        let cfg = crate::PrepareConfig { suppress_artefacts: suppress, ..Default::default() };
+        let (prepared, rep) = crate::prepare_points(&cloud, &[], &cfg);
+        let (mesh, _) = crate::implicit::reconstruct(&prepared, &crate::SurfaceConfig::default());
+        let r = relief_report(&front_face(&mesh));
+        eprintln!("suppress {suppress}: {r:?}, dropped {} + {}", rep.dropped_off_surface, rep.dropped_ghosts);
+        assert_eq!(r.inner_open_edges, 0, "holes in the relief: {r:?}");
+        assert!(r.worst_top_fraction > 0.9, "relief flattened (suppress {suppress}): {r:?}");
+        assert!(r.deepest_pit < 0.12 && r.highest_spike < 0.15, "pits or spikes (suppress {suppress}): {r:?}");
+        assert!(r.plain_rms < 0.02, "plain area rough: {r:?}");
+    }
+}
+
+/// A gently curved 3 mm wall with a marker sticker on its front face: a flat disc 0.4 mm proud,
+/// 5.5 mm in radius, listed with Revo's 3 mm radius (the white dot only).
+fn wall_with_sticker() -> (PointCloud, Vec3) {
+    let dome = |x: f32, y: f32| 0.004 * ((x - 20.0).powi(2) + (y - 15.0).powi(2));
+    let site = Vec3::new(18.0, 14.0, dome(18.0, 14.0));
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            let (x, y) = (i as f32 * 0.5 + jitter(idx, 61, 0.1), j as f32 * 0.5 + jitter(idx, 62, 0.1));
+            let e = 0.05;
+            let n = Vec3::new(-(dome(x + e, y) - dome(x - e, y)) / (2.0 * e), -(dome(x, y + e) - dome(x, y - e)) / (2.0 * e), 1.0).normalize();
+            let r = Vec3::new(x - site.x, y - site.y, 0.0).length();
+            let lift = 0.4 * ((5.5 - r) / 0.5).clamp(0.0, 1.0);
+            c.push(pt(Vec3::new(x, y, dome(x, y) + lift + jitter(idx, 63, 0.03)), n));
+        }
+    }
+    back_face(&mut c, 40.0, 30.0);
+    (noisy(c, 0.0, 6.0), site)
+}
+
+#[test]
+fn prepare_removes_a_listed_marker_flush_with_the_surface() {
+    use crate::solid::markers::{Marker, MarkerSource};
+    let (cloud, site) = wall_with_sticker();
+    let dome = |x: f32, y: f32| 0.004 * ((x - 20.0).powi(2) + (y - 15.0).powi(2));
+    let marker = Marker { id: "M1".into(), center: site, normal: Vec3::Z, scan: Some(1), source: MarkerSource::List, radius_mm: 3.0, score: 0.0 };
+    // Worst deviation from the dome of the front-face vertices within 7 mm of the site.
+    let site_error = |mesh: &Mesh| {
+        mesh.vertices
+            .iter()
+            .map(|v| Vec3::from_array(v.position))
+            .filter(|p| p.z > -1.5 && Vec3::new(p.x - site.x, p.y - site.y, 0.0).length() < 7.0)
+            .map(|p| (p.z - dome(p.x, p.y)).abs())
+            .fold(0.0f32, f32::max)
+    };
+    let mesh_of = |remove: bool| {
+        let cfg = crate::PrepareConfig { remove_markers: remove, ..Default::default() };
+        let (prepared, rep) = crate::prepare_points(&cloud, std::slice::from_ref(&marker), &cfg);
+        let (mut mesh, _) = crate::implicit::reconstruct(&prepared, &crate::SurfaceConfig::default());
+        crate::FeatureSmoother { iterations: 4, sigma_normal: 0.5144, ..Default::default() }.smooth(&mut mesh);
+        if remove {
+            assert_eq!(rep.markers_filled(), 1, "{:?}", rep.marker_outcomes);
+            // The cut reaches past the plateau, not just Revo's 3 mm dot.
+            assert!(rep.marker_sites[0].radius_mm <= 3.0 && crate::solid::markers::MarkerConfig::default().cut_radius_mm >= 6.0);
+            let fair = crate::solid::fair_marker_sites(&mut mesh, &rep.marker_sites, &cfg.markers);
+            assert_eq!(fair[0].status, "faired", "{fair:?}");
+        }
+        mesh
+    };
+    let kept = site_error(&mesh_of(false));
+    assert!(kept > 0.3, "without removal the sticker stays: {kept}");
+    let removed = site_error(&mesh_of(true));
+    assert!(removed < 0.03, "the site is {removed} mm off the surface around it");
+}
+
+/// A 3 mm wall whose front face is a dome with a ridge running through a marker sticker (a flat
+/// disc 0.4 mm proud, r 5.5 mm, listed with Revo's 3 mm radius), 0.03 mm noise.
+fn ridged_wall_with_sticker() -> (PointCloud, Vec3, fn(f32, f32) -> f32) {
+    fn surface(x: f32, y: f32) -> f32 {
+        let (dx, dy) = (x - 20.0, y - 15.0);
+        -0.004 * (dx * dx + dy * dy) + 0.15 * (-(dx - 1.5).powi(2) / 50.0).exp()
+    }
+    let site = Vec3::new(20.0, 15.0, surface(20.0, 15.0));
+    let mut c = PointCloud::new();
+    for i in 0..=80usize {
+        for j in 0..=60usize {
+            let idx = i * 61 + j;
+            let (x, y) = (i as f32 * 0.5 + jitter(idx, 71, 0.1), j as f32 * 0.5 + jitter(idx, 72, 0.1));
+            let e = 0.05;
+            let n = Vec3::new(-(surface(x + e, y) - surface(x - e, y)) / (2.0 * e), -(surface(x, y + e) - surface(x, y - e)) / (2.0 * e), 1.0).normalize();
+            let r = Vec3::new(x - site.x, y - site.y, 0.0).length();
+            let lift = 0.4 * ((5.5 - r) / 0.5).clamp(0.0, 1.0);
+            c.push(pt(Vec3::new(x, y, surface(x, y) + lift + jitter(idx, 73, 0.03)), n));
+        }
+    }
+    back_face(&mut c, 40.0, 30.0);
+    (noisy(c, 0.0, 6.0), site, surface)
+}
+
+#[test]
+fn reconstruct_fills_a_marker_site_with_the_surface_curvature() {
+    // Reconstruct's path: prepare_points (cut and fill from the scan points), the implicit surface,
+    // the app's smoothing, then the fairing onto the fill surfaces. With the band slopes continued
+    // (not Reconstruct's default) the site follows the ridge (a ring quadric alone is ~0.04 mm off
+    // at the centre); with the default (ring fit only, see `PrepareConfig`) it is the quadric, as
+    // before the band slopes existed, and the limits hold it there. Either way no ring at the cut.
+    for slopes in [true, false] {
+        reconstruct_site_check(slopes);
+    }
+}
+
+#[test]
+fn reconstruct_fills_a_marker_site_on_a_small_ball_without_a_bump() {
+    // Reconstruct's path with its default settings on a 3 mm wall whose front face is a ball of
+    // R 20 mm round a sticker (0.5 mm pitch, 0.03 mm noise): a ring quadric misses the ball's centre
+    // by r⁴/8R³ (+0.06 mm, the size of a visible flat spot); the conic ring fit follows it.
+    use crate::solid::markers::{Marker, MarkerSource};
+    const R: f32 = 20.0;
+    let ball = |x: f32, y: f32| -(R - (R * R - x * x - y * y).max(0.0).sqrt());
+    let mut cloud = PointCloud::new();
+    for (k, depth, outward) in [(0u32, 0.0f32, true), (1, 3.0, false)] {
+        for i in -30i32..=30 {
+            for j in -30i32..=30 {
+                let idx = ((i + 30) * 61 + j + 30) as usize + 10_000 * k as usize;
+                let (x, y) = (i as f32 * 0.5 + jitter(idx, 81 + k, 0.1), j as f32 * 0.5 + jitter(idx, 83 + k, 0.1));
+                if x.hypot(y) > 0.75 * R {
+                    continue;
+                }
+                let d = Vec3::new(x, y, ball(x, y) + R).normalize();
+                let lift = if outward { 0.4 * ((5.5 - x.hypot(y)) / 0.5).clamp(0.0, 1.0) } else { 0.0 };
+                let p = Vec3::new(0.0, 0.0, -R) + d * (R - depth) + Vec3::Z * (lift + jitter(idx, 85 + k, 0.03));
+                cloud.push(pt(p, if outward { d } else { -d }));
+            }
+        }
+    }
+    let marker = Marker { id: "B".into(), center: Vec3::ZERO, normal: Vec3::Z, scan: Some(1), source: MarkerSource::List, radius_mm: 3.0, score: 0.0 };
+    let cfg = crate::PrepareConfig::default();
+    let (prepared, rep) = crate::prepare_points(&cloud, std::slice::from_ref(&marker), &cfg);
+    assert_eq!(rep.markers_filled(), 1, "{:?}", rep.marker_outcomes);
+    let (mut mesh, _) = crate::implicit::reconstruct(&prepared, &crate::SurfaceConfig::default());
+    crate::FeatureSmoother { iterations: 4, sigma_normal: 0.5144, ..Default::default() }.smooth(&mut mesh);
+    let fair = crate::solid::fair_marker_sites_on_fills(&mut mesh, &rep.marker_sites, &rep.marker_outcomes, &cfg.markers);
+    assert_eq!(fair[0].status, "faired", "{fair:?}");
+    let front: Vec<Vec3> = mesh.vertices.iter().map(|v| Vec3::from_array(v.position)).filter(|p| p.z > ball(p.x, p.y) - 1.5).collect();
+    let off = |r0: f32, r1: f32| -> (f32, f32) {
+        let e: Vec<f32> = front.iter().filter(|p| (r0..r1).contains(&p.x.hypot(p.y))).map(|p| p.z - ball(p.x, p.y)).collect();
+        (e.iter().sum::<f32>() / e.len().max(1) as f32, e.iter().map(|v| v.abs()).fold(0f32, f32::max))
+    };
+    let ((centre, _), (_, inside), (around_mean, around)) = (off(0.0, 1.5), off(0.0, 6.0), off(8.0, 11.0));
+    eprintln!("reconstruct on a ball R {R}: centre {centre:+.4} mm (around the cut {around_mean:+.4}), worst inside the cut {inside:.4} (around it {around:.4}); {:?}", rep.marker_outcomes[0].fill);
+    assert!((centre - around_mean).abs() < 0.02, "the site stands {:+.3} mm off the ball against the mesh round it", centre - around_mean);
+    assert!(inside < (around + 0.01).max(0.03), "site {inside} mm off the ball (around it {around})");
+}
+
+fn reconstruct_site_check(slopes: bool) {
+    use crate::solid::markers::{Marker, MarkerSource};
+    let (cloud, site, surface) = ridged_wall_with_sticker();
+    let marker = Marker { id: "M1".into(), center: site, normal: Vec3::Z, scan: Some(1), source: MarkerSource::List, radius_mm: 3.0, score: 0.0 };
+    let mut cfg = crate::PrepareConfig::default();
+    cfg.markers.continue_band_slopes = slopes;
+    let (prepared, rep) = crate::prepare_points(&cloud, std::slice::from_ref(&marker), &cfg);
+    assert_eq!(rep.markers_filled(), 1, "{:?}", rep.marker_outcomes);
+    let local = |p: Vec3| (p.x - site.x, p.y - site.y);
+    let fill_worst = prepared
+        .points
+        .iter()
+        .map(|p| Vec3::from_array(p.position))
+        .filter(|p| p.z > -1.5 && local(*p).0.hypot(local(*p).1) < 6.0)
+        .map(|p| (p.z - surface(p.x, p.y)).abs())
+        .fold(0f32, f32::max);
+    let (mut mesh, _) = crate::implicit::reconstruct(&prepared, &crate::SurfaceConfig::default());
+    crate::FeatureSmoother { iterations: 4, sigma_normal: 0.5144, ..Default::default() }.smooth(&mut mesh);
+    let fair = crate::solid::fair_marker_sites_on_fills(&mut mesh, &rep.marker_sites, &rep.marker_outcomes, &cfg.markers);
+    assert_eq!(fair[0].status, "faired", "{fair:?}");
+    // Front-face vertices by distance from the site: inside the cut, across it, further out.
+    let front: Vec<(f32, Vec3)> = mesh
+        .vertices
+        .iter()
+        .map(|v| Vec3::from_array(v.position))
+        .filter(|p| p.z > -1.5)
+        .map(|p| (local(p).0.hypot(local(p).1), p))
+        .collect();
+    let worst_in = |r0: f32, r1: f32| front.iter().filter(|(r, _)| (r0..r1).contains(r)).map(|(_, p)| (p.z - surface(p.x, p.y)).abs()).fold(0f32, f32::max);
+    let (inside, around) = (worst_in(0.0, 6.0), worst_in(8.0, 12.0));
+    // Slope continuity: the normal error of the front faces across the cut against further out.
+    let normal_p99 = |r0: f32, r1: f32| {
+        let mut a: Vec<f32> = mesh
+            .triangles
+            .iter()
+            .filter_map(|t| {
+                let [a, b, c] = t.indices.map(|i| Vec3::from_array(mesh.vertices[i as usize].position));
+                let g = (a + b + c) / 3.0;
+                let r = local(g).0.hypot(local(g).1);
+                if !(r0..r1).contains(&r) || g.z < -1.5 {
+                    return None;
+                }
+                let e = 0.01;
+                let nt = Vec3::new(-(surface(g.x + e, g.y) - surface(g.x - e, g.y)) / (2.0 * e), -(surface(g.x, g.y + e) - surface(g.x, g.y - e)) / (2.0 * e), 1.0).normalize();
+                Some((b - a).cross(c - a).normalize().angle_between(nt) * 1000.0)
+            })
+            .collect();
+        a.sort_by(|x, y| x.total_cmp(y));
+        a[(a.len() - 1) * 99 / 100]
+    };
+    let kink = normal_p99(5.0, 8.0) - normal_p99(9.0, 12.0);
+    eprintln!("reconstruct (band slopes {slopes}): fill points worst {fill_worst:.4} mm; mesh inside the cut worst {inside:.4} (around it {around:.4}), normal error p99 at the cut {kink:.1} mrad over further out; {fair:?}");
+    let (fill_tol, site_tol): (f32, f32) = if slopes { (0.03, 0.025) } else { (0.04, 0.032) };
+    assert!(fill_worst < fill_tol, "fill points {fill_worst} mm off the surface");
+    assert!(inside < site_tol.max(around + 0.005), "site {inside} mm off the surface (around it {around})");
+    // (Against the true ridge: the ring fit alone does not follow it, and its faces round the cut
+    // are a few mrad off the ridge's even without a step there.)
+    let kink_max = if slopes { 4.0 } else { 8.5 };
+    assert!(kink < kink_max, "normals {kink} mrad off at the cut");
+}

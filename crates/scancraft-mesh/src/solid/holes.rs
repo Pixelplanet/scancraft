@@ -16,7 +16,8 @@
 //!
 //! A region whose border carries measured points facing across the sheet (the cut face of the
 //! wall seen by the scanner) on more than `edge_wall_fraction` of its length is taken for a real
-//! opening (a bore, a slot) and left open. Patches are points on the quadric plus a harmonic
+//! opening (a bore, a slot) and left open; so is a round enclosed hole of 1–6 mm radius through a
+//! plate scanned from both sides, with nothing on its axis (`through_bore`). Patches are points on the quadric plus a harmonic
 //! (Laplace) interpolation of the residual from the surrounding pixels, so they meet the sheet
 //! without a step. Passes run from small to large windows; a second completion pass then builds
 //! the opposite face behind them.
@@ -44,6 +45,11 @@ pub struct HoleConfig {
     pub bridge_max_window_mm: f32,
     /// A region is a real opening when this fraction of its border shows the wall's cut face.
     pub edge_wall_fraction: f32,
+    /// Leave round enclosed holes open whose axis is clear of points on both sides and whose plate
+    /// was scanned from both sides round them (screw holes through a plate; see `through_bore`).
+    /// A gap in a face scanned from one side only is always filled: the data cannot tell it from
+    /// a sticker gap or a dropout.
+    pub keep_through_holes: bool,
 }
 
 impl Default for HoleConfig {
@@ -56,6 +62,7 @@ impl Default for HoleConfig {
             bridge_span_mm: 40.0,
             bridge_max_window_mm: 40.0,
             edge_wall_fraction: 0.4,
+            keep_through_holes: true,
         }
     }
 }
@@ -68,8 +75,9 @@ const PX: f64 = 0.5;
 pub(crate) fn fill_holes(pts: &[WorkPoint], prm: &HoleConfig) -> (Vec<WorkPoint>, usize) {
     let mut all = pts.to_vec();
     let mut out = Vec::new();
+    let mut bores = Vec::new();
     for &w in &prm.windows_mm {
-        let fill = fill_pass(&all, prm, w);
+        let fill = fill_pass(&all, prm, w, &mut bores);
         all.extend_from_slice(&fill);
         out.extend(fill);
     }
@@ -114,17 +122,51 @@ fn count_patches(pts: &[WorkPoint], cell: f32) -> usize {
     patches
 }
 
-fn fill_pass(pts: &[WorkPoint], prm: &HoleConfig, w: f32) -> Vec<WorkPoint> {
+/// A hole left open in one face ([`through_bore`]): centre on the sheet, axis (the sheet normal)
+/// and radius (mm).
+#[derive(Clone, Copy, Debug)]
+struct Bore {
+    c: Vec3,
+    a: Vec3,
+    r: f32,
+}
+
+impl Bore {
+    /// Whether a fill point (`p`, normal `n`) of the same face lies in the bore. Each face decides
+    /// for itself: a gap through both faces may be a bore in one and too wide in the other, which
+    /// is then patched and gets the other face built behind it by the completion.
+    fn contains(&self, p: Vec3, n: Vec3) -> bool {
+        let d = p - self.c;
+        let h = d.dot(self.a);
+        n.dot(self.a) > 0.5 && h.abs() < 1.5 && (d - self.a * h).length_squared() < self.r * self.r
+    }
+}
+
+/// One pass at window half width `w`. `bores` holds the holes left open so far and gains this
+/// pass's: no seed fills a bore another seed (or a smaller window) kept open in that face. A seed
+/// far from a hole can see only part of it, too small for a bore.
+fn fill_pass(pts: &[WorkPoint], prm: &HoleConfig, w: f32, bores: &mut Vec<Bore>) -> Vec<WorkPoint> {
     let pos: Vec<Vec3> = pts.iter().map(|p| p.p).collect();
     let grid = PointGrid::new(&pos, 2.0);
     let seeds = PointGrid::new(&pos, w / 4.0).representatives();
-    let per_seed: Vec<Vec<WorkPoint>> =
-        seeds.par_iter().map(|&s| holes_at(s as usize, pts, &pos, &grid, prm, w).0).collect();
+    let per_seed: Vec<(Vec<WorkPoint>, Vec<Bore>)> = seeds
+        .par_iter()
+        .map(|&s| {
+            let (fill, _, b) = holes_at(s as usize, pts, &pos, &grid, prm, w);
+            (fill, b)
+        })
+        .collect();
+    for (_, b) in &per_seed {
+        bores.extend_from_slice(b);
+    }
     // Holes are seen from several seeds: keep one point per 0.35 mm cell.
     let mut seen: FxMap<u64, ()> = FxMap::default();
     let mut out = Vec::new();
-    for fill in per_seed {
+    for (fill, _) in per_seed {
         for p in fill {
+            if bores.iter().any(|b| b.contains(p.p, p.n)) {
+                continue;
+            }
             if seen.insert(cell_key((p.p / 0.35).floor().as_ivec3()), ()).is_none() {
                 out.push(p);
             }
@@ -140,7 +182,7 @@ fn holes_at(
     grid: &PointGrid,
     prm: &HoleConfig,
     w: f32,
-) -> (Vec<WorkPoint>, usize) {
+) -> (Vec<WorkPoint>, usize, Vec<Bore>) {
     let s = &pts[si];
     let n = s.n;
     let (eu, ev) = tangent_frame(n);
@@ -153,6 +195,10 @@ fn holes_at(
     // Points of any other orientation near the sheet (the opposite face, ribs, plates).
     let mut other: Vec<(f64, f64, f64)> = Vec::new();
     let mut opposite: Vec<(f64, f64, f64)> = Vec::new();
+    // Real surface (measured or marker fill, not completion: that is a copy of the seen face) on the
+    // sheet and opposite-facing behind it: both scanned faces of a plate round a through hole.
+    let mut loc_real: Vec<(f64, f64)> = Vec::new();
+    let mut opposite_real: Vec<(f64, f64, f64)> = Vec::new();
     grid.for_each_within(pos, s.p, w, |i, _| {
         let p = &pts[i as usize];
         let d = p.p - s.p;
@@ -166,6 +212,9 @@ fn holes_at(
                 other.push((d.dot(eu) as f64, d.dot(ev) as f64, h as f64));
                 if c < -0.6 {
                     opposite.push((d.dot(eu) as f64, d.dot(ev) as f64, h as f64));
+                    if matches!(p.kind, PointKind::Measured | PointKind::MarkerFill) {
+                        opposite_real.push((d.dot(eu) as f64, d.dot(ev) as f64, h as f64));
+                    }
                 }
             }
             return;
@@ -175,9 +224,12 @@ fn holes_at(
             if p.kind == PointKind::Measured {
                 loc_measured.push((d.dot(eu) as f64, d.dot(ev) as f64));
             }
+            if matches!(p.kind, PointKind::Measured | PointKind::MarkerFill) {
+                loc_real.push((d.dot(eu) as f64, d.dot(ev) as f64));
+            }
         }
     });
-    let none = (Vec::new(), 0);
+    let none = (Vec::new(), 0, Vec::new());
     if loc.len() < 200 {
         return none;
     }
@@ -339,9 +391,13 @@ fn holes_at(
     }
     let span = if bridge { min_span(&wall, side) } else { Vec::new() };
     let span_max = (prm.bridge_span_mm as f64 / PX) as f32;
-    let emit = |pix: &[usize], dt_hole: &[f32], fill: &mut Vec<WorkPoint>| {
+    // Patch points over the region's pixels, except those `skip` marks (a bore left open).
+    let emit = |pix: &[usize], dt_hole: &[f32], skip: Option<&[bool]>, fill: &mut Vec<WorkPoint>| {
         let resid = harmonic_fill(pix, dt_hole, &rsum, &rcnt, side);
         for (&k, &rk) in pix.iter().zip(&resid) {
+            if skip.is_some_and(|s| s[k]) {
+                continue;
+            }
             let (u, v) = (((k % side) as i32 - half) as f64 * PX, ((k / side) as i32 - half) as f64 * PX);
             let z = q.eval(u, v) + rk;
             let (gu, gv) = q.grad(u, v);
@@ -354,6 +410,7 @@ fn holes_at(
 
     let mut fill = Vec::new();
     let mut count = 0usize;
+    let mut bores = Vec::new();
     let dt_occ = chamfer_dt(&occ, side);
     for (pix, open) in &comps {
         if pix.len() < 2 {
@@ -389,7 +446,7 @@ fn holes_at(
                 continue;
             }
             count += 1;
-            emit(&bp, &dt_hole, &mut fill);
+            emit(&bp, &dt_hole, None, &mut fill);
             continue;
         }
         // Only holes centred in the inner half of the window (other seeds take the rest).
@@ -425,10 +482,195 @@ fn holes_at(
         if edge_fraction(&dt_hole) > prm.edge_wall_fraction {
             continue;
         }
+        // A real opening through the part stays open; the rest of the region (a shadowed gap
+        // beside it) is still patched.
+        // The clear part ends 0.5 mm short of the bore's wall (the axis test's radius); the region
+        // within 1 mm of it stays open too, so the bore keeps its size and a later, larger window
+        // sees the same hole and not a smaller remainder of it.
+        let bore = if prm.keep_through_holes {
+            through_bore(pix, side, half, &q, s.p, (eu, ev, n), pts, pos, grid)
+                .filter(|open| both_faces_round(open, &occ, &loc_real, &opposite_real, &q, side, half))
+                .map(|mut open| {
+                    let dt = chamfer_dt(&open, side);
+                    for &k in pix {
+                        if dt[k] as f64 * PX <= 1.0 {
+                            open[k] = true;
+                        }
+                    }
+                    open
+                })
+        } else {
+            None
+        };
+        if let Some(open) = &bore {
+            let (mut su, mut sv, mut cnt) = (0f64, 0f64, 0usize);
+            for k in (0..side * side).filter(|&k| open[k]) {
+                su += ((k % side) as i32 - half) as f64 * PX;
+                sv += ((k / side) as i32 - half) as f64 * PX;
+                cnt += 1;
+            }
+            let (u, v) = (su / cnt as f64, sv / cnt as f64);
+            let (gu, gv) = q.grad(u, v);
+            let nl = DVec3::new(-gu, -gv, 1.0).normalize();
+            bores.push(Bore {
+                c: s.p + eu * u as f32 + ev * v as f32 + n * q.eval(u, v) as f32,
+                a: (eu * nl.x as f32 + ev * nl.y as f32 + n * nl.z as f32).normalize(),
+                r: ((cnt as f64 * PX * PX / std::f64::consts::PI).sqrt()) as f32,
+            });
+        }
+        if bore.as_ref().is_some_and(|open| pix.iter().filter(|&&k| !open[k]).count() < 2) {
+            continue;
+        }
         count += 1;
-        emit(pix, &dt_hole, &mut fill);
+        emit(pix, &dt_hole, bore.as_deref(), &mut fill);
     }
-    (fill, count)
+    (fill, count, bores)
+}
+
+/// The bore of a real opening through the part inside an enclosed hole region (a screw hole in a
+/// bracket plate, often merged with a shadowed gap beside it), as a pixel mask: the pixels whose
+/// line along the sheet normal is clear of real surface (measured or marker fill points) within
+/// 0.5 mm for 30 mm on either side (no opposite face of a wall, no other plate, no rib), connected
+/// to the deepest such pixel. `None` when the clear part holds no disc of 1–6 mm radius or is not
+/// round (more than [`ROUND_AREA_RATIO`] times its inscribed disc). A data gap in one face of a
+/// wall whose other face was scanned has that face behind it and is filled. Completion points do
+/// not count: behind a plate they are a guess, and behind a gap in a one-sided scan they have the
+/// same gap; the caller therefore also asks for both faces scanned round the bore
+/// ([`both_faces_round`]).
+#[allow(clippy::too_many_arguments)]
+fn through_bore(
+    pix: &[usize],
+    side: usize,
+    half: i32,
+    q: &Quadric,
+    origin: Vec3,
+    (eu, ev, n): (Vec3, Vec3, Vec3),
+    pts: &[WorkPoint],
+    pos: &[Vec3],
+    grid: &PointGrid,
+) -> Option<Vec<bool>> {
+    const RADIAL: f32 = 0.5;
+    const REACH: f32 = 30.0;
+    let clear_at = |k: usize| {
+        let (u, v) = (((k % side) as i32 - half) as f64 * PX, ((k / side) as i32 - half) as f64 * PX);
+        let (gu, gv) = q.grad(u, v);
+        let nl = DVec3::new(-gu, -gv, 1.0).normalize();
+        let axis = (eu * nl.x as f32 + ev * nl.y as f32 + n * nl.z as f32).normalize();
+        let c = origin + eu * u as f32 + ev * v as f32 + n * q.eval(u, v) as f32;
+        // Outwards from the sheet in both directions: the opposite face of a wall is met first.
+        let mut t = 0.0f32;
+        while t <= REACH {
+            for x in [c + axis * t, c - axis * t] {
+                let mut hit = false;
+                grid.for_each_within(pos, x, 2.0 * RADIAL, |i, _| {
+                    let p = &pts[i as usize];
+                    if !hit && matches!(p.kind, PointKind::Measured | PointKind::MarkerFill) {
+                        let d = p.p - c;
+                        let h = d.dot(axis);
+                        hit = (d - axis * h).length_squared() < RADIAL * RADIAL;
+                    }
+                });
+                if hit {
+                    return false;
+                }
+            }
+            t += RADIAL;
+        }
+        true
+    };
+    let clear: Vec<(usize, bool)> = pix.par_iter().map(|&k| (k, clear_at(k))).collect();
+    let mut blocked = vec![true; side * side];
+    for &(k, c) in &clear {
+        blocked[k] = !c;
+    }
+    let dt = chamfer_dt(&blocked, side);
+    let (deepest, depth) = clear.iter().filter(|e| e.1).map(|e| (e.0, dt[e.0])).max_by(|a, b| a.1.total_cmp(&b.1))?;
+    // chamfer_dt is in pixels, 3-4 weights normalised to one pixel per step.
+    let radius = depth as f64 * PX;
+    if !(1.0..=6.0).contains(&radius) {
+        return None;
+    }
+    // The clear pixels connected to the deepest one.
+    let mut open = vec![false; side * side];
+    open[deepest] = true;
+    let mut stack = vec![deepest];
+    while let Some(k) = stack.pop() {
+        let (a, b) = ((k % side) as i32, (k / side) as i32);
+        for (da, db) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+            let (x, y) = (a + da, b + db);
+            if x < 0 || y < 0 || x >= side as i32 || y >= side as i32 {
+                continue;
+            }
+            let kk = y as usize * side + x as usize;
+            if !blocked[kk] && !open[kk] {
+                open[kk] = true;
+                stack.push(kk);
+            }
+        }
+    }
+    // A drilled or moulded hole is round: its clear part is not much larger than its inscribed
+    // disc. An elongated dropout (a laser line's shadow, a glare streak) is a data gap.
+    let area = open.iter().filter(|&&o| o).count() as f64;
+    let disc = std::f64::consts::PI * (depth as f64).powi(2);
+    if area > ROUND_AREA_RATIO * disc {
+        return None;
+    }
+    Some(open)
+}
+
+/// Largest area of a bore's clear part, as a multiple of its inscribed disc.
+const ROUND_AREA_RATIO: f64 = 2.0;
+
+/// Whether both faces of the plate were scanned round a bore (`open`, from [`through_bore`]): in
+/// the 3 mm ring round it, at least half of the sheet pixels carry real (measured or marker fill)
+/// points of the sheet itself and have real opposite-facing surface 0.3–9 mm behind them. Only
+/// then is a clear axis evidence of a hole through the part: where one face alone was scanned,
+/// nothing real lies behind any gap in it (the completion builds the other face from the seen one,
+/// gaps included, and seen from that completed face the scanned one is behind), so a sticker gap,
+/// a glare or dark-spot dropout looks exactly like a screw hole and is filled instead.
+#[allow(clippy::too_many_arguments)]
+fn both_faces_round(
+    open: &[bool],
+    occ: &[bool],
+    sheet_real: &[(f64, f64)],
+    opposite_real: &[(f64, f64, f64)],
+    q: &Quadric,
+    side: usize,
+    half: i32,
+) -> bool {
+    let mark = |mask: &mut [bool], u: f64, v: f64| {
+        let (iu, iv) = ((u / PX).round() as i32 + half, (v / PX).round() as i32 + half);
+        for dv in -1..=1 {
+            for du in -1..=1 {
+                let (a, b) = (iu + du, iv + dv);
+                if a >= 0 && b >= 0 && a < side as i32 && b < side as i32 {
+                    mask[b as usize * side + a as usize] = true;
+                }
+            }
+        }
+    };
+    let mut sheet = vec![false; side * side];
+    for &(u, v) in sheet_real {
+        mark(&mut sheet, u, v);
+    }
+    let mut behind = vec![false; side * side];
+    for &(u, v, z) in opposite_real {
+        if (0.3..9.0).contains(&(q.eval(u, v) - z)) {
+            mark(&mut behind, u, v);
+        }
+    }
+    let dt = chamfer_dt(open, side);
+    let (mut ring, mut hit) = (0usize, 0usize);
+    for k in 0..side * side {
+        let d = dt[k] as f64 * PX;
+        if d > 0.0 && d <= 3.0 && occ[k] {
+            ring += 1;
+            if sheet[k] && behind[k] {
+                hit += 1;
+            }
+        }
+    }
+    ring > 0 && 2 * hit >= ring
 }
 
 /// Per pixel, the shortest span between occupied pixels on both sides of it along one of four
