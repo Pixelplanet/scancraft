@@ -3,7 +3,7 @@
 //! Reconstruct, Make Solid) and measures both meshes against the truth.
 //!
 //! ```text
-//! cargo run --release -p scancraft-synth --example synth_eval -- <data dir> <out dir> [filter] [--no-align] [--no-solid] [--whole-scene]
+//! cargo run --release -p scancraft-synth --example synth_eval -- <data dir> <out dir> [filter] [--no-align] [--no-solid] [--whole-scene] [--truth-isolation]
 //! ```
 //!
 //! Each scene runs in a child process of its own (so its peak memory is its own and a crash
@@ -22,13 +22,13 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some("--one") {
         let (Some(dir), Some(out)) = (args.get(1), args.get(2)) else { std::process::exit(2) };
-        let options = RunOptions { align_check: !args.iter().any(|a| a == "--no-align"), solid: !args.iter().any(|a| a == "--no-solid"), whole_scene: args.iter().any(|a| a == "--whole-scene") };
+        let options = RunOptions { align_check: !args.iter().any(|a| a == "--no-align"), solid: !args.iter().any(|a| a == "--no-solid"), whole_scene: args.iter().any(|a| a == "--whole-scene"), truth_isolation: args.iter().any(|a| a == "--truth-isolation") };
         one(Path::new(dir), Path::new(out), &options);
         return;
     }
     let positional: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let (Some(data), Some(out)) = (positional.first(), positional.get(1)) else {
-        eprintln!("usage: synth_eval <data dir> <out dir> [filter] [--no-align] [--no-solid] [--whole-scene]");
+        eprintln!("usage: synth_eval <data dir> <out dir> [filter] [--no-align] [--no-solid] [--whole-scene] [--truth-isolation]");
         std::process::exit(2);
     };
     let filter = positional.get(2).map(|s| s.as_str()).unwrap_or("");
@@ -45,7 +45,7 @@ fn main() {
     }
     let scenes: Vec<PathBuf> = scenes.into_iter().filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().contains(filter))).collect();
     let exe = std::env::current_exe().expect("own path");
-    let passthrough: Vec<&String> = args.iter().filter(|a| *a == "--no-align" || *a == "--no-solid" || *a == "--whole-scene").collect();
+    let passthrough: Vec<&String> = args.iter().filter(|a| *a == "--no-align" || *a == "--no-solid" || *a == "--whole-scene" || *a == "--truth-isolation").collect();
     let mut results = Vec::new();
     for dir in &scenes {
         let name = dir.file_name().unwrap().to_string_lossy().to_string();
@@ -164,7 +164,15 @@ fn table(results: &[SceneResult]) -> String {
             }
             if let Some(po) = &m.pass_offset {
                 if po.get("handled").and_then(|h| h.as_bool()) == Some(false) {
-                    s.push_str(&format!("  {:28} {:11} {:24} {:14} step {} mm between pass-1-only, overlap and other-pass surface\n", r.scene, m.mesh, "(passes)", "pass_offset", po.get("step_mm").cloned().unwrap_or_default()));
+                    s.push_str(&format!(
+                        "  {:28} {:11} {:24} {:14} step {} mm between pass-1-only, overlap and other-pass surface; worst group {} mm off the truth\n",
+                        r.scene,
+                        m.mesh,
+                        "(passes)",
+                        "pass_offset",
+                        po.get("step_mm").cloned().unwrap_or_default(),
+                        po.get("bias_mm").cloned().unwrap_or_default()
+                    ));
                 }
             }
         }

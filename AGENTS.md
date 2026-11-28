@@ -436,3 +436,13 @@ laser model are not built.
   Reconstruct's spacing is the mean of the middle fifth over all points (stable). 13 new tests, all
   fail on 41e7b72. Open: the lattice suppression still depends on the support radius; see
   open-issues 2.4.
+- 2026-11-28 (branch `agent/synth-scenes`) — Synthetic test scenes (`crates/scancraft-synth`,
+  README there): 30 scenes with an exact truth (plates, vents, grille, screw plate, domes, balls,
+  cylinders, saddle, cup, block edges, fine relief, fins, the shell, also on its rim). Scanner
+  model checked against S1-S3's `raw_preview.ply` (`examples/synth_realism.rs`: density, normals
+  from depth images, correlated noise and hatching, sticker dot / thin or empty ring / halo,
+  tables with clutter, pass tilt); `*_marker_holes` = Revo's Fused export. `synth_eval` runs the
+  app's pipeline (also `--truth-isolation`), `scripts/overview.py` writes one page per run. Eval
+  metric errors fixed (slot-wall "beads", knurl sign, relief base, stray counts, blind pilots,
+  hole caps, pass-offset bias). Results and the ranked mesher failures: `docs/open-issues.md`
+  §2.5; the app's isolation fails on plates lying on a table with clutter.

@@ -1,8 +1,10 @@
 //! The simulated scanner: rays from every view of a pass, cast against the scene (part, stickers,
-//! the pass's table) with occlusion; noise along the ray that grows at grazing incidence;
-//! coverage lost past a maximum incidence angle; the views fused into one cloud at the pass's
-//! point spacing; normals from a plane fit of the noisy neighbours; then the pass's faults
-//! (marker cut-outs, dropout, laser strays, offsets).
+//! the pass's table and clutter) with occlusion; a depth error along the ray that grows at
+//! grazing incidence and is correlated in space, with hatching and grazing streaks; coverage
+//! lost past a maximum incidence angle; normals from each view's depth image (as a scanner makes
+//! them, without the true surface); the views fused into one cloud by blue-noise thinning at the
+//! pass's spacing; then the pass's faults (losses on the stickers' rings, marker cut-outs,
+//! dropout, laser strays, offset and pose error).
 
 use std::collections::HashMap;
 
@@ -10,9 +12,9 @@ use glam::DVec3;
 use rayon::prelude::*;
 use serde::Serialize;
 
-use crate::rng::{value_noise, Rng};
-use crate::scene::{NormalMode, PassSpec, Scene, Sticker};
-use crate::sdf::{sdf_normal, v3};
+use crate::rng::{mix, value_noise, Rng};
+use crate::scene::{NoiseModel, NormalMode, PassSpec, Scene, Sticker};
+use crate::sdf::{sdf_normal, v3, Rigid};
 
 /// What a scanned point lies on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -75,16 +77,6 @@ pub struct PassScan {
     pub points: Vec<ScanPoint>,
     pub listed: Vec<ListedMarker>,
     pub stats: PassStats,
-}
-
-#[derive(Clone, Copy)]
-struct Hit {
-    true_pos: DVec3,
-    true_normal: DVec3,
-    ray: DVec3,
-    cos: f64,
-    pos: DVec3,
-    kind: PointKind,
 }
 
 /// Distance of the scene as pass `pass` sees it: part, its table, the stickers on both.
@@ -152,12 +144,16 @@ fn ray_box(o: DVec3, d: DVec3, lo: DVec3, hi: DVec3) -> Option<(f64, f64)> {
     (t0 < t1).then_some((t0, t1))
 }
 
+/// How far round the part a table (and the clutter on it) is seen.
+pub const TABLE_MARGIN_MM: f64 = 28.0;
+
 /// The box rays are cast into for pass `pass`: the part's bounds, and room round it for a table.
 pub fn march_box(scene: &Scene, pass: usize) -> (DVec3, DVec3) {
     let (mut lo, mut hi) = (v3(scene.bounds[0]) - DVec3::splat(2.0), v3(scene.bounds[1]) + DVec3::splat(2.0));
     if scene.passes[pass].table.is_some() {
-        lo -= DVec3::new(30.0, 30.0, 6.0);
-        hi += DVec3::new(30.0, 30.0, 0.0);
+        // Room for the table round the part and for what stands on it.
+        lo -= DVec3::new(TABLE_MARGIN_MM, TABLE_MARGIN_MM, TABLE_MARGIN_MM);
+        hi += DVec3::new(TABLE_MARGIN_MM, TABLE_MARGIN_MM, TABLE_MARGIN_MM);
     }
     (lo, hi)
 }
@@ -171,8 +167,101 @@ fn spacing_at(pass: &PassSpec, p: DVec3) -> (u8, f64) {
     (0, pass.spacing_mm)
 }
 
-/// A fusion cell: density region and grid index.
-type CellKey = (u8, i64, i64, i64);
+#[derive(Clone, Copy)]
+struct Hit {
+    true_pos: DVec3,
+    true_normal: DVec3,
+    ray: DVec3,
+    cos: f64,
+    pos: DVec3,
+    /// Measured distance along the ray.
+    t: f64,
+    /// Where a single frame would have measured it (for the normals).
+    frame_pos: DVec3,
+    normal: DVec3,
+    view: u16,
+    kind: PointKind,
+}
+
+/// The spatial part of a pass's depth error ([`NoiseModel`]): a stationary Gaussian field
+/// (sum of random plane waves, Gaussian correlation), the hatching and the grazing streaks.
+pub struct NoiseField {
+    waves: Vec<(DVec3, f64)>,
+    hatch_dir: DVec3,
+    hatch_phase: f64,
+    model: NoiseModel,
+    seed: u64,
+}
+
+impl NoiseField {
+    pub fn new(seed: u64, pass: usize, model: &NoiseModel) -> Self {
+        let mut rng = Rng::for_parts(&[seed, pass as u64, 0xf1e1d]);
+        let sk = std::f64::consts::SQRT_2 / model.correlation_mm.max(1e-3);
+        let waves = (0..48).map(|_| (DVec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * sk, rng.range(0.0, std::f64::consts::TAU))).collect();
+        let a = rng.range(0.0, std::f64::consts::TAU);
+        let hatch_dir = DVec3::new(a.cos(), a.sin(), rng.range(-0.4, 0.4)).normalize();
+        NoiseField { waves, hatch_dir, hatch_phase: rng.range(0.0, std::f64::consts::TAU), model: *model, seed: mix(&[seed, pass as u64]) }
+    }
+
+    /// Unit-variance correlated field at `p`.
+    pub fn field(&self, p: DVec3) -> f64 {
+        let s: f64 = self.waves.iter().map(|(k, ph)| (k.dot(p) + ph).cos()).sum();
+        s * (2.0 / self.waves.len() as f64).sqrt()
+    }
+
+    pub fn hatch(&self, p: DVec3) -> f64 {
+        if self.model.hatch_mm == 0.0 {
+            return 0.0;
+        }
+        self.model.hatch_mm * (std::f64::consts::TAU * self.hatch_dir.dot(p) / self.model.hatch_period_mm.max(0.05) + self.hatch_phase).sin()
+    }
+
+    /// Depth error of a ray hitting `p` (true position) at incidence cosine `cos`: `white` is a
+    /// standard normal number drawn for the ray.
+    pub fn depth_error(&self, pass: &PassSpec, p: DVec3, cos: f64, white: f64) -> f64 {
+        let sigma = pass.noise_mm / cos.max(0.15).powf(pass.grazing_noise);
+        let c = self.model.correlated_share.clamp(0.0, 1.0);
+        let mut e = sigma * ((1.0 - c).sqrt() * white + c.sqrt() * self.field(p)) + self.hatch(p) + pass.depth_bias_mm;
+        if let Some(st) = &pass.streaks {
+            let (c0, c1) = (st.from_incidence_deg.to_radians().cos(), st.full_incidence_deg.to_radians().cos());
+            let w = ((c0 - cos) / (c0 - c1).max(1e-6)).clamp(0.0, 1.0);
+            if w > 0.0 {
+                for (fi, fam) in st.families.iter().enumerate() {
+                    let t = v3(fam.normal).normalize().dot(p) / fam.spacing_mm + fam.phase;
+                    if (t - t.round()).abs() * fam.spacing_mm < 0.5 * st.width_mm {
+                        let line = t.round() as i64 as u64;
+                        let v = value_noise(mix(&[self.seed, 0x57e4, fi as u64, line]), p.x, p.y, p.z, st.cell_mm.max(0.5));
+                        e += st.amplitude_mm * w * (2.0 * v - 1.0) * 1.6;
+                        break;
+                    }
+                }
+            }
+        }
+        e
+    }
+}
+
+/// Plane fit (PCA) of `pts`, oriented to face against `ray`.
+fn fit_normal(pts: &[DVec3], ray: DVec3) -> Option<DVec3> {
+    if pts.len() < 4 {
+        return None;
+    }
+    let mean = pts.iter().copied().sum::<DVec3>() / pts.len() as f64;
+    let mut m = [[0.0f64; 3]; 3];
+    for q in pts {
+        let d = *q - mean;
+        for i in 0..3 {
+            for j in 0..3 {
+                m[i][j] += d[i] * d[j];
+            }
+        }
+    }
+    let n = smallest_eigenvector(m);
+    if n == DVec3::ZERO {
+        return None;
+    }
+    Some(if n.dot(-ray) < 0.0 { -n } else { n })
+}
 
 /// Scans pass `pass` of `scene`.
 pub fn scan_pass(scene: &Scene, pass_index: usize) -> PassScan {
@@ -182,9 +271,10 @@ pub fn scan_pass(scene: &Scene, pass_index: usize) -> PassScan {
     let min_spacing = pass.density.iter().map(|r| r.spacing_mm).fold(pass.spacing_mm, f64::min);
     let cos_max = pass.max_incidence_deg.to_radians().cos();
     let thin_from = (pass.max_incidence_deg - 6.0).to_radians().cos();
+    let noise = NoiseField::new(scene.seed, pass_index, &pass.noise);
     let mut stats = PassStats::default();
 
-    // 1. Rays of every view.
+    // 1. Rays of every view, as a depth image per view; normals from that image.
     let mut hits: Vec<Hit> = Vec::new();
     for (vi, view) in pass.views.iter().enumerate() {
         let eye = v3(view.eye);
@@ -207,65 +297,126 @@ pub fn scan_pass(scene: &Scene, pass_index: usize) -> PassScan {
         let nx = ((tx1 - tx0) / pitch).ceil() as usize + 1;
         let ny = ((ty1 - ty0) / pitch).ceil() as usize + 1;
         stats.rays += nx * ny;
-        let rows: Vec<Vec<Hit>> = (0..ny)
+        // None: no surface; Some(None): seen too obliquely (lost); Some(Some(hit)).
+        let image: Vec<Option<Option<Hit>>> = (0..ny)
             .into_par_iter()
-            .map(|iy| {
-                let mut row = Vec::new();
-                for ix in 0..nx {
+            .flat_map_iter(|iy| {
+                let f = &f;
+                let noise = &noise;
+                (0..nx).map(move |ix| {
                     let d = (forward + right * (tx0 + ix as f64 * pitch) + up * (ty0 + iy as f64 * pitch)).normalize();
-                    let Some((t0, t1)) = ray_box(eye, d, lo, hi) else { continue };
-                    let Some(t) = march(&f, eye, d, t0, t1) else { continue };
+                    let (t0, t1) = ray_box(eye, d, lo, hi)?;
+                    let t = march(f, eye, d, t0, t1)?;
                     let p = eye + d * t;
-                    let n = sdf_normal(&f, p);
+                    let n = sdf_normal(f, p);
                     let cos = -d.dot(n);
                     let mut rng = Rng::for_parts(&[scene.seed, pass_index as u64, vi as u64, (iy * nx + ix) as u64]);
-                    if cos < cos_max {
-                        row.push(Hit { true_pos: p, true_normal: n, ray: d, cos: -1.0, pos: p, kind: PointKind::Part });
-                        continue;
-                    }
-                    if cos < thin_from && rng.uniform() > (cos - cos_max) / (thin_from - cos_max) {
-                        row.push(Hit { true_pos: p, true_normal: n, ray: d, cos: -1.0, pos: p, kind: PointKind::Part });
-                        continue;
+                    if cos < cos_max || (cos < thin_from && rng.uniform() > (cos - cos_max) / (thin_from - cos_max)) {
+                        return Some(None);
                     }
                     let kind = classify(scene, pass_index, p);
-                    let sigma = pass.noise_mm / cos.max(0.15).powf(pass.grazing_noise);
-                    let pos = p + d * (sigma * rng.gauss() + pass.depth_bias_mm);
-                    row.push(Hit { true_pos: p, true_normal: n, ray: d, cos, pos, kind });
-                }
-                row
+                    let e = noise.depth_error(pass, p, cos, rng.gauss());
+                    let frame = e + pass.noise.frame_noise_mm / cos.max(0.15).powf(pass.grazing_noise) * rng.gauss();
+                    Some(Some(Hit { true_pos: p, true_normal: n, ray: d, cos, pos: p + d * e, t: t + e, frame_pos: p + d * frame, normal: n, view: vi as u16, kind }))
+                })
             })
             .collect();
-        for row in rows {
-            for h in row {
-                if h.cos < 0.0 {
-                    stats.lost_grazing += 1;
-                } else {
+        stats.lost_grazing += image.iter().filter(|c| matches!(c, Some(None))).count();
+        if pass.normals == NormalMode::DepthImage {
+            let w = pass.normal_window.max(1) as i64;
+            let at = |ix: i64, iy: i64| -> Option<&Hit> {
+                if ix < 0 || iy < 0 || ix >= nx as i64 || iy >= ny as i64 {
+                    return None;
+                }
+                image[iy as usize * nx + ix as usize].as_ref().and_then(|c| c.as_ref())
+            };
+            let normals: Vec<Option<DVec3>> = (0..image.len())
+                .into_par_iter()
+                .map(|k| {
+                    let h = image[k].as_ref()?.as_ref()?;
+                    let (ix, iy) = ((k % nx) as i64, (k / nx) as i64);
+                    // Neighbours within the window, not across a depth jump.
+                    let jump = 0.8 + 3.0 * pitch * h.t;
+                    let mut win = w;
+                    loop {
+                        let mut pts = Vec::with_capacity(((2 * win + 1) * (2 * win + 1)) as usize);
+                        for dy in -win..=win {
+                            for dx in -win..=win {
+                                if let Some(q) = at(ix + dx, iy + dy) {
+                                    if (q.t - h.t).abs() < jump {
+                                        pts.push(q.frame_pos);
+                                    }
+                                }
+                            }
+                        }
+                        if pts.len() >= 5 || win > w {
+                            return Some(fit_normal(&pts, h.ray).unwrap_or(-h.ray));
+                        }
+                        win += 1;
+                    }
+                })
+                .collect();
+            for (c, n) in image.into_iter().zip(normals) {
+                if let Some(Some(mut h)) = c {
+                    h.normal = n.unwrap_or(-h.ray);
                     hits.push(h);
                 }
             }
+        } else {
+            hits.extend(image.into_iter().flatten().flatten());
         }
     }
     stats.hits = hits.len() + stats.lost_grazing;
 
-    // 2. Fuse: one point per cell (and sheet side), the most frontal one.
-    // Several sheets can share a cell (both faces of a thin wall): a hit joins the entry of the
-    // cell whose normal faces the same way.
-    let mut cells: HashMap<CellKey, Vec<(usize, u32)>> = HashMap::new();
-    for (k, h) in hits.iter().enumerate() {
-        let (region, s) = spacing_at(pass, h.true_pos);
-        let c = (h.true_pos / s).floor();
-        let list = cells.entry((region, c.x as i64, c.y as i64, c.z as i64)).or_default();
-        match list.iter_mut().find(|e| hits[e.0].true_normal.dot(h.true_normal) > 0.0) {
-            Some(e) => {
-                e.1 += 1;
-                if h.cos > hits[e.0].cos {
-                    e.0 = k;
+    // 2. Fuse: blue-noise thinning, the most frontal hits first (in random order within 0.05 of
+    // cosine), one point per `spacing` and sheet (the faces of a thin wall do not merge: a hit is
+    // only blocked by points whose surface faces the same way).
+    let cell = pass.density.iter().map(|r| r.spacing_mm).fold(pass.spacing_mm, f64::max).max(1e-3);
+    let mut order: Vec<(i64, u64, u32)> = hits.iter().enumerate().map(|(k, h)| (-(h.cos * 20.0).floor() as i64, mix(&[scene.seed, pass_index as u64, 0xf05e, k as u64]), k as u32)).collect();
+    order.sort_unstable();
+    // (hit, rays fused into it, has a duplicate)
+    let mut accepted: Vec<(u32, u32, bool)> = Vec::new();
+    let mut duplicates: Vec<u32> = Vec::new();
+    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
+    for &(_, hash, k) in &order {
+        let h = &hits[k as usize];
+        let r = spacing_at(pass, h.true_pos).1;
+        let c = (h.true_pos / cell).floor();
+        let (cx, cy, cz) = (c.x as i64, c.y as i64, c.z as i64);
+        let mut blocker: Option<(u32, f64)> = None;
+        'search: for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(list) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for &a in list {
+                            let q = &hits[accepted[a as usize].0 as usize];
+                            let d = q.true_pos.distance(h.true_pos);
+                            if d < r && q.true_normal.dot(h.true_normal) > 0.0 {
+                                blocker = Some((a, d));
+                                break 'search;
+                            }
+                        }
+                    }
                 }
             }
-            None => list.push((k, 1)),
+        }
+        match blocker {
+            Some((a, d)) => {
+                let acc = &mut accepted[a as usize];
+                acc.1 += 1;
+                let other_view = hits[acc.0 as usize].view != h.view;
+                if !acc.2 && other_view && d < 0.5 * r && ((hash >> 11) as f64 / (1u64 << 53) as f64) < pass.fusion.duplicates {
+                    acc.2 = true;
+                    duplicates.push(k);
+                }
+            }
+            None => {
+                grid.entry((cx, cy, cz)).or_default().push(accepted.len() as u32);
+                accepted.push((k, 1, false));
+            }
         }
     }
-    let mut kept: Vec<(usize, u32)> = cells.into_values().flatten().collect();
+    let mut kept: Vec<(usize, u32)> = accepted.iter().map(|a| (a.0 as usize, a.1)).chain(duplicates.iter().map(|&k| (k as usize, 1))).collect();
     kept.sort_unstable();
     stats.fused = kept.len();
 
@@ -283,20 +434,37 @@ pub fn scan_pass(scene: &Scene, pass_index: usize) -> PassScan {
                 continue;
             }
         }
-        points.push(ScanPoint { pos: h.pos, normal: h.true_normal, true_pos: h.true_pos, true_normal: h.true_normal, ray: h.ray, cos: h.cos, hits: count, kind: h.kind });
+        let normal = if pass.normals == NormalMode::True { h.true_normal } else { h.normal };
+        points.push(ScanPoint { pos: h.pos, normal, true_pos: h.true_pos, true_normal: h.true_normal, ray: h.ray, cos: h.cos, hits: count, kind: h.kind });
     }
     drop(hits);
 
-    // 3. Normals.
-    if pass.normals == NormalMode::Estimated {
-        estimate_normals(&mut points, pass);
-    }
-
-    // 4. The markers the scanner software would list (it saw the dot), before any cut.
+    // 3. The markers the scanner software would list (it saw the dot), before any loss on them.
     let listed = list_markers(scene, pass_index, &points);
 
-    // 5. Marker cut-outs.
-    let cuts: Vec<&Sticker> = scene.stickers.iter().filter(|s| s.cut_radius.is_some() && s.on_table_of_pass.is_none_or(|p| p == pass_index)).collect();
+    // 4. Points lost at random in the fusion, and on the stickers' black rings and halos.
+    let stickers: Vec<&Sticker> = scene.stickers.iter().filter(|s| s.on_table_of_pass.is_none_or(|p| p == pass_index)).collect();
+    let before = points.len();
+    let mut k = 0u64;
+    points.retain(|p| {
+        k += 1;
+        let mut rng = Rng::for_parts(&[scene.seed, pass_index as u64, 0x6b65, k]);
+        let mut keep = pass.fusion.keep;
+        for s in &stickers {
+            if (p.true_pos - v3(s.center)).length_squared() > (s.site_radius() + 2.0).powi(2) {
+                continue;
+            }
+            let (lateral, axial) = s.local(p.true_pos);
+            if axial > -s.back_limit && axial < s.height + 1.0 {
+                keep *= s.keep_share(lateral);
+            }
+        }
+        rng.uniform() < keep
+    });
+    stats.dropout += before - points.len();
+
+    // 5. Marker cut-outs (Revo's Fused export).
+    let cuts: Vec<&Sticker> = stickers.iter().copied().filter(|s| s.cut_radius.is_some()).collect();
     if !cuts.is_empty() {
         let before = points.len();
         points.retain(|p| {
@@ -335,11 +503,13 @@ pub fn scan_pass(scene: &Scene, pass_index: usize) -> PassScan {
         points.extend(extra);
     }
 
-    // 7. Registration error of the whole pass.
+    // 7. Registration error of the whole pass: the offset, then the pose error.
     let offset = v3(pass.offset_mm);
-    if offset != DVec3::ZERO {
+    let pose_error = pass.pose_error;
+    if offset != DVec3::ZERO || pose_error != Rigid::IDENTITY {
         for p in &mut points {
-            p.pos += offset;
+            p.pos = pose_error.apply(p.pos + offset);
+            p.normal = pose_error.apply_dir(p.normal);
         }
     }
 
@@ -372,63 +542,6 @@ fn classify(scene: &Scene, pass: usize, p: DVec3) -> PointKind {
     match &scene.passes[pass].table {
         Some(t) if t.sdf(p).abs() < scene.part.sdf(p).abs() => PointKind::Table,
         _ => PointKind::Part,
-    }
-}
-
-/// Plane fit over the neighbours on the same sheet (true normals within 60°, as a depth image's
-/// neighbours would be), oriented towards the scanner.
-fn estimate_normals(points: &mut [ScanPoint], pass: &PassSpec) {
-    let radius_of = |p: &ScanPoint| 2.5 * spacing_at(pass, p.true_pos).1;
-    let cell = points.iter().map(radius_of).fold(0.0, f64::max).max(1e-3);
-    let mut grid: HashMap<(i64, i64, i64), Vec<u32>> = HashMap::new();
-    for (k, p) in points.iter().enumerate() {
-        let c = (p.pos / cell).floor();
-        grid.entry((c.x as i64, c.y as i64, c.z as i64)).or_default().push(k as u32);
-    }
-    let normals: Vec<DVec3> = points
-        .par_iter()
-        .map(|p| {
-            let r = radius_of(p);
-            let c = (p.pos / cell).floor();
-            let (cx, cy, cz) = (c.x as i64, c.y as i64, c.z as i64);
-            let mut nb: Vec<DVec3> = Vec::with_capacity(48);
-            for dx in -1..=1 {
-                for dy in -1..=1 {
-                    for dz in -1..=1 {
-                        if let Some(list) = grid.get(&(cx + dx, cy + dy, cz + dz)) {
-                            for &j in list {
-                                let q = &points[j as usize];
-                                if (q.pos - p.pos).length_squared() <= r * r && q.true_normal.dot(p.true_normal) > 0.5 {
-                                    nb.push(q.pos);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            if nb.len() < 5 {
-                return p.true_normal;
-            }
-            let mean = nb.iter().copied().sum::<DVec3>() / nb.len() as f64;
-            let mut m = [[0.0f64; 3]; 3];
-            for q in &nb {
-                let d = *q - mean;
-                for i in 0..3 {
-                    for j in 0..3 {
-                        m[i][j] += d[i] * d[j];
-                    }
-                }
-            }
-            let n = smallest_eigenvector(m);
-            if n.dot(-p.ray) < 0.0 {
-                -n
-            } else {
-                n
-            }
-        })
-        .collect();
-    for (p, n) in points.iter_mut().zip(normals) {
-        p.normal = n;
     }
 }
 
@@ -484,6 +597,7 @@ fn list_markers(scene: &Scene, pass: usize, points: &[ScanPoint]) -> Vec<ListedM
         }
     }
     let offset = v3(scene.passes[pass].offset_mm);
+    let pose_error = scene.passes[pass].pose_error;
     scene
         .stickers
         .iter()
@@ -494,8 +608,8 @@ fn list_markers(scene: &Scene, pass: usize, points: &[ScanPoint]) -> Vec<ListedM
             let n = v3(s.normal);
             // Revo's centres sit about 0.1-0.2 mm above the surface (inside the sticker), its
             // normals are within about 1.5° of the surface's.
-            let centre = v3(s.center) + n * (0.4 * s.height) + DVec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.03 + offset;
-            let normal = (n + DVec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.02).normalize();
+            let centre = pose_error.apply(v3(s.center) + n * (0.4 * s.height) + DVec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.03 + offset);
+            let normal = pose_error.apply_dir((n + DVec3::new(rng.gauss(), rng.gauss(), rng.gauss()) * 0.02).normalize());
             ListedMarker { sticker: i, centre, normal, radius_mm: if rng.uniform() < 0.5 { 3.0 } else { 3.05 }, dot_points: dots[i] }
         })
         .collect()

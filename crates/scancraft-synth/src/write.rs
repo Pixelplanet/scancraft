@@ -22,6 +22,7 @@ pub const REFERENCE_MESH_FILE: &str = "reference_mesh.ply";
 
 /// Per-point label values in `<pass>.labels` (one byte per point, PLY order).
 pub const LABEL_PART: u8 = 0;
+/// A sticker on the part (stickers on a table or marker block are [`LABEL_TABLE`]).
 pub const LABEL_STICKER: u8 = 1;
 pub const LABEL_TABLE: u8 = 2;
 pub const LABEL_STRAY: u8 = 3;
@@ -132,9 +133,11 @@ fn colour(kind: PointKind, scene: &Scene, p: DVec3) -> ColorRgba {
     }
 }
 
-fn label(kind: PointKind) -> u8 {
+/// The label of a point: a sticker on a table or marker block is table (not the object).
+pub fn label(kind: PointKind, scene: &Scene) -> u8 {
     match kind {
         PointKind::Part => LABEL_PART,
+        PointKind::Sticker(i) if scene.stickers[i as usize].on_table_of_pass.is_some() => LABEL_TABLE,
         PointKind::Sticker(_) => LABEL_STICKER,
         PointKind::Table => LABEL_TABLE,
         PointKind::Stray => LABEL_STRAY,
@@ -175,7 +178,7 @@ pub fn generate(scene: &Scene, out: &Path, options: &Options) -> io::Result<Gene
         let cloud_name = format!("{}-pass-{id}.ply", scene.name);
         scancraft_io::save_ply_binary(&PointCloud::from_points(points), dir.join(&folder).join(&cloud_name)).map_err(to_io)?;
         let labels_name = format!("{}-pass-{id}.labels", scene.name);
-        std::fs::write(dir.join(&folder).join(&labels_name), scan.points.iter().map(|p| label(p.kind)).collect::<Vec<u8>>())?;
+        std::fs::write(dir.join(&folder).join(&labels_name), scan.points.iter().map(|p| label(p.kind, scene)).collect::<Vec<u8>>())?;
 
         let has_stickers = scene.stickers.iter().any(|s| s.on_table_of_pass.is_none_or(|p| p == i));
         let mut listed = Vec::new();

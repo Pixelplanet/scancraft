@@ -509,6 +509,115 @@ scancraft`: 89 and 88 (3 ignored) pass; the end-to-end test passes.
   0.0001 mm² from the marching cubes, not visible.
 - **Fills are smoother than the scanned texture round them** (left as decided, no noise added).
 
+### 2.5 What the synthetic scenes show (2026-11-28, branch `agent/synth-scenes`)
+
+30 synthetic scenes with an exact truth (`crates/scancraft-synth`, README there): plates, vents,
+a perforated grille, plates with screw holes / bosses / ribs, domes, balls, cylinders, a saddle,
+a cup, a block with edges, fine relief, fins, the shell like the Revo part (also standing on its
+rim). The simulated scanner was checked against S1-S3's `raw_preview.ply` with
+`examples/synth_realism.rs` (4 points per mm², normals 5° median, noise 0.025 mm correlated over
+0.55 mm, the stickers' dot measured and their black ring thin, empty or with an empty halo to
+9-12 mm, tables with clutter under most parts, passes 0.05-0.15 mm deep or tilted 0.22-0.25°
+against each other). The `*_marker_holes` scenes model Revo's Fused export (sites cut to 5.5 mm,
+no table). Every scene went through the app's pipeline with its defaults (`synth_eval`, passes at
+their true poses) twice: with the app's isolation, and with the table and clutter dropped by the
+generator's labels (`--truth-isolation`, to measure the meshers alone).
+
+Results: `E:\Claude\eval\synth\results.txt` (app isolation), `E:\Claude\eval\synth\truth_iso\results.txt`
+(label isolation), failures by kind in `failures.txt` beside each, one-page overviews
+`E:\Claude\eval\synth\overview.png` and `overview_truth_isolation.png`, renders in `img\` and
+`truth_iso\img\`. Make Solid stays watertight on every scene.
+
+**Before the meshers: object isolation on a table with clutter (app isolation, `results.txt`).**
+
+- A plate lying on a table is "plane-like" and is never taken as the object, so a marker block or
+  the can is: `perforated_grille` keeps 5 648 of 93 626 points (27 446 part points dropped in each
+  pass; both meshes empty), `relief_fine` keeps the can (70 036 part points dropped),
+  `plate_screws_bosses_ribs` pass 1 keeps 5 719 (31 137 part points dropped). `flat_markers` and
+  `flat_laser_strays` keep everything (table and clutter in the mesh), `flat_vents` falls back to
+  everything (Make Solid genus 75 for 5: the table closes the slots).
+- It depends on where the clutter stands: moving the marker block 4 mm turned `perforated_grille`
+  from "plate kept" into "marker block kept".
+- Where the part is found, table pieces at the contact come back with it: Make Solid with 5
+  components and genus 11 on `box_edges` (truth 1 and 0), 5 / genus 3 on `cylinder_r15_markers`,
+  5 / genus 7 on `thin_fins`, 7 on `shell_two_pass`.
+- Without a table (`ball_r15_marker_holes`) the plate under the ball is dropped (37 724 points), as
+  in the first run.
+- Images: `img\perforated_grille__overview.png`, `img\relief_fine__overview.png`,
+  `img\box_edges__overview_tilted.png`, `img\flat_vents__slot-6.png` (table inside the slot).
+
+**Mesher failures to work on, ranked (label isolation, `truth_iso\`).**
+
+1. **Sticker sites with an empty halo (S2's pattern) are left partly open by Reconstruct.** It
+   cuts and refills the disc but leaves the empty ring round it: 17 of 21 halo sites on curved
+   surfaces fail, 29 % of the site open in the median, up to 54 % (`dome_r60_markers` M4-r18 30 %,
+   M8-r33 41 %, `dome_density_steps` M8-r33 54 %, `grazing_cylinder_r30` M4-65 45 %,
+   `cylinder_r15_markers` M4-80 20 %). Make Solid closes them but 13 of 21 are off, median
+   |centre| 0.17 mm, worst 0.26 (`saddle_markers` M4 +0.20 with a 0.22 mm ring). Sites whose ring
+   is only thin (S1) mostly pass in Reconstruct (6 of 58 curved fail). Images:
+   `truth_iso\img\dome_r60_markers__M4-r18.png`, `__M8-r33.png`, `truth_iso\img\saddle_markers__M4.png`.
+2. **Pass misregistration is kept.** Reconstruct keeps a constant offset (`flat_two_pass_offset`:
+   pass-2-only surface -0.12 mm, sites -0.07 to -0.14; shell inside -0.147) and a tilt
+   (`flat_two_pass_tilt`: pass-2-only +0.235, sites up to +0.29, top relief std 0.094 mm). Make
+   Solid removes the constant offset (handled) but not the tilt (pass-2-only +0.137, sites +0.11 to
+   +0.19), and on the shell it moves the outside pass by -0.075 while the inside stays at -0.142:
+   0 of 18 features. Images: `truth_iso\img\flat_two_pass_tilt__overview.png`, `__M2.png`,
+   `truth_iso\img\shell_two_pass__overview_tilted.png`.
+3. **Holes and slots close or come out narrow** (now checked with `through` probes along the axis).
+   Reconstruct closes 93 of 99 holes of 1.5 mm (0.52 mm where open) and 6 of 36 of 3 mm (2.80),
+   5 of 18 louvre stations (1.76 for 2), slot 1.5 at 3 of 5 stations (1.10 wide), slot 3 2.79, 4
+   3.77; 3 of the 4 screw holes in the 2 mm plate have no walls at mid-thickness. Make Solid keeps every hole
+   open but narrow at mid-thickness: 1.5 -> 1.00, 3 -> 2.72, slot 1.5 -> 1.32, screw holes 3.2 ->
+   2.96-2.97 and 4.5 -> 4.26-4.29 (the shell's 3.2 holes 3.42-3.89, wide). Images:
+   `truth_iso\img\perforated_grille__holes-1.5.png`, `truth_iso\img\flat_vents__slot-1.5.png`.
+4. **Fine relief is flattened** (`relief_fine`, 0.25 mm spacing): Reconstruct keeps 41 % of the
+   0.3 mm emboss, 20 % of the 0.4 mm engraving, 19 % of the 0.2 mm bumps, 74 % of the 0.1 mm
+   stripe; Make Solid 74 / 63 / 38 / 84 %. The shell's stripe fails all 8 probes in Make Solid.
+   Images: `truth_iso\img\relief_fine__emboss.png`, `__bumps.png`.
+5. **Make Solid is thrown by correlated noise on curved marker sites**: thin-ring sites on curved
+   surfaces 25 of 58 fail (median |centre| 0.047, at the 0.05 limit), the noise series falls to
+   41 of 93 probes at 0.05 mm (Reconstruct 83), and every dome rim fails 7-8 of 8 probes (0.26 mm
+   from the edge line; Reconstruct 0.01). Images: `truth_iso\img\dome_r60_noise_005__overview.png`,
+   `truth_iso\img\dome_r60_markers__rim.png`.
+6. **Laser strays**: Reconstruct's preparation keeps 1 896 of the 1 966 strays the merge leaves
+   on the plate (96 %; its stray filter drops none) and 1 646 of 1 930 on the shell, where a stray
+   layer is left under 25 % of the window with pits to -0.48 mm. Make Solid's plate in the window
+   is wavy (relief std 0.062 mm, pits -0.25) and its made-up bottom lies at the stray depth (inner
+   sheet under 100 % of the window). Images: `truth_iso\img\flat_laser_strays__strays.png`,
+   `truth_iso\img\shell_two_pass__wall.png`.
+7. **Screw bosses**: Reconstruct caps the through pilot (2 extra surfaces, 2.16 mm for 2.5) and
+   loses the shell's pilot walls; Make Solid caps the shell's pilots (3 extra surfaces, 1.98-2.07
+   mm) and the plate's through pilot. Images: `truth_iso\img\shell_two_pass__boss-1.png`,
+   `truth_iso\img\plate_screws_bosses_ribs__boss-2.png`.
+8. **Cut-out sites of a Fused export**: Reconstruct leaves all 45 open (`markers_on_surface` keeps a
+   marker only with a point within 3 mm; a 5.5 mm cut has none); Make Solid's hole filling leaves
+   20 of 45 off (R 15 ball -0.07 to -0.08, flat rings 0.05-0.07, the saddle's band sites). This
+   happens only with the Fused export: every listed marker in a raw preview has dot points 0.05-0.9
+   mm from its centre. Images: `truth_iso\img\flat_marker_holes__M7.png`,
+   `truth_iso\img\ball_r15_marker_holes__M3-45.png`.
+9. **Edges**: the 0.5 mm fillet comes out 1.02 (Reconstruct) / 0.86 mm (Make Solid), the box step
+   has a 0.30 / 0.17 mm bead at its concave edge, plate edges are rounded 0.25-0.4 mm with beads of
+   0.13-0.16 mm in Make Solid (the corrected bead measure; the first run's 0.3-0.6 mm were slot
+   walls). Images: `truth_iso\img\box_edges__step.png`, `__edge-fillet-0.5.png`.
+10. **Thin fins**: the 0.6 mm fin fails 3 (Reconstruct) / 2 (Make Solid) of 5 probes, edges 0.3-0.4
+    mm off. Image: `truth_iso\img\thin_fins__fin-0.6.png`.
+
+**Alignment check:** Auto Align (geometry only) still puts the second pass of every symmetric part
+180° round (7 scenes).
+
+**What passes:** kept sites whose ring is only thin, on flat and large-radius surfaces (R 65 barrel
+7 of 8 features in both meshes); the dome surfaces and the density steps in Reconstruct; Make Solid's
+removal of a constant offset between overlapping passes; Make Solid's topology wherever isolation
+is clean (genus exact for the grille's 141 holes, the vents' 5 slots, the plate's 5 holes).
+
+**Corrections to the first run's numbers** (metric fixes): the 0.28-0.6 mm "beads beside slot
+edges" were slot walls measured against the far edge's rounding; the knurl's "169 % kept" was a
+sign error (it is raised relief); relief is now measured against the base 1.6 mm clear of the
+feature (the first run halved the emboss); "preparation keeps 2 781 of 6 753 strays" credited the
+merge's resampling to the preparation (it removes 3-15 % of what it receives); the blind pilots
+were never measured; the hole probes could not see caps; "pass offset handled" ignored a shared
+bias.
+
 ## 3. Found by the user in the app
 
 ### 3.1 New Project throws away the open project without asking

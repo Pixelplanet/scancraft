@@ -28,10 +28,10 @@ use scancraft_fusion::{segment_object, SegmentConfig, SegmentLabel};
 use scancraft_mesh::solid::markers::{Marker, MarkerSource};
 use scancraft_mesh::{FeatureSmoother, Mesher, PrepareConfig, PrepareReport, Solid, SolidConfig, SolidPoint, SurfaceConfig};
 
-use crate::scan::{scan_pass, PointKind};
+use crate::scan::scan_pass;
 use crate::scene::Scene;
 use crate::sdf::Rigid;
-use crate::write::{Truth, LABEL_PART, LABEL_STICKER, LABEL_STRAY, LABEL_TABLE};
+use crate::write::Truth;
 
 /// The app's defaults (`apps/scancraft/src/app.rs`, `impl Default for Settings`).
 pub mod defaults {
@@ -123,12 +123,7 @@ pub fn scan_in_memory(scene: &Scene) -> Vec<PassData> {
             let labels = scan
                 .points
                 .iter()
-                .map(|p| match p.kind {
-                    PointKind::Part => LABEL_PART,
-                    PointKind::Sticker(_) => LABEL_STICKER,
-                    PointKind::Table => LABEL_TABLE,
-                    PointKind::Stray => LABEL_STRAY,
-                })
+                .map(|p| crate::write::label(p.kind, scene))
                 .collect();
             let markers = scan
                 .listed

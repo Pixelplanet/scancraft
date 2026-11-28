@@ -158,7 +158,8 @@ pub struct ProbeResult {
     pub check: ProbeKind,
     pub passed: bool,
     /// On: distance to the mesh; Clear: distance of the nearest mesh (None = clear);
-    /// Height: the crossing nearest the expected one (None = no surface along the line).
+    /// Height: the crossing nearest the expected one (None = no surface along the line);
+    /// Through: the crossing nearest the point (None = open).
     pub value: Option<f64>,
 }
 
@@ -226,6 +227,10 @@ pub fn score(truth: &Truth, mesh: &Mesh) -> Report {
                     ProbeKind::Clear { radius } => {
                         let d = index.nearest(at, *radius);
                         (d.is_none(), d)
+                    }
+                    ProbeKind::Through { axis, half_length } => {
+                        let c = index.crossings(at, v3(*axis).normalize(), *half_length);
+                        (c.is_empty(), c.into_iter().min_by(|a, b| a.abs().total_cmp(&b.abs())))
                     }
                     ProbeKind::Height { normal, expect, tol, range } => {
                         let c = index.crossings(at, v3(*normal).normalize(), *range);

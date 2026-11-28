@@ -71,7 +71,12 @@ fn get_f(v: &Value, key: &str) -> Option<f64> {
 /// Every root of the true distance along o + t d, t in [a, b] (the distance is exact, so steps of
 /// |f| never jump over a surface).
 pub fn truth_roots(truth: &Truth, o: DVec3, d: DVec3, a: f64, b: f64) -> Vec<f64> {
-    let f = |t: f64| truth.part.sdf(o + d * t);
+    truth_roots_part(&truth.part, o, d, a, b)
+}
+
+/// [`truth_roots`] of a shape.
+pub fn truth_roots_part(part: &crate::sdf::Shape, o: DVec3, d: DVec3, a: f64, b: f64) -> Vec<f64> {
+    let f = |t: f64| part.sdf(o + d * t);
     let mut out = Vec::new();
     let (mut t, mut ft) = (a, f(a));
     while t < b {
@@ -118,33 +123,45 @@ fn walls(c: &[f64]) -> (Option<f64>, Option<f64>) {
     (neg, pos)
 }
 
-/// The two face normals at an edge point of the true part (normals sampled on a sphere round it
-/// and split into two groups), and the angle between them in degrees.
+/// The two face normals at an edge point of the true part, and the angle between them in
+/// degrees. Normals are sampled where points on a sphere of `radius` round the edge project to
+/// the surface, only where the projection stays within the sphere (so the opposite wall of a
+/// narrow slot is not taken for a face); each face's normal is the one that occurs most often
+/// (a plane gives the same normal everywhere, while points projected onto the edge itself give
+/// normals between the faces). Falls back to the mean of each group on curved faces.
 pub fn edge_faces(truth: &Truth, e: DVec3, radius: f64) -> Option<(DVec3, DVec3, f64)> {
     let f = |p: DVec3| truth.part.sdf(p);
     let golden = std::f64::consts::PI * (3.0 - 5f64.sqrt());
     let mut normals = Vec::new();
-    for k in 0..96 {
-        let z = 1.0 - 2.0 * (k as f64 + 0.5) / 96.0;
+    for k in 0..160 {
+        let z = 1.0 - 2.0 * (k as f64 + 0.5) / 160.0;
         let r = (1.0 - z * z).sqrt();
         let a = golden * k as f64;
         let u = DVec3::new(r * a.cos(), r * a.sin(), z);
         let q = project_to_surface(f, e + u * radius);
-        if f(q).abs() < 1e-5 && (q - e).length() > 0.6 * radius {
+        let d = (q - e).length();
+        if f(q).abs() < 1e-5 && d > 0.5 * radius && d <= radius * 1.0001 {
             normals.push(truth.part.normal(q));
         }
     }
-    let first = *normals.first()?;
-    let other = *normals.iter().min_by(|a, b| a.dot(first).total_cmp(&b.dot(first)))?;
-    let (mut s1, mut s2) = (DVec3::ZERO, DVec3::ZERO);
-    for n in &normals {
-        if n.dot(first) >= n.dot(other) {
-            s1 += *n;
-        } else {
-            s2 += *n;
+    let support = |n: DVec3| normals.iter().filter(|m| m.dot(n) > 0.9995).count();
+    let mode = |pool: &[DVec3]| pool.iter().copied().max_by_key(|n| support(*n));
+    let n1 = mode(&normals)?;
+    let far: Vec<DVec3> = normals.iter().copied().filter(|n| n.dot(n1) < 0.95).collect();
+    let n2 = mode(&far)?;
+    let (n1, n2) = if support(n1) >= 4 && support(n2) >= 4 {
+        (n1, n2)
+    } else {
+        let (mut s1, mut s2) = (DVec3::ZERO, DVec3::ZERO);
+        for n in &normals {
+            if n.dot(n1) >= n.dot(n2) {
+                s1 += *n;
+            } else {
+                s2 += *n;
+            }
         }
-    }
-    let (n1, n2) = (s1.try_normalize()?, s2.try_normalize()?);
+        (s1.try_normalize()?, s2.try_normalize()?)
+    };
     Some((n1, n2, n1.dot(n2).clamp(-1.0, 1.0).acos().to_degrees()))
 }
 
@@ -519,7 +536,8 @@ fn marker(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
     let sticker = truth.stickers.iter().min_by(|a, b| (v3(a.sticker.center) - c).length().total_cmp(&(v3(b.sticker.center) - c).length())).map(|s| &s.sticker);
     let outer = sticker.map_or(5.6, |s| s.outer_radius);
     let flat_r = sticker.map_or(4.3, |s| s.flat_radius);
-    let site = cut.unwrap_or(0.0).max(outer);
+    // The site: the disc, a cut-out, an empty halo round it (all must be closed).
+    let site = cut.unwrap_or(0.0).max(outer).max(get_f(&f.params, "site_radius_mm").unwrap_or(0.0));
     let r_max = (site + 2.5).max(9.0);
     let (e1, e2) = frame(n);
     let f_sdf = |p: DVec3| truth.part.sdf(p);
@@ -659,19 +677,30 @@ fn summarise_stations(e: &mut FeatureEval, st: &[Station], true_width: f64, labe
 
 fn slot(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
     let p = &f.params;
-    let (Some(c), Some(ax), Some(len), Some(w)) = (get_v2(p, "center"), get_v2(p, "axis"), get_f(p, "length_mm"), get_f(p, "width_mm")) else { return };
+    let (Some(ax), Some(len), Some(w)) = (get_v2(p, "axis"), get_f(p, "length_mm"), get_f(p, "width_mm")) else { return };
+    // One slot (`center`) or a row of them (`centers`, e.g. louvres).
+    let centres: Vec<[f64; 2]> = match (get_v2(p, "center"), p.get("centers").and_then(|v| v.as_array())) {
+        (Some(c), _) => vec![c],
+        (None, Some(list)) => list.iter().filter_map(|v| Some([v.get(0)?.as_f64()?, v.get(1)?.as_f64()?])).collect(),
+        _ => return,
+    };
     let axis = DVec3::new(ax[0], ax[1], 0.0).normalize();
     let across = DVec3::Z.cross(axis);
-    let centre = DVec3::new(c[0], c[1], 0.0);
-    let Some((top, bottom)) = plate_span(cx.truth, centre + across * (w / 2.0 + 1.2), 0.0) else { return };
     let reach = (len / 2.0 - w / 2.0 - 0.5).max(0.0) * 0.9;
-    let st: Vec<Station> = (0..5)
-        .map(|k| {
-            let s = -reach + 2.0 * reach * k as f64 / 4.0;
+    let per = if centres.len() > 1 { 3 } else { 5 };
+    let mut st = Vec::new();
+    for c in centres {
+        let centre = DVec3::new(c[0], c[1], 0.0);
+        let Some((top, bottom)) = plate_span(cx.truth, centre + across * (w / 2.0 + 1.2), 0.0) else { continue };
+        for k in 0..per {
+            let s = -reach + 2.0 * reach * k as f64 / (per - 1) as f64;
             let q = centre + axis * s;
-            station(index, q.x, q.y, across, w / 2.0, top, bottom)
-        })
-        .collect();
+            st.push(station(index, q.x, q.y, across, w / 2.0, top, bottom));
+        }
+    }
+    if st.is_empty() {
+        return;
+    }
     summarise_stations(e, &st, w, "width");
 }
 
@@ -782,16 +811,31 @@ fn boss(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
     e.put("mesh_surfaces_on_axis", me.len());
     e.put("extra_surfaces_on_axis", extra);
     e.put_opt("axis_worst_mm", errs.iter().copied().reduce(f64::max));
-    // The pilot's diameter halfway down its first open stretch.
-    let pilot_top = o.z - tr.first().copied().unwrap_or(60.0);
-    let z = pilot_top - 1.5;
-    let cx_ = mesh_line(index, DVec3::new(c[0], c[1], z), DVec3::X, -(pd / 2.0 + 2.0), pd / 2.0 + 2.0);
-    let dm = match walls(&cx_) {
+    // The pilot's diameter halfway along it: from the boss end (`end_z`) along `pilot_axis` by
+    // half of `pilot_depth_mm` (inside the recess, never in the plate above a blind one).
+    let (end_z, depth) = (get_f(p, "end_z"), get_f(p, "pilot_depth_mm"));
+    let axis = get_v3(p, "pilot_axis").unwrap_or(DVec3::Z).normalize();
+    let mid = match (end_z, depth) {
+        (Some(z), Some(dp)) => Some(DVec3::new(c[0], c[1], z) + axis * (0.5 * dp)),
+        _ => None,
+    };
+    let across = if axis.x.abs() < 0.9 { axis.cross(DVec3::X).cross(axis).normalize() } else { DVec3::Y };
+    let width_at = |q: DVec3, dir: DVec3| match walls(&mesh_line(index, q, dir, -(pd / 2.0 + 1.0), pd / 2.0 + 1.0)) {
         (Some(a), Some(b)) => Some(b - a),
         _ => None,
     };
+    let dm = mid.and_then(|q| {
+        let w: Vec<f64> = [across, axis.cross(across).normalize()].iter().filter_map(|d| width_at(q, *d)).collect();
+        mean(&w)
+    });
+    // True width there (the cut is a cylinder: the same diameter, unless the truth says otherwise).
+    let true_open = mid.is_some_and(|q| truth_roots(cx.truth, q - across * (pd / 2.0 + 1.0), across, 0.0, pd + 2.0).len() == 2);
     e.put("true_pilot_mm", pd);
     e.put_opt("pilot_mm", dm);
+    e.put("pilot_measured_at", mid.map_or(Value::Null, |q| Value::from(vec![r3(q.x), r3(q.y), r3(q.z)])));
+    if mid.is_some() && true_open && dm.is_none() {
+        e.fail("pilot walls not found halfway down the recess (filled or not meshed)".into());
+    }
     if extra > 0 {
         e.fail(format!("{extra} extra surface(s) across the pilot (capped or bridged)"));
     }
@@ -805,6 +849,13 @@ fn boss(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
 
 // ---------------------------------------------------------------------------------- relief
 
+/// Share of the relief height kept at each top probe: (height + mesh deviation at the top -
+/// mesh deviation of the base round it) / height. The base is the true surface at the foot of
+/// the relief, sampled on rings from the feature's half width + 1.6 mm out to + 2.9 mm (clear of
+/// the mesher's skirt round it); where no base is found the top is measured against the truth
+/// alone. A knurl (`peak_valley`) is measured as peak minus valley. A top with no mesh along
+/// its line is counted as missing (the solid is perforated there or the surface was dropped),
+/// not as 0 % kept. Too little (below 80 %, 70 % for grooves) and too much (above 125 %) fail.
 fn relief(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
     let p = &f.params;
     let h = match (get_f(p, "height_mm"), get_f(p, "depth_mm")) {
@@ -814,55 +865,95 @@ fn relief(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
     };
     let truth = cx.truth;
     let fs = |q: DVec3| truth.part.sdf(q);
+    let half_width = get_f(p, "width_mm").or_else(|| get_f(p, "diameter_mm")).map_or(0.4, |w| 0.5 * w);
+    let (r0, r1) = (half_width + 1.6, half_width + 2.9);
     let mut kept = Vec::new();
-    for probe in &f.probes {
-        let note = probe.note.to_lowercase();
-        let is_top = ["top", "peak", "floor", "crest", "ridge"].iter().any(|w| note.contains(w)) && !note.contains("beside");
-        let ProbeKind::Height { normal, .. } = &probe.check else { continue };
-        if !is_top {
-            continue;
-        }
-        let at = v3(probe.point);
-        let n = v3(*normal).normalize();
-        let Some(d_top) = dev_at(index, at, n, 1.5) else {
-            kept.push(0.0);
-            continue;
+    let mut missing = 0usize;
+    let mut no_base = 0usize;
+    if p.get("peak_valley").and_then(|v| v.as_bool()) == Some(true) {
+        let line = |probe: &crate::scene::Probe| -> Option<f64> {
+            let ProbeKind::Height { normal, .. } = &probe.check else { return None };
+            dev_at(index, v3(probe.point), v3(*normal).normalize(), 1.0)
         };
-        // The base round it: true surface points about h below the top (above, for a groove).
-        let (e1, e2) = frame(n);
-        let mut base = Vec::new();
-        for ri in 0..8 {
-            let r = 0.8 + 0.3 * ri as f64;
-            for k in 0..16 {
-                let a = std::f64::consts::TAU * k as f64 / 16.0;
-                let q = project_to_surface(fs, at - n * h + (e1 * a.cos() + e2 * a.sin()) * r);
-                let level = (q - at).dot(n) + h;
-                if fs(q).abs() < 1e-4 && level.abs() < 0.03 && truth.part.normal(q).dot(n) > 0.95 {
-                    if let Some(d) = dev_at(index, q, truth.part.normal(q), 1.5) {
-                        base.push(d);
+        let peaks: Vec<&crate::scene::Probe> = f.probes.iter().filter(|q| q.note.contains("peak")).collect();
+        let valleys: Vec<&crate::scene::Probe> = f.probes.iter().filter(|q| q.note.contains("valley")).collect();
+        for (pk, va) in peaks.iter().zip(&valleys) {
+            match (line(pk), line(va)) {
+                (Some(a), Some(b)) => kept.push((h + a - b) / h),
+                _ => missing += 1,
+            }
+        }
+    } else {
+        for probe in &f.probes {
+            let note = probe.note.to_lowercase();
+            let is_top = ["top", "peak", "floor", "crest", "ridge"].iter().any(|w| note.contains(w)) && !note.contains("beside");
+            let ProbeKind::Height { normal, .. } = &probe.check else { continue };
+            if !is_top {
+                continue;
+            }
+            let at = v3(probe.point);
+            let n = v3(*normal).normalize();
+            let Some(d_top) = dev_at(index, at, n, 1.5) else {
+                missing += 1;
+                continue;
+            };
+            // The base round it: true surface points about h below the top (above, for a groove).
+            let (e1, e2) = frame(n);
+            let mut base = Vec::new();
+            for ri in 0..6 {
+                let r = r0 + (r1 - r0) * ri as f64 / 5.0;
+                for k in 0..16 {
+                    let a = std::f64::consts::TAU * k as f64 / 16.0;
+                    let q = project_to_surface(fs, at - n * h + (e1 * a.cos() + e2 * a.sin()) * r);
+                    let level = (q - at).dot(n) + h;
+                    if fs(q).abs() < 1e-4 && level.abs() < 0.03 && truth.part.normal(q).dot(n) > 0.95 {
+                        if let Some(d) = dev_at(index, q, truth.part.normal(q), 1.5) {
+                            base.push(d);
+                        }
                     }
                 }
             }
+            let d_base = median(base).unwrap_or_else(|| {
+                no_base += 1;
+                0.0
+            });
+            kept.push((h + d_top - d_base) / h);
         }
-        let d_base = median(base).unwrap_or(0.0);
-        kept.push((h + d_top - d_base) / h);
     }
     let k = median(kept.clone());
     let worst = kept.iter().copied().reduce(f64::min);
+    let most = kept.iter().copied().reduce(f64::max);
     e.put("true_height_mm", h);
     e.put_opt("height_kept", k);
     e.put_opt("height_kept_worst", worst);
+    e.put_opt("height_kept_most", most);
+    e.put("tops_missing", missing);
+    e.put("tops_without_base", no_base);
+    e.put("base_ring_mm", serde_json::json!([r3(r0), r3(r1)]));
+    let what = if h < 0.0 { "depth" } else { "height" };
     let limit = if h < 0.0 { 0.7 } else { 0.8 };
     if let Some(k) = k.filter(|k| *k < limit) {
-        e.fail(format!("only {:.0} % of the {} kept", 100.0 * k, if h < 0.0 { "depth" } else { "height" }));
+        e.fail(format!("only {:.0} % of the {what} kept", 100.0 * k));
+    }
+    if let Some(k) = k.filter(|k| *k > 1.25) {
+        e.fail(format!("{:.0} % of the {what}: exaggerated", 100.0 * k));
+    }
+    if missing > 0 {
+        e.fail(format!("no surface at {missing} of {} tops (perforated or dropped)", missing + kept.len()));
     }
 }
 
 // ---------------------------------------------------------------------------------- edges
 
-/// Deviation profile across an edge on both faces, relative to each face's level 2.5-3 mm from
-/// the edge: the highest bulge (mm, outwards) from 0.3 mm on, and how far from the edge the mesh
-/// is more than 0.03 mm off that level.
+/// Deviation profile across an edge on both faces, relative to each face's own level further
+/// away: the highest bulge (mm, outwards) from 0.3 mm on, and how far from the edge the mesh is
+/// more than 0.03 mm off that level.
+///
+/// The walk along a face stops 1 mm before the face ends (its far edge, the bottom of a slot
+/// wall), so the far edge's rounding is not taken for this face's level; a face shorter than
+/// 1.8 mm is not measured. The level is the mean over the last 0.5 mm of the walk. The mesh is
+/// searched along the face normal only up to 0.45 x the free room in front of the face and the
+/// material behind it (the opposite wall of a narrow slot is not this face).
 fn edge_profile(truth: &Truth, index: &MeshIndex, e: DVec3, n1: DVec3, n2: DVec3) -> (Option<f64>, Option<f64>) {
     let fs = |q: DVec3| truth.part.sdf(q);
     let (mut bead, mut band): (Option<f64>, Option<f64>) = (None, None);
@@ -870,28 +961,40 @@ fn edge_profile(truth: &Truth, index: &MeshIndex, e: DVec3, n1: DVec3, n2: DVec3
         let Some(t) = (nb - na * nb.dot(na)).try_normalize() else { continue };
         // Along face a away from the edge: whichever direction stays on that face.
         let dir = [-t, t].into_iter().find(|d| {
-            let q = project_to_surface(fs, e + *d * 1.5);
-            (q - (e + *d * 1.5)).length() < 0.05 && truth.part.normal(q).dot(na) > 0.98
+            let q = project_to_surface(fs, e + *d * 1.0);
+            (q - (e + *d * 1.0)).length() < 0.05 && truth.part.normal(q).dot(na) > 0.98
         });
         let Some(dir) = dir else { continue };
-        // Deviations along the face, then taken relative to the face's level 2.5-3 mm away (so
-        // a pass that sits too deep does not count as a bead).
-        let mut prof = Vec::new();
-        for k in 1..=30 {
+        // How far the face goes (up to 6 mm).
+        let mut extent = 6.0;
+        for k in 1..=60 {
             let s = 0.1 * k as f64;
             let q = project_to_surface(fs, e + dir * s);
-            if truth.part.normal(q).dot(na) < 0.98 {
+            if truth.part.normal(q).dot(na) < 0.98 || (q - (e + dir * s)).length() > 0.05 {
+                extent = s - 0.1;
                 break;
             }
-            if let Some(d) = dev_at(index, q, na, 1.0) {
+        }
+        let reach = (extent - 1.0).min(3.0);
+        if reach < 0.8 + 1e-9 {
+            continue;
+        }
+        let mut prof = Vec::new();
+        for k in 1..=((reach / 0.1).round() as usize) {
+            let s = 0.1 * k as f64;
+            let q = project_to_surface(fs, e + dir * s);
+            let room = truth_roots(truth, q + na * 0.02, na, 0.0, 3.0).first().copied().unwrap_or(3.0);
+            let back = truth_roots(truth, q - na * 0.02, -na, 0.0, 3.0).first().copied().unwrap_or(3.0);
+            let range = (0.45 * room.min(back)).clamp(0.1, 1.0);
+            if let Some(d) = dev_at(index, q, na, range) {
                 prof.push((s, d));
             }
         }
-        let far: Vec<f64> = prof.iter().filter(|p| p.0 >= 2.45).map(|p| p.1).collect();
+        let far: Vec<f64> = prof.iter().filter(|p| p.0 >= reach - 0.5).map(|p| p.1).collect();
         let Some(level) = mean(&far) else { continue };
         for (s, d) in prof {
             let d = d - level;
-            if s >= 0.3 {
+            if s >= 0.3 && s < reach - 0.5 {
                 bead = Some(bead.map_or(d, |b| b.max(d)));
             }
             if d.abs() > 0.03 {
@@ -994,9 +1097,13 @@ fn strays(e: &mut FeatureEval, f: &Feature, index: &MeshIndex, cx: &Context) {
         if cx.solid {
             e.put("solid_dropped_laser_strays", s.solid_dropped);
         } else {
+            // The preparation gets the merged cloud: compare with what the merge left (the merge's
+            // 0.5 mm resampling already thins the strays with everything else).
             e.put("strays_after_prepare", s.after_prepare);
-            if s.input > 0 && s.after_prepare as f64 > 0.05 * s.input as f64 {
-                e.fail(format!("{} of {} stray points left after preparation", s.after_prepare, s.input));
+            let removed = if s.after_merge > 0 { 1.0 - s.after_prepare as f64 / s.after_merge as f64 } else { 0.0 };
+            e.put("prepare_removed_share", r3(removed));
+            if s.after_merge > 0 && s.after_prepare as f64 > 0.05 * s.after_merge as f64 {
+                e.fail(format!("preparation keeps {} of the {} stray points the merge left ({} in the passes)", s.after_prepare, s.after_merge, s.input));
             }
         }
     }
@@ -1043,31 +1150,43 @@ fn flatness(e: &mut FeatureEval, index: &MeshIndex, cx: &Context) {
 
 // ---------------------------------------------------------------------------- pass offsets
 
+/// Mean signed distance of the mesh to the truth on smooth surface (true normal the same 1 mm
+/// round, at least 1.5 mm from an edge) seen by pass 1 only, by the other passes only and by
+/// both. `bias_mm` is the largest |mean| of a group against the truth; `step_mm` the largest
+/// difference between the groups (pass 1 only vs other passes only included). Handled = both
+/// within 0.05 mm.
 fn pass_offset(index: &MeshIndex, cx: &Context) -> Value {
     let groups: [(&str, Box<dyn Fn(u32) -> bool + Sync>); 3] = [("pass_1_only", Box::new(|c| c == 1)), ("other_passes_only", Box::new(|c| c != 0 && c & 1 == 0)), ("overlap", Box::new(|c| c & 1 != 0 && c & !1 != 0))];
+    let truth = cx.truth;
+    let fs = |q: DVec3| truth.part.sdf(q);
+    let smooth = |q: DVec3, n: DVec3| {
+        let (e1, e2) = frame(n);
+        [e1, -e1, e2, -e2].iter().all(|d| {
+            let a = project_to_surface(fs, q + *d * 1.5);
+            (a - (q + *d * 1.5)).length() < 0.2 && truth.part.normal(a).dot(n) > 0.995
+        })
+    };
     let mut out = serde_json::Map::new();
     let mut means = Vec::new();
     for (name, keep) in &groups {
         let pts: Vec<&(DVec3, DVec3)> = cx.samples.points.iter().zip(&cx.samples.covered).filter(|(_, c)| keep(**c)).map(|(s, _)| s).collect();
-        let devs: Vec<f64> = pts.par_iter().filter_map(|(q, n)| dev_at(index, *q, *n, 1.0)).collect();
-        let m = mean(&devs);
+        let devs: Vec<f64> = pts.par_iter().filter(|(q, n)| smooth(*q, *n)).filter_map(|(q, n)| dev_at(index, *q, *n, 1.0)).collect();
+        let m = (devs.len() >= 30).then(|| mean(&devs)).flatten();
         let spread = m.and_then(|m| rms(&devs.iter().map(|d| d - m).collect::<Vec<_>>()));
         out.insert(name.to_string(), serde_json::json!({"samples": pts.len(), "measured": devs.len(), "mean_mm": m.map(r3), "spread_mm": spread.map(r3)}));
         means.push(m);
     }
-    let biases: Vec<Value> = cx.truth.passes.iter().map(|p| serde_json::json!({"pass": p.id, "depth_bias_mm": p.spec.depth_bias_mm, "offset_mm": p.spec.offset_mm})).collect();
+    let biases: Vec<Value> = cx.truth.passes.iter().map(|p| serde_json::json!({"pass": p.id, "depth_bias_mm": p.spec.depth_bias_mm, "offset_mm": p.spec.offset_mm, "pose_error": p.spec.pose_error})).collect();
     out.insert("pass_faults".into(), Value::from(biases));
-    let step = match (means[0], means[2]) {
+    let diff = |a: Option<f64>, b: Option<f64>| match (a, b) {
         (Some(a), Some(b)) => Some((a - b).abs()),
         _ => None,
     };
-    let step2 = match (means[1], means[2]) {
-        (Some(a), Some(b)) => Some((a - b).abs()),
-        _ => None,
-    };
-    let worst = [step, step2].into_iter().flatten().reduce(f64::max);
-    out.insert("step_mm".into(), worst.map(r3).map_or(Value::Null, Value::from));
-    out.insert("handled".into(), Value::from(worst.is_none_or(|s| s <= 0.05)));
+    let step = [diff(means[0], means[2]), diff(means[1], means[2]), diff(means[0], means[1])].into_iter().flatten().reduce(f64::max);
+    let bias = means.iter().flatten().map(|m| m.abs()).reduce(f64::max);
+    out.insert("step_mm".into(), step.map(r3).map_or(Value::Null, Value::from));
+    out.insert("bias_mm".into(), bias.map(r3).map_or(Value::Null, Value::from));
+    out.insert("handled".into(), Value::from(step.is_none_or(|s| s <= 0.05) && bias.is_none_or(|b| b <= 0.05)));
     Value::Object(out)
 }
 

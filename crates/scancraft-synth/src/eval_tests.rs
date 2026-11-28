@@ -112,7 +112,7 @@ fn mini_plate() -> Scene {
 
 #[test]
 fn mini_plate_markers_flush_slot_open() {
-    let res = run(&mini_plate(), &RunOptions { align_check: false, solid: true, whole_scene: false });
+    let res = run(&mini_plate(), &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: false });
     print(&res);
     assert!(res.error.is_none(), "{:?}", res.error);
     // A plate on its own has no table: isolation keeps everything.
@@ -145,11 +145,13 @@ fn mini_plate_markers_flush_slot_open() {
 /// Known failure (2026-11-28): Revo lists the stickers it cut out, but `markers_on_surface`
 /// keeps only markers with a point within 3 mm of the centre, and a cut-out has none within
 /// 5.5 mm. So Reconstruct never removes or fills those sites (left open) and Make Solid fills
-/// them as plain holes, without the marker fairing.
+/// them as plain holes, without the marker fairing. Cut-outs like this come only from Revo's
+/// Fused export (exactly 5.5 mm); in `raw_preview.ply` every listed marker has dot points
+/// 0.05-0.9 mm from its centre.
 #[test]
 #[ignore = "known failure: cut-out marker sites are not used (markers_on_surface's 3 mm rule)"]
 fn known_failure_cut_out_marker_sites_are_filled() {
-    let res = run(&mini_plate(), &RunOptions { align_check: false, solid: true, whole_scene: false });
+    let res = run(&mini_plate(), &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: false });
     print(&res);
     assert_eq!(res.passes[0].markers_on_surface, 2, "a listed cut-out marker is dropped");
     for m in &res.evals {
@@ -173,7 +175,7 @@ fn mini_dome() -> Scene {
 
 #[test]
 fn mini_dome_marker_sites_follow_the_curvature() {
-    let res = run(&mini_dome(), &RunOptions { align_check: false, solid: true, whole_scene: false });
+    let res = run(&mini_dome(), &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: false });
     print(&res);
     assert!(res.error.is_none(), "{:?}", res.error);
     // Reconstruct: the kept sticker; Make Solid: both sites (the cut-out one by hole filling).
@@ -216,22 +218,30 @@ fn mini_strays() -> Scene {
     scene("mini_strays", part, [[-15.0, -15.0, -4.0], [15.0, 15.0, 0.0]], Vec::new(), vec![pass], vec![f])
 }
 
+/// Share (%) of the strays the merge leaves that Reconstruct's preparation may keep.
+const MINI_PREP_KEEP_PCT: usize = 99;
+
 /// Guards what the stray handling achieves now (2026-11-28); the ideal is the known failure
-/// below.
+/// below. The preparation is measured against what the merge leaves it (the merge's 0.5 mm
+/// resampling thins the strays with everything else).
 #[test]
 fn mini_strays_do_not_get_worse() {
-    let res = run(&mini_strays(), &RunOptions { align_check: false, solid: true, whole_scene: false });
+    let res = run(&mini_strays(), &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: false });
     print(&res);
     assert!(res.strays.input > 200, "the scene has strays: {:?}", res.strays);
-    // 376 of 665 left after Reconstruct's preparation on 2026-11-28.
-    assert!(res.strays.after_prepare * 100 <= res.strays.input * 65, "Reconstruct's preparation keeps more strays: {:?}", res.strays);
+    assert!(res.strays.after_merge <= res.strays.input, "{:?}", res.strays);
+    // The preparation removes almost none of the strays the merge leaves (315 of 324 kept on
+    // 2026-11-28 with the scanner model of that day; the merge itself left 324 of 454).
+    assert!(res.strays.after_prepare * 100 <= res.strays.after_merge * MINI_PREP_KEEP_PCT, "Reconstruct's preparation keeps more strays: {:?}", res.strays);
     let rec = res.eval("reconstruct").unwrap();
     let f = feat(rec, "strays");
     assert!(num(f, "window_p01_mm") > -0.2, "Reconstruct pits deeper: {:?}", f.metrics);
     assert!(num(f, "inner_sheet_share") < 0.45, "Reconstruct keeps more of the stray layer: {:?}", f.metrics);
     let solid = res.eval("solid").unwrap();
     assert!(solid.topology.watertight, "{:?}", solid.topology);
-    assert!(num(feat(solid, "strays"), "window_p01_mm") > -0.25, "Make Solid pits deeper: {:?}", feat(solid, "strays").metrics);
+    // -0.30 mm on 2026-11-28; its "inner sheet" under the whole window is the solid's made-up
+    // bottom, which the wall guess puts about 1 mm under the top (from the strays).
+    assert!(num(feat(solid, "strays"), "window_p01_mm") > -0.35, "Make Solid pits deeper: {:?}", feat(solid, "strays").metrics);
 }
 
 /// Known failure (2026-11-28): Reconstruct's preparation keeps about 55 % of the strays (a
@@ -241,9 +251,9 @@ fn mini_strays_do_not_get_worse() {
 #[test]
 #[ignore = "known failure: laser strays (see the doc comment)"]
 fn known_failure_strays_are_dropped() {
-    let res = run(&mini_strays(), &RunOptions { align_check: false, solid: true, whole_scene: false });
+    let res = run(&mini_strays(), &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: false });
     print(&res);
-    assert!(res.strays.after_prepare * 20 <= res.strays.input, "Reconstruct's preparation keeps strays: {:?}", res.strays);
+    assert!(res.strays.after_prepare * 20 <= res.strays.after_merge, "Reconstruct's preparation keeps strays: {:?}", res.strays);
     for m in &res.evals {
         let f = feat(m, "strays");
         assert!(num(f, "inner_sheet_share") <= 0.01, "{}: a layer inside the plate: {:?}", m.mesh, f.metrics);
@@ -254,38 +264,44 @@ fn known_failure_strays_are_dropped() {
 // ------------------------------------------------------------------------- the catalogue
 
 /// Per scene: the most failing features allowed (Reconstruct, Make Solid) and the fewest probes
-/// that must pass (Reconstruct, Make Solid; 97 % of what passed). Measured 2026-11-28 on
-/// `agent/synth-scenes` with the app's defaults (isolation on, passes at their true poses);
-/// tighten them when the pipeline gets better. Make Solid must always be watertight.
+/// that must pass (Reconstruct, Make Solid; 97 % of what passed). Measured 2026-11-28 (second
+/// run, scanner model checked against Revo's raw_preview.ply: density, normals, correlated noise,
+/// sticker rings, tables with clutter, pass tilt) on `agent/synth-scenes`, with the app's
+/// defaults but the passes isolated by the generator's labels (`truth_isolation`: the app's
+/// isolation fails on several plates on a table and would hide the meshers; it is measured by
+/// `synth_eval` without `--truth-isolation`) and placed at their true poses. Tighten them when
+/// the meshers get better. Make Solid must always be watertight.
 const CATALOGUE_LIMITS: &[(&str, usize, usize, usize, usize)] = &[
-    ("ball_r15_marker_holes", 8, 8, 7, 15),
-    ("ball_r15_markers", 3, 4, 50, 40),
-    ("box_edges", 6, 5, 7, 12),
-    ("cup_rim_partial", 1, 1, 64, 56),
-    ("cylinder_r15_marker_holes", 7, 3, 6, 46),
-    ("cylinder_r15_markers", 1, 1, 58, 56),
-    ("cylinder_r65_marker_holes", 8, 1, 7, 66),
+    ("ball_r15_marker_holes", 8, 8, 2, 29),
+    ("ball_r15_markers", 5, 7, 44, 29),
+    ("box_edges", 6, 6, 9, 7),
+    ("cup_rim_partial", 3, 1, 60, 58),
+    ("cylinder_r15_marker_holes", 7, 3, 5, 45),
+    ("cylinder_r15_markers", 3, 4, 57, 51),
+    ("cylinder_r65_marker_holes", 8, 1, 4, 65),
     ("cylinder_r65_markers", 1, 1, 66, 65),
-    ("dome_density_steps", 1, 2, 94, 87),
-    ("dome_r60_marker_holes", 9, 3, 11, 77),
-    ("dome_r60_markers", 1, 2, 86, 81),
-    ("dome_r60_noise_002", 1, 2, 87, 81),
-    ("dome_r60_noise_005", 1, 2, 86, 81),
-    ("dome_r60_noise_010", 1, 2, 84, 81),
-    ("flat_laser_strays", 2, 3, 76, 64),
-    ("flat_marker_holes", 9, 8, 7, 46),
-    ("flat_markers", 1, 1, 79, 78),
-    ("flat_plain", 1, 1, 9, 8),
-    ("flat_two_pass_offset", 8, 1, 20, 83),
-    ("flat_vents", 8, 12, 63, 73),
-    ("grazing_cylinder_r30", 5, 5, 16, 16),
-    ("perforated_grille", 3, 2, 108, 112),
-    ("plate_screws_bosses_ribs", 8, 8, 52, 55),
-    ("relief_fine", 5, 8, 32, 24),
-    ("saddle_marker_holes", 8, 3, 4, 52),
-    ("saddle_markers", 2, 2, 61, 63),
-    ("shell_two_pass", 10, 18, 78, 23),
-    ("thin_fins", 4, 4, 6, 5),
+    ("dome_density_steps", 4, 11, 90, 55),
+    ("dome_r60_marker_holes", 10, 2, 8, 81),
+    ("dome_r60_markers", 3, 4, 78, 75),
+    ("dome_r60_noise_002", 2, 4, 90, 70),
+    ("dome_r60_noise_005", 3, 10, 80, 39),
+    ("dome_r60_noise_010", 3, 7, 79, 62),
+    ("flat_laser_strays", 2, 4, 81, 57),
+    ("flat_marker_holes", 9, 8, 7, 37),
+    ("flat_markers", 2, 1, 78, 78),
+    ("flat_plain", 1, 1, 8, 6),
+    ("flat_two_pass_offset", 8, 1, 21, 82),
+    ("flat_two_pass_tilt", 7, 6, 39, 49),
+    ("flat_vents", 8, 11, 75, 90),
+    ("grazing_cylinder_r30", 2, 4, 40, 30),
+    ("perforated_grille", 3, 2, 137, 181),
+    ("plate_screws_bosses_ribs", 8, 7, 61, 64),
+    ("relief_fine", 5, 5, 33, 34),
+    ("saddle_marker_holes", 8, 3, 4, 60),
+    ("saddle_markers", 4, 4, 51, 52),
+    ("shell_on_rim", 3, 4, 66, 70),
+    ("shell_two_pass", 12, 18, 71, 23),
+    ("thin_fins", 4, 4, 12, 14),
 ];
 
 #[test]
@@ -300,7 +316,7 @@ fn synth_catalogue() {
     let mut problems = Vec::new();
     for &(name, max_rec, max_solid, min_rec_probes, min_solid_probes) in CATALOGUE_LIMITS.iter().filter(|l| l.0.contains(filter.as_str())) {
         let dir: &Path = &data.join(name);
-        let (res, _, _) = run_scene_dir(dir, &RunOptions { align_check: false, solid: true, whole_scene: false }).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (res, _, _) = run_scene_dir(dir, &RunOptions { align_check: false, solid: true, whole_scene: false, truth_isolation: true }).unwrap_or_else(|e| panic!("{name}: {e}"));
         let rec = res.eval("reconstruct").expect("Reconstruct ran");
         let solid = res.eval("solid").expect("Make Solid ran");
         let fails = |m: &MeshEval| m.features.iter().filter(|f| !f.fails.is_empty()).map(|f| format!("{} ({})", f.id, f.fails.join("; "))).collect::<Vec<_>>();

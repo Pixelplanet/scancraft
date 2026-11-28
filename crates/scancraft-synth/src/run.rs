@@ -26,11 +26,14 @@ pub struct RunOptions {
     /// The app's "whole scene" setting: no object isolation (the default is off, so the app
     /// isolates every imported pass).
     pub whole_scene: bool,
+    /// Not the app: isolate every pass by the generator's labels (drop the table and clutter,
+    /// keep everything else), so the meshers are measured on a perfect isolation.
+    pub truth_isolation: bool,
 }
 
 impl Default for RunOptions {
     fn default() -> Self {
-        RunOptions { align_check: true, solid: true, whole_scene: false }
+        RunOptions { align_check: true, solid: true, whole_scene: false, truth_isolation: false }
     }
 }
 
@@ -74,6 +77,9 @@ pub struct SceneResult {
     pub scene: String,
     /// Run with the app's "whole scene" setting (no isolation).
     pub whole_scene: bool,
+    /// Isolated by the generator's labels instead of the app's isolation.
+    #[serde(default)]
+    pub truth_isolation: bool,
     pub tags: Vec<String>,
     pub passes: Vec<PassReport>,
     pub import: Stage,
@@ -122,11 +128,23 @@ fn inside_count(truth: &Truth, pts: impl Iterator<Item = Vec3>) -> usize {
 pub fn run_scene(truth: &Truth, passes: &[PassData], reference: &Mesh, import: Stage, options: &RunOptions) -> (SceneResult, Option<Outputs>) {
     let t_all = Instant::now();
     let sampler = Sampler::start();
-    let mut res = SceneResult { scene: truth.scene.clone(), tags: truth.tags.clone(), import, whole_scene: options.whole_scene, ..Default::default() };
+    let mut res = SceneResult { scene: truth.scene.clone(), tags: truth.tags.clone(), import, whole_scene: options.whole_scene, truth_isolation: options.truth_isolation, ..Default::default() };
 
     // Import's isolation (whole_scene is off by default).
     let t = Instant::now();
-    let isolations: Vec<app::Isolation> = passes.iter().map(|p| app::isolate(&p.points)).collect();
+    let isolations: Vec<app::Isolation> = passes
+        .iter()
+        .map(|p| match (&p.labels, options.truth_isolation) {
+            (Some(l), true) => {
+                // The labels choose the points; the support plane is the app's (Make Solid uses it).
+                let object: Vec<bool> = l.iter().map(|v| *v != crate::write::LABEL_TABLE).collect();
+                let kept = object.iter().filter(|o| **o).count();
+                let support = app::isolate(&p.points).support;
+                app::Isolation { object, support, kept, fallback: false, seconds: 0.0 }
+            }
+            _ => app::isolate(&p.points),
+        })
+        .collect();
     res.isolate = Stage { seconds: t.elapsed().as_secs_f64(), peak_mb: sampler.mark() };
 
     let poses: Vec<Transform> = passes.iter().map(|p| app::to_transform(&p.pass_to_part)).collect();
