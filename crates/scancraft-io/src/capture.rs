@@ -584,7 +584,7 @@ mod tests {
         // Serial numbers have a known form (the placeholder D00000000B0S00E1B; the real ones end
         // in the model code). Without this computer's key, hashing candidates in any public way
         // never gives the stored name; another computer gives another name.
-        let serial = "D04719263B0S00E1B";
+        let serial = "D00000042B0S00E1B";
         let stored = serial_hash(serial, &random_key());
         let public = |s: &str| -> Vec<String> {
             let take = |d: &[u8]| -> String { d.iter().take(8).map(|b| format!("{b:02x}")).collect() };
