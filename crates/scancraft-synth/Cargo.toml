@@ -1,0 +1,20 @@
+[package]
+name = "scancraft-synth"
+description = "Synthetic scan scenes with ground truth for testing ScanCraft's meshing (development only)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+scancraft-core.workspace = true
+scancraft-io.workspace = true
+glam.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+# examples/synth_baseline.rs: the app's Reconstruct on a scene, scored against the truth.
+scancraft-mesh.workspace = true

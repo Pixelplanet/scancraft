@@ -19,6 +19,7 @@ members = [
     "crates/scancraft-stereo",
     "crates/scancraft-hybrid",
     "crates/scancraft-segment",
+    "crates/scancraft-synth",
     "apps/scancraft"
 ]
 
@@ -101,6 +102,9 @@ opt-level = 1
 [profile.dev.package.scancraft-slam]
 opt-level = 3
 [profile.dev.package.scancraft-core]
+opt-level = 3
+# Synthetic test scenes: ray casting millions of rays, also in its unit tests.
+[profile.dev.package.scancraft-synth]
 opt-level = 3
 [profile.dev.package.scancraft-markers]
 [profile.dev.package.scancraft-hybrid]
